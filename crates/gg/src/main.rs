@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `gg` — the GG programming language.
 //!
-//! Phase 2: the lexer (`gg --tokens file.gg`) and the parser
-//! (`gg --ast file.gg`) are available. The interpreter arrives
-//! in later phases.
+//! Phase 3: the lexer (`gg --tokens file.gg`), the parser
+//! (`gg --ast file.gg`) and the interpreter (`gg run file.gg`)
+//! are available.
 
+use std::io::Write;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("gg {VERSION} — the GG programming language (Phase 2: parser)");
+    println!("gg {VERSION} — the GG programming language (Phase 3: interpreter)");
     println!();
     println!("Usage: gg [options] <file.gg>");
+    println!();
+    println!("Commands:");
+    println!("  run <file.gg>          run a .gg program");
     println!();
     println!("Options:");
     println!("  --tokens <file.gg>   print the tokens of a .gg file, one per line");
@@ -36,9 +40,41 @@ fn main() -> ExitCode {
         }
         [flag, file] if flag == "--tokens" => dump_tokens(file),
         [flag, file] if flag == "--ast" => dump_ast(file),
+        [cmd, file] if cmd == "run" => run_file(file),
         _ => {
-            eprintln!("Usage: gg --tokens <file.gg> | gg --ast <file.gg>");
+            eprintln!("Usage: gg run <file.gg> | gg --tokens <file.gg> | gg --ast <file.gg>");
             eprintln!("Run `gg --help` for the full usage.");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_file(path: &str) -> ExitCode {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("error: cannot read '{path}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match gg_interp::run_source(&source, &mut out) {
+        Ok(()) => {
+            // Flush stdout so piped output is not lost.
+            let _ = out.flush();
+            ExitCode::SUCCESS
+        }
+        Err(gg_interp::GgError::Lex(e)) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+        Err(gg_interp::GgError::Parse(e)) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+        Err(gg_interp::GgError::Runtime(e)) => {
+            eprintln!("runtime error: {e}");
             ExitCode::FAILURE
         }
     }

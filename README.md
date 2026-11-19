@@ -19,7 +19,73 @@ end
 **Phase 1 — lexer: done.** The lexer turns GG source into tokens
 (`gg-lexer` crate). **Phase 2 — parser + AST: done.** The parser
 (`gg-parser` crate) turns tokens into an AST; `gg --ast file.gg`
-prints it back in canonical form.
+prints it back in canonical form. **Phase 3 — interpreter: done.**
+The tree-walking interpreter (`gg-interp` crate) runs GG programs;
+`gg run file.gg` executes them.
+
+## Semantics
+
+Values: integers, floats, strings, booleans, `nil` (the value of a
+function that returns nothing) and functions. Functions are
+**closures**: they capture the environment where they were defined,
+so they can use outer variables — and see themselves, so recursion
+works.
+
+- **Truthiness:** only `false` and `nil` are false; everything else
+  (including `0` and `""`) is true. `and`/`or` short-circuit and
+  return the operand value, not a boolean (`1 and 2` is `2`,
+  `false or "x"` is `"x"`).
+- **Numbers:** `int + int` is an int; any float operand makes the
+  result a float. `/` is **always float division** (`7 / 2` is `3.5`).
+  `%` works only between integers and keeps the dividend's sign
+  (`-7 % 3` is `-1`). Integer overflow is a runtime error.
+- **Strings:** `+` concatenates; `< <= > >=` compare
+  lexicographically. `==`/`!=` between different types are
+  `false`/`true`, never an error.
+- **`for i = a to b then ... end`** includes both ends and steps +1
+  if `a <= b`, -1 otherwise. The loop variable exists only inside
+  the loop body.
+- **Scopes:** every block (`if`/`while`/`for`/function body) runs in
+  its own child scope. `let` inside a block is invisible outside;
+  assignment updates the variable where it was defined.
+- **Errors** are plain-English runtime errors (`undefined variable
+  'x'`, `cannot add Int and Str`, `division by zero`,
+  `cannot call Int`, `expected 1 argument(s) but got 2`,
+  `return outside function`). **Known limitation:** the Phase 2 AST
+  carries no source positions, so runtime errors have no line or
+  column yet — positions will arrive in a later phase.
+
+```gg
+fn fib(n)
+    if n < 2 then
+        return n
+    else
+        return fib(n - 1) + fib(n - 2)
+    end
+end
+
+for i = 0 to 10 then
+    print fib(i)
+end
+```
+
+```gg
+for i = 1 to 15 then
+    if i % 15 == 0 then
+        print "FizzBuzz"
+    else
+        if i % 3 == 0 then
+            print "Fizz"
+        else
+            if i % 5 == 0 then
+                print "Buzz"
+            else
+                print i
+            end
+        end
+    end
+end
+```
 
 ## Grammar
 
@@ -85,6 +151,7 @@ plain-English messages with line and column
 
 ```sh
 cargo build --release
+./target/release/gg run hello.gg          # run a .gg program
 ./target/release/gg --tokens hello.gg   # print the tokens, one per line
 ./target/release/gg --ast hello.gg      # parse and print the AST (canonical form)
 ./target/release/gg --help
@@ -92,13 +159,15 @@ cargo build --release
 ```
 
 Token output format: `<line>:<col> TYPE value`, e.g. `1:1 Let let`.
+Runtime errors print as `runtime error: <message>` on stderr and
+exit with code 1.
 
 ## Roadmap
 
 1. **Lexer** ✅ — `gg-lexer`
 2. **Parser + AST** ✅ — `gg-parser`
-3. **Interpreter** — variables, `print`, `if`/`while`, operators
-4. **Functions** — `fn`, `return`, calls
+3. **Interpreter** ✅ — `gg-interp` (variables, `print`, `if`/`while`/`for`, operators, functions, closures)
+4. **Builtins + standard library** — builtin functions (`len`, `type`, input...) and a small stdlib
 5. **REPL + stdlib** — interactive shell, a small standard library
 
 ## License
