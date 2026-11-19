@@ -23,7 +23,48 @@ prints it back in canonical form. **Phase 3 — interpreter: done.**
 The tree-walking interpreter (`gg-interp` crate) runs GG programs;
 `gg run file.gg` executes them. **Phase 4 — builtins: done.**
 Builtin functions (`len`, `type`, `input`...) are available in
-every program.
+every program. **Phase 5 — REPL: done.** The interactive shell
+(`gg` with no arguments, or `gg repl`) evaluates line by line, keeps
+state across lines, and lets blocks span several lines until `end`.
+
+## The REPL
+
+```sh
+./target/release/gg
+```
+
+```text
+GG 0.1.0 — interactive REPL. Type exit to quit.
+gg> let x = 5
+gg> x
+5
+gg> fn add(a, b)
+... return a + b
+... end
+gg> add(2, 3)
+5
+gg> if x > 3 then
+... print "grande"
+... end
+grande
+gg> let = 5
+error: line 1, col 5: expected variable name after 'let' but found '='
+gg> x
+5
+gg> exit
+```
+
+Rules: an expression on its own echoes its value (`1 + 2` prints
+`3`); other statements print nothing by themselves, and `nil` is
+never echoed. `exit` (or `quit`) on its own line leaves; Ctrl-D
+leaves too. Errors (lex, parse, runtime) are printed and the session
+goes on with its state intact — a line that fails halfway may have
+executed part of its statements before failing. Blocks wait for their
+`end` with the `... ` prompt; note that `then` must stay on the same
+line as the condition (`if x` followed by `then` on the next line is
+an error, not a continuation). The REPL reads plain lines from stdin:
+no arrow-key history and no line editing yet (that needs a line-editing
+library like `rustyline`, a future upgrade).
 
 ## Semantics
 
@@ -208,6 +249,8 @@ plain-English messages with line and column
 
 ```sh
 cargo build --release
+./target/release/gg                 # start the interactive REPL
+./target/release/gg repl            # same thing
 ./target/release/gg run hello.gg          # run a .gg program
 ./target/release/gg --tokens hello.gg   # print the tokens, one per line
 ./target/release/gg --ast hello.gg      # parse and print the AST (canonical form)
@@ -225,7 +268,12 @@ exit with code 1.
 2. **Parser + AST** ✅ — `gg-parser`
 3. **Interpreter** ✅ — `gg-interp` (variables, `print`, `if`/`while`/`for`, operators, functions, closures)
 4. **Builtins + standard library** ✅ — builtin functions (`len`, `type`, `str`, `int`, `float`, `input`, `abs`, `min`, `max`)
-5. **REPL + stdlib** — interactive shell, a small standard library
+5. **REPL** ✅ — interactive shell (`gg` / `gg repl`): persistent state, multi-line blocks, expression echo, error recovery
+6. **Lists + file handling** — lists (`[1, 2, 3]`), `read_file`/`write_file`
+7. **OOP** — classes, methods, inheritance
+8. **Modules + virtual environments** — `import`, packages, per-project envs (like `venv`)
+
+Long term, after lists exist: data libraries in the spirit of NumPy/Pandas, and a web framework in the spirit of Django — each is a large project of its own, not a single phase.
 
 ## License
 

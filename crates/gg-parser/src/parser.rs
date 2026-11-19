@@ -12,20 +12,32 @@ use std::fmt;
 
 /// A parse error: a plain-English message plus the 1-based
 /// line/column of the token that caused it.
+///
+/// `incomplete` is true when the error was caused by unexpected end
+/// of input (e.g. a missing `end`): the source could become valid if
+/// more lines were added. The REPL uses it to decide whether to keep
+/// reading instead of reporting the error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParserError {
     pub message: String,
     pub line: usize,
     pub col: usize,
+    pub incomplete: bool,
 }
 
 impl ParserError {
-    fn new(message: impl Into<String>, line: usize, col: usize) -> Self {
+    fn new(message: impl Into<String>, line: usize, col: usize, incomplete: bool) -> Self {
         Self {
             message: message.into(),
             line,
             col,
+            incomplete,
         }
+    }
+
+    /// True when this error is only due to unexpected end of input.
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 }
 
@@ -89,7 +101,10 @@ impl<'a> Parser<'a> {
 
     fn error_here(&self, message: impl Into<String>) -> ParserError {
         let token = self.peek();
-        ParserError::new(message, token.line, token.col)
+        // An error at end of input means the source may still become
+        // valid with more lines (e.g. a block missing its `end`).
+        let incomplete = token.kind == TokenKind::Eof;
+        ParserError::new(message, token.line, token.col, incomplete)
     }
 
     /// Consume the current token if it is of the given kind, else error.
@@ -884,5 +899,24 @@ mod tests {
         let prog = parse_ok(source);
         let reparsed = parse_ok(&prog.to_string());
         assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn incomplete_errors_are_flagged_when_input_ends_early() {
+        // A block missing its `end`.
+        assert!(parse_err("if x then\n    print 1\n").is_incomplete());
+        // A `then` missing at end of input.
+        assert!(parse_err("if x").is_incomplete());
+        // An unclosed parenthesis at end of input.
+        assert!(parse_err("print (1 + 2").is_incomplete());
+        // An expression missing at end of input.
+        assert!(parse_err("let x =").is_incomplete());
+        // But an error at a real token is not incomplete, even when
+        // the same keyword is involved: `then` missing before a
+        // newline means the line is wrong, not unfinished.
+        assert!(!parse_err("if x\n    print 1\nend").is_incomplete());
+        assert!(!parse_err("let = 5").is_incomplete());
+        assert!(!parse_err("end").is_incomplete());
+        assert!(!parse_err("let x = 1 let y = 2").is_incomplete());
     }
 }

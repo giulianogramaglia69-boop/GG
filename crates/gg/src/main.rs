@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `gg` — the GG programming language.
 //!
-//! Phase 4: the lexer (`gg --tokens file.gg`), the parser
-//! (`gg --ast file.gg`) and the interpreter (`gg run file.gg`,
-//! with builtins and `input` from stdin) are available.
+//! Phase 5: the lexer (`gg --tokens file.gg`), the parser
+//! (`gg --ast file.gg`), the interpreter (`gg run file.gg`, with
+//! builtins and `input` from stdin) and the REPL (`gg` with no
+//! arguments, or `gg repl`) are available.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -11,12 +12,13 @@ use std::process::ExitCode;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("gg {VERSION} — the GG programming language (Phase 4: builtins)");
+    println!("gg {VERSION} — the GG programming language (Phase 5: REPL)");
     println!();
     println!("Usage: gg [options] <file.gg>");
     println!();
     println!("Commands:");
     println!("  run <file.gg>          run a .gg program (stdin is available to `input`)");
+    println!("  repl                   start the interactive REPL (also the default: bare `gg`)");
     println!();
     println!("Options:");
     println!("  --tokens <file.gg>   print the tokens of a .gg file, one per line");
@@ -30,6 +32,8 @@ fn print_help() {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [] => start_repl(),
+        [arg] if arg == "repl" => start_repl(),
         [arg] if arg == "--help" || arg == "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -42,8 +46,25 @@ fn main() -> ExitCode {
         [flag, file] if flag == "--ast" => dump_ast(file),
         [cmd, file] if cmd == "run" => run_file(file),
         _ => {
-            eprintln!("Usage: gg run <file.gg> | gg --tokens <file.gg> | gg --ast <file.gg>");
+            eprintln!("Usage: gg [repl | run <file.gg> | --tokens <file.gg> | --ast <file.gg>]");
             eprintln!("Run `gg --help` for the full usage.");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn start_repl() -> ExitCode {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match gg_interp::run_repl(&mut input, &mut out) {
+        Ok(()) => {
+            let _ = out.flush();
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }

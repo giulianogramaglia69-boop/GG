@@ -9,6 +9,7 @@ pub mod builtin;
 pub mod env;
 pub mod error;
 pub mod interp;
+pub mod repl;
 pub mod value;
 
 use std::fmt;
@@ -17,6 +18,7 @@ use std::io::{BufRead, Write};
 pub use builtin::Builtin;
 pub use error::RuntimeError;
 pub use interp::Interpreter;
+pub use repl::run_repl;
 pub use value::Value;
 
 use gg_lexer::LexerError;

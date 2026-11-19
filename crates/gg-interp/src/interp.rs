@@ -46,6 +46,18 @@ impl Interpreter {
         Self { globals }
     }
 
+    /// Evaluate one expression in the global environment and return
+    /// its value. Used by the REPL to echo expression results.
+    pub fn eval(
+        &mut self,
+        expr: &Expr,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        let globals = Rc::clone(&self.globals);
+        self.eval_expr(expr, &globals, input, out)
+    }
+
     /// Run a whole program. `print` output goes to `out`, `input`
     /// reads from `input`. A `return` at the top level is a runtime
     /// error.
