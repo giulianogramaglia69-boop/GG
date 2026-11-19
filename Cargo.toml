@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gg-lexer", "crates/gg"]
+members = ["crates/gg-lexer", "crates/gg-parser", "crates/gg"]
 resolver = "2"
 
 [workspace.package]

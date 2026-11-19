@@ -8,6 +8,7 @@ description = "GG programming language interpreter (tree-walking)"
 
 [dependencies]
 gg-lexer = { path = "../gg-lexer" }
+gg-parser = { path = "../gg-parser" }
 
 [[bin]]
 name = "gg"

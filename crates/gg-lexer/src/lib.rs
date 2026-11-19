@@ -54,6 +54,7 @@ pub enum TokenKind {
     And,
     Or,
     Not,
+    To,
     // Literals
     Ident(String),
     Int(i64),
@@ -101,6 +102,7 @@ impl TokenKind {
             TokenKind::And => "And",
             TokenKind::Or => "Or",
             TokenKind::Not => "Not",
+            TokenKind::To => "To",
             TokenKind::Ident(_) => "Ident",
             TokenKind::Int(_) => "Int",
             TokenKind::Float(_) => "Float",
@@ -143,6 +145,7 @@ impl TokenKind {
             TokenKind::And => "and".to_string(),
             TokenKind::Or => "or".to_string(),
             TokenKind::Not => "not".to_string(),
+            TokenKind::To => "to".to_string(),
             TokenKind::Ident(name) => name.clone(),
             TokenKind::Int(n) => n.to_string(),
             TokenKind::Float(f) => f.to_string(),
@@ -210,6 +213,7 @@ fn keyword_or_ident(word: &str) -> TokenKind {
         "and" => TokenKind::And,
         "or" => TokenKind::Or,
         "not" => TokenKind::Not,
+        "to" => TokenKind::To,
         _ => TokenKind::Ident(word.to_string()),
     }
 }
@@ -571,7 +575,7 @@ mod tests {
     #[test]
     fn keywords_are_not_identifiers_but_prefixes_are() {
         assert_eq!(
-            kinds_no_eof("let letter endif endless truex not_now"),
+            kinds_no_eof("let letter endif endless truex not_now total"),
             vec![
                 TokenKind::Let,
                 TokenKind::Ident("letter".to_string()),
@@ -579,14 +583,20 @@ mod tests {
                 TokenKind::Ident("endless".to_string()),
                 TokenKind::Ident("truex".to_string()),
                 TokenKind::Ident("not_now".to_string()),
+                TokenKind::Ident("total".to_string()),
             ]
         );
     }
 
     #[test]
+    fn to_is_a_keyword() {
+        assert_eq!(kinds_no_eof("to"), vec![TokenKind::To]);
+    }
+
+    #[test]
     fn all_keywords() {
         assert_eq!(
-            kinds_no_eof("let if then else end while for fn return print true false and or not"),
+            kinds_no_eof("let if then else end while for fn return print true false and or not to"),
             vec![
                 TokenKind::Let,
                 TokenKind::If,
@@ -603,6 +613,7 @@ mod tests {
                 TokenKind::And,
                 TokenKind::Or,
                 TokenKind::Not,
+                TokenKind::To,
             ]
         );
     }

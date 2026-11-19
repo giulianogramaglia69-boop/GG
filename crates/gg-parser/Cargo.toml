@@ -1,0 +1,10 @@
+[package]
+name = "gg-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Parser for the GG programming language: tokens -> AST"
+
+[dependencies]
+gg-lexer = { path = "../gg-lexer" }

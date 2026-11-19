@@ -7,8 +7,16 @@ name = "gg"
 version = "0.1.0"
 dependencies = [
  "gg-lexer",
+ "gg-parser",
 ]
 
 [[package]]
 name = "gg-lexer"
 version = "0.1.0"
+
+[[package]]
+name = "gg-parser"
+version = "0.1.0"
+dependencies = [
+ "gg-lexer",
+]
