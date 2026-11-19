@@ -1,0 +1,14 @@
+[package]
+name = "gg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GG programming language interpreter (tree-walking)"
+
+[dependencies]
+gg-lexer = { path = "../gg-lexer" }
+
+[[bin]]
+name = "gg"
+path = "src/main.rs"
