@@ -10,11 +10,12 @@
 //!   (and therefore see themselves, so recursion works).
 
 use std::cmp::Ordering;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 
+use crate::builtin;
 use crate::env::Environment;
 use crate::error::RuntimeError;
 use crate::value::{Function, Value, values_equal};
@@ -40,16 +41,22 @@ impl Default for Interpreter {
 
 impl Interpreter {
     pub fn new() -> Self {
-        Self {
-            globals: Environment::new(),
-        }
+        let globals = Environment::new();
+        builtin::define_all(&globals);
+        Self { globals }
     }
 
-    /// Run a whole program. `print` output goes to `out`.
-    /// A `return` at the top level is a runtime error.
-    pub fn run(&mut self, program: &Program, out: &mut dyn Write) -> Result<(), RuntimeError> {
+    /// Run a whole program. `print` output goes to `out`, `input`
+    /// reads from `input`. A `return` at the top level is a runtime
+    /// error.
+    pub fn run(
+        &mut self,
+        program: &Program,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
         let globals = Rc::clone(&self.globals);
-        match self.exec_block(&program.stmts, &globals, out)? {
+        match self.exec_block(&program.stmts, &globals, input, out)? {
             Flow::Normal => Ok(()),
             Flow::Return(_) => Err(RuntimeError::new("return outside function")),
         }
@@ -60,10 +67,11 @@ impl Interpreter {
         &mut self,
         stmts: &[Stmt],
         env: &Rc<Environment>,
+        input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Flow, RuntimeError> {
         for stmt in stmts {
-            match self.exec_stmt(stmt, env, out)? {
+            match self.exec_stmt(stmt, env, input, out)? {
                 Flow::Normal => {}
                 flow @ Flow::Return(_) => return Ok(flow),
             }
@@ -76,21 +84,22 @@ impl Interpreter {
         &mut self,
         stmt: &Stmt,
         env: &Rc<Environment>,
+        input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Flow, RuntimeError> {
         match stmt {
             Stmt::Let { name, value } => {
-                let value = self.eval_expr(value, env, out)?;
+                let value = self.eval_expr(value, env, input, out)?;
                 env.define(name, value);
                 Ok(Flow::Normal)
             }
             Stmt::Assign { name, value } => {
-                let value = self.eval_expr(value, env, out)?;
+                let value = self.eval_expr(value, env, input, out)?;
                 env.assign(name, value)?;
                 Ok(Flow::Normal)
             }
             Stmt::Print { expr } => {
-                let value = self.eval_expr(expr, env, out)?;
+                let value = self.eval_expr(expr, env, input, out)?;
                 writeln!(out, "{value}")
                     .map_err(|e| RuntimeError::new(format!("output error: {e}")))?;
                 Ok(Flow::Normal)
@@ -100,7 +109,7 @@ impl Interpreter {
                 then_block,
                 else_block,
             } => {
-                let cond = self.eval_expr(cond, env, out)?;
+                let cond = self.eval_expr(cond, env, input, out)?;
                 let branch = if cond.is_truthy() {
                     then_block
                 } else {
@@ -111,15 +120,15 @@ impl Interpreter {
                 };
                 // Each branch runs in its own child scope.
                 let child = Environment::child(env);
-                self.exec_block(branch, &child, out)
+                self.exec_block(branch, &child, input, out)
             }
             Stmt::While { cond, body } => loop {
-                let cond = self.eval_expr(cond, env, out)?;
+                let cond = self.eval_expr(cond, env, input, out)?;
                 if !cond.is_truthy() {
                     return Ok(Flow::Normal);
                 }
                 let child = Environment::child(env);
-                match self.exec_block(body, &child, out)? {
+                match self.exec_block(body, &child, input, out)? {
                     Flow::Normal => {}
                     flow @ Flow::Return(_) => return Ok(flow),
                 }
@@ -130,8 +139,8 @@ impl Interpreter {
                 to,
                 body,
             } => {
-                let from = self.eval_expr(from, env, out)?;
-                let to = self.eval_expr(to, env, out)?;
+                let from = self.eval_expr(from, env, input, out)?;
+                let to = self.eval_expr(to, env, input, out)?;
                 let (Value::Int(from), Value::Int(to)) = (from, to) else {
                     return Err(RuntimeError::new("for loop bounds must be integers"));
                 };
@@ -146,7 +155,7 @@ impl Interpreter {
                     }
                     loop_env.define(var, Value::Int(i));
                     let child = Environment::child(&loop_env);
-                    match self.exec_block(body, &child, out)? {
+                    match self.exec_block(body, &child, input, out)? {
                         Flow::Normal => {}
                         flow @ Flow::Return(_) => return Ok(flow),
                     }
@@ -167,13 +176,13 @@ impl Interpreter {
             }
             Stmt::Return { expr } => {
                 let value = match expr {
-                    Some(expr) => self.eval_expr(expr, env, out)?,
+                    Some(expr) => self.eval_expr(expr, env, input, out)?,
                     None => Value::Nil,
                 };
                 Ok(Flow::Return(value))
             }
             Stmt::ExprStmt { expr } => {
-                self.eval_expr(expr, env, out)?;
+                self.eval_expr(expr, env, input, out)?;
                 Ok(Flow::Normal)
             }
         }
@@ -184,6 +193,7 @@ impl Interpreter {
         &mut self,
         expr: &Expr,
         env: &Rc<Environment>,
+        input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
         match expr {
@@ -193,7 +203,7 @@ impl Interpreter {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Ident(name) => env.get(name),
             Expr::Unary { op, expr } => {
-                let value = self.eval_expr(expr, env, out)?;
+                let value = self.eval_expr(expr, env, input, out)?;
                 match op {
                     UnaryOp::Not => Ok(Value::Bool(!value.is_truthy())),
                     UnaryOp::Neg => match value {
@@ -209,27 +219,44 @@ impl Interpreter {
                     },
                 }
             }
-            Expr::Binary { op, left, right } => self.eval_binary(*op, left, right, env, out),
+            Expr::Binary { op, left, right } => self.eval_binary(*op, left, right, env, input, out),
             Expr::Call { name, args } => {
                 let callee = env.get(name)?;
-                let Value::Function(function) = callee else {
-                    return Err(RuntimeError::new(format!(
+                match callee {
+                    Value::Function(function) => {
+                        if args.len() != function.params.len() {
+                            return Err(RuntimeError::new(format!(
+                                "expected {} argument(s) but got {}",
+                                function.params.len(),
+                                args.len()
+                            )));
+                        }
+                        let mut values = Vec::with_capacity(args.len());
+                        for arg in args {
+                            values.push(self.eval_expr(arg, env, input, out)?);
+                        }
+                        self.call(&function, values, input, out)
+                    }
+                    Value::Builtin(builtin) => {
+                        if args.len() != builtin.arity {
+                            return Err(RuntimeError::new(format!(
+                                "{}() expects {} argument(s) but got {}",
+                                builtin.name,
+                                builtin.arity,
+                                args.len()
+                            )));
+                        }
+                        let mut values = Vec::with_capacity(args.len());
+                        for arg in args {
+                            values.push(self.eval_expr(arg, env, input, out)?);
+                        }
+                        (builtin.func)(&values, input, out)
+                    }
+                    other => Err(RuntimeError::new(format!(
                         "cannot call {}",
-                        callee.type_name()
-                    )));
-                };
-                if args.len() != function.params.len() {
-                    return Err(RuntimeError::new(format!(
-                        "expected {} argument(s) but got {}",
-                        function.params.len(),
-                        args.len()
-                    )));
+                        other.type_name()
+                    ))),
                 }
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval_expr(arg, env, out)?);
-                }
-                self.call(&function, values, out)
             }
         }
     }
@@ -242,26 +269,27 @@ impl Interpreter {
         left: &Expr,
         right: &Expr,
         env: &Rc<Environment>,
+        input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
         match op {
             BinaryOp::And => {
-                let left = self.eval_expr(left, env, out)?;
+                let left = self.eval_expr(left, env, input, out)?;
                 if !left.is_truthy() {
                     return Ok(left);
                 }
-                self.eval_expr(right, env, out)
+                self.eval_expr(right, env, input, out)
             }
             BinaryOp::Or => {
-                let left = self.eval_expr(left, env, out)?;
+                let left = self.eval_expr(left, env, input, out)?;
                 if left.is_truthy() {
                     return Ok(left);
                 }
-                self.eval_expr(right, env, out)
+                self.eval_expr(right, env, input, out)
             }
             _ => {
-                let left = self.eval_expr(left, env, out)?;
-                let right = self.eval_expr(right, env, out)?;
+                let left = self.eval_expr(left, env, input, out)?;
+                let right = self.eval_expr(right, env, input, out)?;
                 match op {
                     BinaryOp::Eq => Ok(Value::Bool(values_equal(&left, &right))),
                     BinaryOp::NotEq => Ok(Value::Bool(!values_equal(&left, &right))),
@@ -290,13 +318,14 @@ impl Interpreter {
         &mut self,
         function: &Rc<Function>,
         args: Vec<Value>,
+        input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
         let call_env = Environment::child(&function.env);
         for (param, value) in function.params.iter().zip(args) {
             call_env.define(param, value);
         }
-        match self.exec_block(&function.body, &call_env, out)? {
+        match self.exec_block(&function.body, &call_env, input, out)? {
             Flow::Normal => Ok(Value::Nil),
             Flow::Return(value) => Ok(value),
         }

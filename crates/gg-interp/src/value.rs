@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use gg_parser::ast::Stmt;
 
+use crate::builtin::Builtin;
 use crate::env::Environment;
 
 /// A value at runtime.
@@ -20,6 +21,7 @@ pub enum Value {
     Bool(bool),
     Nil,
     Function(Rc<Function>),
+    Builtin(Rc<Builtin>),
 }
 
 /// A user-defined function: parameters, body, and the environment
@@ -40,7 +42,7 @@ impl Value {
             Value::Str(_) => "Str",
             Value::Bool(_) => "Bool",
             Value::Nil => "Nil",
-            Value::Function(_) => "Function",
+            Value::Function(_) | Value::Builtin(_) => "Function",
         }
     }
 
@@ -61,7 +63,7 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "{s}"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Nil => write!(f, "nil"),
-            Value::Function(_) => write!(f, "<fn>"),
+            Value::Function(_) | Value::Builtin(_) => write!(f, "<fn>"),
         }
     }
 }
@@ -77,6 +79,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nil, Value::Nil) => true,
         (Value::Function(x), Value::Function(y)) => Rc::ptr_eq(x, y),
+        (Value::Builtin(x), Value::Builtin(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }

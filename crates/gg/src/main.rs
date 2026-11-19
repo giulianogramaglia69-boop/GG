@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `gg` — the GG programming language.
 //!
-//! Phase 3: the lexer (`gg --tokens file.gg`), the parser
-//! (`gg --ast file.gg`) and the interpreter (`gg run file.gg`)
-//! are available.
+//! Phase 4: the lexer (`gg --tokens file.gg`), the parser
+//! (`gg --ast file.gg`) and the interpreter (`gg run file.gg`,
+//! with builtins and `input` from stdin) are available.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -11,12 +11,12 @@ use std::process::ExitCode;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("gg {VERSION} — the GG programming language (Phase 3: interpreter)");
+    println!("gg {VERSION} — the GG programming language (Phase 4: builtins)");
     println!();
     println!("Usage: gg [options] <file.gg>");
     println!();
     println!("Commands:");
-    println!("  run <file.gg>          run a .gg program");
+    println!("  run <file.gg>          run a .gg program (stdin is available to `input`)");
     println!();
     println!("Options:");
     println!("  --tokens <file.gg>   print the tokens of a .gg file, one per line");
@@ -57,9 +57,11 @@ fn run_file(path: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    match gg_interp::run_source(&source, &mut out) {
+    match gg_interp::run_source(&source, &mut input, &mut out) {
         Ok(()) => {
             // Flush stdout so piped output is not lost.
             let _ = out.flush();

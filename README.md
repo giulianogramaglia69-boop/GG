@@ -21,7 +21,9 @@ end
 (`gg-parser` crate) turns tokens into an AST; `gg --ast file.gg`
 prints it back in canonical form. **Phase 3 — interpreter: done.**
 The tree-walking interpreter (`gg-interp` crate) runs GG programs;
-`gg run file.gg` executes them.
+`gg run file.gg` executes them. **Phase 4 — builtins: done.**
+Builtin functions (`len`, `type`, `input`...) are available in
+every program.
 
 ## Semantics
 
@@ -85,6 +87,61 @@ for i = 1 to 15 then
         end
     end
 end
+```
+
+## Builtins
+
+Nine builtin functions are predefined in the global environment of
+every program. They are first-class values: they can be assigned to
+variables (`let f = len`), passed as arguments and returned from
+functions. `type()` returns `"fn"` for user functions and builtins
+alike, and `print` shows them as `<fn>`.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `len(x)` | Length of a string, in characters (not bytes: `len("è")` is 1) | `len("ciao")` → `4` |
+| `type(x)` | Type name as a string | `type(1)` → `"int"`, `type(len)` → `"fn"` |
+| `str(x)` | Convert to a string (same as `print` shows) | `str(42)` → `"42"` |
+| `int(x)` | Float truncated toward zero, string parsed, `true`→`1`, `false`→`0` | `int(3.9)` → `3`, `int("42")` → `42` |
+| `float(x)` | Int converted, string parsed, `true`→`1.0`, `false`→`0.0` | `float(3)` → `3.0` |
+| `input(prompt)` | Print the prompt (no newline), read one line, return it without the newline; `""` at end of input | `input("Name: ")` |
+| `abs(x)` | Absolute value of a number | `abs(-5)` → `5` |
+| `min(a, b)` | The smaller of two numbers (mixed int/float gives a float) | `min(2, 5)` → `2` |
+| `max(a, b)` | The larger of two numbers | `max(2, 5)` → `5` |
+
+Wrong arity is a runtime error naming the builtin
+(`len() expects 1 argument(s) but got 0`); a wrong argument type
+is a clear error too (`len() expects a Str`,
+`int() cannot parse "ciao" as an integer`). `int("3.5")` is an
+error — parse a float first (`int(float("3.5"))`).
+
+**Shadowing:** a `let` with the same name hides a builtin in the
+current scope, like any other variable (`let len = 5` makes `len`
+the number 5 there); outside that scope the builtin is back.
+
+Interactive example — a guessing game:
+
+```gg
+let name = input("Come ti chiami? ")
+print "Ciao, " + name + "!"
+
+let secret = 7
+let guess = int(input("Indovina un numero da 1 a 10: "))
+if guess == secret then
+    print "Bravo, hai indovinato!"
+else
+    if guess < secret then
+        print "Troppo piccolo, era 7"
+    else
+        print "Troppo grande, era 7"
+    end
+end
+```
+
+```
+$ echo -e "Giuliano\n5" | gg run indovina.gg
+Come ti chiami? Ciao, Giuliano!
+Indovina un numero da 1 a 10: Troppo piccolo, era 7
 ```
 
 ## Grammar
@@ -167,7 +224,7 @@ exit with code 1.
 1. **Lexer** ✅ — `gg-lexer`
 2. **Parser + AST** ✅ — `gg-parser`
 3. **Interpreter** ✅ — `gg-interp` (variables, `print`, `if`/`while`/`for`, operators, functions, closures)
-4. **Builtins + standard library** — builtin functions (`len`, `type`, input...) and a small stdlib
+4. **Builtins + standard library** ✅ — builtin functions (`len`, `type`, `str`, `int`, `float`, `input`, `abs`, `min`, `max`)
 5. **REPL + stdlib** — interactive shell, a small standard library
 
 ## License

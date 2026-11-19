@@ -5,14 +5,16 @@
 //! the one-call pipeline (lex + parse + interpret) used by the `gg`
 //! binary and by the tests.
 
+pub mod builtin;
 pub mod env;
 pub mod error;
 pub mod interp;
 pub mod value;
 
 use std::fmt;
-use std::io::Write;
+use std::io::{BufRead, Write};
 
+pub use builtin::Builtin;
 pub use error::RuntimeError;
 pub use interp::Interpreter;
 pub use value::Value;
@@ -59,11 +61,16 @@ impl From<RuntimeError> for GgError {
     }
 }
 
-/// Lex, parse and run `source`, writing `print` output to `out`.
-pub fn run_source(source: &str, out: &mut dyn Write) -> Result<(), GgError> {
+/// Lex, parse and run `source`: `print` output goes to `out`,
+/// `input` reads from `input`.
+pub fn run_source(
+    source: &str,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<(), GgError> {
     let tokens = gg_lexer::lex(source)?;
     let program = gg_parser::parse(&tokens)?;
-    Interpreter::new().run(&program, out)?;
+    Interpreter::new().run(&program, input, out)?;
     Ok(())
 }
 
@@ -71,16 +78,25 @@ pub fn run_source(source: &str, out: &mut dyn Write) -> Result<(), GgError> {
 mod tests {
     use super::*;
 
-    /// Run `source` and return its printed output, or the error text.
+    /// Run `source` with empty input and return its printed output,
+    /// or the error text.
     fn run_ok(source: &str) -> String {
+        run_ok_in(source, "")
+    }
+
+    /// Run `source` with `input` as stdin and return its printed
+    /// output, or the error text.
+    fn run_ok_in(source: &str, input: &str) -> String {
+        let mut input = std::io::Cursor::new(input.as_bytes().to_vec());
         let mut out = Vec::new();
-        run_source(source, &mut out).unwrap();
+        run_source(source, &mut input, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
     fn run_err(source: &str) -> String {
+        let mut input = std::io::Cursor::new(Vec::new());
         let mut out = Vec::new();
-        let err = run_source(source, &mut out).unwrap_err();
+        let err = run_source(source, &mut input, &mut out).unwrap_err();
         err.to_string()
     }
 
@@ -256,5 +272,144 @@ mod tests {
         assert!(run_err("print \"oops\n").starts_with("lex error:"));
         assert!(run_err("let = 5\n").starts_with("parse error:"));
         assert!(run_err("print z\n").starts_with("runtime error:"));
+    }
+
+    // ---- Phase 4: builtins ----
+
+    #[test]
+    fn len_counts_characters_not_bytes() {
+        assert_eq!(run_ok("print len(\"ciao\")\n"), "4\n");
+        assert_eq!(run_ok("print len(\"\")\n"), "0\n");
+        // "è" is one character but two UTF-8 bytes.
+        assert_eq!(run_ok("print len(\"è\")\n"), "1\n");
+        assert_eq!(run_ok("print len(\"héllo\")\n"), "5\n");
+        assert!(run_err("print len(5)\n").contains("len() expects a Str"));
+        assert!(run_err("print len()\n").contains("len() expects 1 argument(s) but got 0"));
+        assert!(
+            run_err("print len(\"a\", \"b\")\n").contains("len() expects 1 argument(s) but got 2")
+        );
+    }
+
+    #[test]
+    fn type_names_every_value() {
+        assert_eq!(run_ok("print type(1)\n"), "int\n");
+        assert_eq!(run_ok("print type(1.5)\n"), "float\n");
+        assert_eq!(run_ok("print type(\"s\")\n"), "str\n");
+        assert_eq!(run_ok("print type(true)\n"), "bool\n");
+        let src = "fn nothing()\nend\nprint type(nothing())\n";
+        assert_eq!(run_ok(src), "nil\n");
+        let src = "fn f()\nend\nprint type(f)\n";
+        assert_eq!(run_ok(src), "fn\n");
+        // Builtins are functions too.
+        assert_eq!(run_ok("print type(len)\n"), "fn\n");
+        assert!(run_err("print type()\n").contains("type() expects 1 argument(s) but got 0"));
+    }
+
+    #[test]
+    fn str_converts_like_print() {
+        assert_eq!(run_ok("print str(42)\n"), "42\n");
+        assert_eq!(run_ok("print str(3.5)\n"), "3.5\n");
+        assert_eq!(run_ok("print str(true)\n"), "true\n");
+        assert_eq!(run_ok("print str(\"x\")\n"), "x\n");
+        let src = "fn nothing()\nend\nprint str(nothing())\n";
+        assert_eq!(run_ok(src), "nil\n");
+        assert_eq!(run_ok("print str(len)\n"), "<fn>\n");
+    }
+
+    #[test]
+    fn int_converts_and_truncates_toward_zero() {
+        assert_eq!(run_ok("print int(3.9)\n"), "3\n");
+        assert_eq!(run_ok("print int(-3.9)\n"), "-3\n");
+        assert_eq!(run_ok("print int(\"42\")\n"), "42\n");
+        assert_eq!(run_ok("print int(\"  -7  \")\n"), "-7\n");
+        assert_eq!(run_ok("print int(true)\n"), "1\n");
+        assert_eq!(run_ok("print int(false)\n"), "0\n");
+        assert_eq!(run_ok("print int(5)\n"), "5\n");
+        assert!(
+            run_err("print int(\"ciao\")\n").contains("int() cannot parse \"ciao\" as an integer")
+        );
+        assert!(
+            run_err("print int(\"3.5\")\n").contains("int() cannot parse \"3.5\" as an integer")
+        );
+        let src = "fn nothing()\nend\nprint int(nothing())\n";
+        assert!(run_err(src).contains("int() cannot convert Nil to Int"));
+        assert!(run_err("print int(len)\n").contains("int() cannot convert Function to Int"));
+    }
+
+    #[test]
+    fn float_converts() {
+        assert_eq!(run_ok("print type(float(3))\n"), "float\n");
+        assert_eq!(run_ok("print float(3)\n"), "3\n");
+        assert_eq!(run_ok("print float(\"2.5\")\n"), "2.5\n");
+        assert_eq!(run_ok("print float(true)\n"), "1\n");
+        assert_eq!(run_ok("print float(false)\n"), "0\n");
+        assert_eq!(run_ok("print float(2.5)\n"), "2.5\n");
+        assert!(
+            run_err("print float(\"ciao\")\n").contains("float() cannot parse \"ciao\" as a float")
+        );
+        let src = "fn nothing()\nend\nprint float(nothing())\n";
+        assert!(run_err(src).contains("float() cannot convert Nil to Float"));
+    }
+
+    #[test]
+    fn input_reads_a_line_and_writes_the_prompt() {
+        let src = "let name = input(\"Name: \")\nprint \"Hi \" + name\n";
+        assert_eq!(run_ok_in(src, "Giuliano\n"), "Name: Hi Giuliano\n");
+        // The newline is stripped, and a second read gets the next line.
+        let src = "print input(\"A: \")\nprint input(\"B: \")\n";
+        assert_eq!(run_ok_in(src, "one\ntwo\n"), "A: one\nB: two\n");
+        // A CRLF ending is stripped too.
+        let src = "print input(\"P: \")\n";
+        assert_eq!(run_ok_in(src, "x\r\n"), "P: x\n");
+        // At end of input, input returns "".
+        let src = "print \"[\" + input(\"P: \") + \"]\"\n";
+        assert_eq!(run_ok_in(src, ""), "P: []\n");
+        assert!(run_err("print input()\n").contains("input() expects 1 argument(s) but got 0"));
+        assert!(run_err("print input(5)\n").contains("input() expects a Str"));
+    }
+
+    #[test]
+    fn abs_min_max() {
+        assert_eq!(run_ok("print abs(-5)\n"), "5\n");
+        assert_eq!(run_ok("print abs(5)\n"), "5\n");
+        assert_eq!(run_ok("print abs(-2.5)\n"), "2.5\n");
+        assert_eq!(run_ok("print abs(0)\n"), "0\n");
+        assert!(run_err("print abs(\"a\")\n").contains("abs() expects a number"));
+        assert_eq!(run_ok("print min(2, 5)\n"), "2\n");
+        assert_eq!(run_ok("print max(2, 5)\n"), "5\n");
+        assert_eq!(run_ok("print min(5, 2)\n"), "2\n");
+        // Mixed int/float gives a float result.
+        assert_eq!(run_ok("print type(min(2.5, 2))\n"), "float\n");
+        assert_eq!(run_ok("print min(2.5, 2)\n"), "2\n");
+        assert_eq!(run_ok("print max(2, 2.5)\n"), "2.5\n");
+        assert!(run_err("print min(\"a\", 1)\n").contains("min() expects numbers"));
+        assert!(run_err("print max(1)\n").contains("max() expects 2 argument(s) but got 1"));
+    }
+
+    #[test]
+    fn builtins_are_first_class_values() {
+        // Assigned to a variable, then called through it.
+        assert_eq!(run_ok("let f = len\nprint f(\"ciao\")\n"), "4\n");
+        // Passed to a user function.
+        let src = "fn apply(g, x)\n    return g(x)\nend\nprint apply(len, \"abc\")\n";
+        assert_eq!(run_ok(src), "3\n");
+        // Returned from a user function.
+        let src = "fn get_len()\n    return len\nend\nlet g = get_len()\nprint g(\"hi\")\n";
+        assert_eq!(run_ok(src), "2\n");
+        // A builtin prints like any function.
+        assert_eq!(run_ok("print len\n"), "<fn>\n");
+        // Builtins compare by identity: the same builtin is equal to itself.
+        assert_eq!(run_ok("print len == len\n"), "true\n");
+        assert_eq!(run_ok("print len == str\n"), "false\n");
+    }
+
+    #[test]
+    fn let_shadows_a_builtin_in_the_current_scope() {
+        // Shadowing works like any variable: the builtin is hidden.
+        assert_eq!(run_ok("let len = 5\nprint len\n"), "5\n");
+        assert!(run_err("let len = 5\nprint len(\"a\")\n").contains("cannot call Int"));
+        // The shadow is local: outside the block the builtin is back.
+        let src = "if true then\n    let len = 1\nend\nprint len(\"ab\")\n";
+        assert_eq!(run_ok(src), "2\n");
     }
 }
