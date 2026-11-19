@@ -224,4 +224,12 @@ mod tests {
             format!("{WELCOME}gg> error: line 1, col 7: unterminated string\ngg> gg> 2\ngg> ")
         );
     }
+
+    #[test]
+    fn lists_work_in_the_repl() {
+        assert_eq!(
+            session("let xs = [1, 2]\nxs\nxs[1]\npush(xs, 3)\nxs\nexit\n"),
+            format!("{WELCOME}gg> gg> [1, 2]\ngg> 2\ngg> gg> [1, 2, 3]\ngg> ")
+        );
+    }
 }

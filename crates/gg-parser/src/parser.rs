@@ -80,10 +80,6 @@ impl<'a> Parser<'a> {
         &self.peek().kind
     }
 
-    fn peek_next_kind(&self) -> Option<&TokenKind> {
-        self.tokens.get(self.pos + 1).map(|t| &t.kind)
-    }
-
     /// Consume the current token (never past `Eof`) and return it.
     fn advance(&mut self) -> Token {
         let token = self.peek().clone();
@@ -192,12 +188,25 @@ impl<'a> Parser<'a> {
             TokenKind::Return => self.parse_return(),
             TokenKind::Print => self.parse_print(),
             TokenKind::Ident(_) => {
-                // `x = ...` is an assignment; anything else starting
-                // with an identifier is an expression statement.
-                if matches!(self.peek_next_kind(), Some(TokenKind::Eq)) {
-                    self.parse_assign()
+                // An assignment starts with an expression (a plain
+                // name, or an index like `xs[0]`): if an `=` follows
+                // it, this is an assignment; otherwise it is an
+                // expression statement (`x == 1` is a comparison,
+                // not an assignment).
+                let expr = self.parse_expr()?;
+                if self.check(&TokenKind::Eq) {
+                    self.advance(); // =
+                    let value = self.parse_expr()?;
+                    match expr {
+                        Expr::Ident(name) => Ok(Stmt::Assign { name, value }),
+                        Expr::Index { .. } => Ok(Stmt::IndexAssign {
+                            target: expr,
+                            value,
+                        }),
+                        _ => Err(self.error_here("invalid assignment target")),
+                    }
                 } else {
-                    self.parse_expr_stmt()
+                    Ok(Stmt::ExprStmt { expr })
                 }
             }
             _ => self.parse_expr_stmt(),
@@ -210,13 +219,6 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::Eq, "'=' after variable name")?;
         let value = self.parse_expr()?;
         Ok(Stmt::Let { name, value })
-    }
-
-    fn parse_assign(&mut self) -> Result<Stmt, ParserError> {
-        let name = self.expect_ident("variable name")?;
-        self.expect(&TokenKind::Eq, "'=' in assignment")?;
-        let value = self.parse_expr()?;
-        Ok(Stmt::Assign { name, value })
     }
 
     fn parse_print(&mut self) -> Result<Stmt, ParserError> {
@@ -438,8 +440,24 @@ impl<'a> Parser<'a> {
                     expr: Box::new(expr),
                 })
             }
-            _ => self.parse_primary(),
+            _ => self.parse_postfix(),
         }
+    }
+
+    /// Postfix operators, as tight as a call: indexing (`xs[0]`,
+    /// `f()[0]`, `xs[0][1]`). Applies after any primary.
+    fn parse_postfix(&mut self) -> Result<Expr, ParserError> {
+        let mut expr = self.parse_primary()?;
+        while self.check(&TokenKind::LBracket) {
+            self.advance(); // [
+            let index = self.parse_expr()?;
+            self.expect(&TokenKind::RBracket, "']' after index")?;
+            expr = Expr::Index {
+                target: Box::new(expr),
+                index: Box::new(index),
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParserError> {
@@ -487,6 +505,19 @@ impl<'a> Parser<'a> {
                 let expr = self.parse_expr()?;
                 self.expect(&TokenKind::RParen, "')' after expression")?;
                 Ok(expr)
+            }
+            TokenKind::LBracket => {
+                self.advance(); // [
+                let mut elements = Vec::new();
+                if !self.check(&TokenKind::RBracket) {
+                    elements.push(self.parse_expr()?);
+                    while self.check(&TokenKind::Comma) {
+                        self.advance(); // ,
+                        elements.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "']' after list elements")?;
+                Ok(Expr::List(elements))
             }
             _ => Err(self.error_here(format!(
                 "expected expression but found {}",
@@ -897,6 +928,190 @@ mod tests {
     fn display_round_trip_with_parens_and_floats() {
         let source = "let a = (1 + 2) * 3\nlet b = -(a + 1)\nlet c = not (a and true)\nlet d = 1.0\nprint a - (b - c)\n";
         let prog = parse_ok(source);
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn list_literals() {
+        assert_eq!(
+            parse_ok("print [1, 2, 3]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::List(vec![int(1), int(2), int(3)]),
+            }]
+        );
+        // Empty, mixed and nested lists.
+        assert_eq!(
+            parse_ok("print []").stmts,
+            vec![Stmt::Print {
+                expr: Expr::List(vec![]),
+            }]
+        );
+        assert_eq!(
+            parse_ok("print [1, \"ciao\", true]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::List(vec![
+                    int(1),
+                    Expr::Str("ciao".to_string()),
+                    Expr::Bool(true),
+                ]),
+            }]
+        );
+        assert_eq!(
+            parse_ok("print [[1, 2], [3]]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::List(vec![
+                    Expr::List(vec![int(1), int(2)]),
+                    Expr::List(vec![int(3)]),
+                ]),
+            }]
+        );
+        // Elements may be any expression.
+        assert_eq!(
+            parse_ok("print [1 + 2, f(3)]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::List(vec![
+                    bin(Add, int(1), int(2)),
+                    Expr::Call {
+                        name: "f".to_string(),
+                        args: vec![int(3)],
+                    },
+                ]),
+            }]
+        );
+    }
+
+    #[test]
+    fn index_is_a_tight_postfix() {
+        // xs[0]
+        assert_eq!(
+            parse_ok("print xs[0]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(ident("xs")),
+                    index: Box::new(int(0)),
+                },
+            }]
+        );
+        // Negative index is just a unary minus inside the brackets.
+        assert_eq!(
+            parse_ok("print xs[-1]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(ident("xs")),
+                    index: Box::new(Expr::Unary {
+                        op: UnaryOp::Neg,
+                        expr: Box::new(int(1)),
+                    }),
+                },
+            }]
+        );
+        // Chained indexes and indexing a call result.
+        assert_eq!(
+            parse_ok("print xs[0][1]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(Expr::Index {
+                        target: Box::new(ident("xs")),
+                        index: Box::new(int(0)),
+                    }),
+                    index: Box::new(int(1)),
+                },
+            }]
+        );
+        assert_eq!(
+            parse_ok("print f()[0]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(Expr::Call {
+                        name: "f".to_string(),
+                        args: vec![],
+                    }),
+                    index: Box::new(int(0)),
+                },
+            }]
+        );
+        // Indexing binds tighter than `+`: xs[0] + 1, not xs[0 + 1].
+        assert_eq!(
+            parse_ok("print xs[0] + 1").stmts,
+            vec![Stmt::Print {
+                expr: bin(
+                    Add,
+                    Expr::Index {
+                        target: Box::new(ident("xs")),
+                        index: Box::new(int(0)),
+                    },
+                    int(1),
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn index_assignment() {
+        assert_eq!(
+            parse_ok("xs[0] = 99").stmts,
+            vec![Stmt::IndexAssign {
+                target: Expr::Index {
+                    target: Box::new(ident("xs")),
+                    index: Box::new(int(0)),
+                },
+                value: int(99),
+            }]
+        );
+        // Nested index assignment, with an expression on the right.
+        assert_eq!(
+            parse_ok("m[0][1] = 1 + 2").stmts,
+            vec![Stmt::IndexAssign {
+                target: Expr::Index {
+                    target: Box::new(Expr::Index {
+                        target: Box::new(ident("m")),
+                        index: Box::new(int(0)),
+                    }),
+                    index: Box::new(int(1)),
+                },
+                value: bin(Add, int(1), int(2)),
+            }]
+        );
+        // A call result is not a valid assignment target.
+        let err = parse_err("f() = 1");
+        assert!(
+            err.message.contains("invalid assignment target"),
+            "{}",
+            err.message
+        );
+        // A plain variable assignment still works, and `==` is still
+        // a comparison.
+        assert_eq!(
+            parse_ok("x = 5").stmts,
+            vec![Stmt::Assign {
+                name: "x".to_string(),
+                value: int(5),
+            }]
+        );
+        assert_eq!(
+            parse_ok("xs[0] == 5").stmts,
+            vec![Stmt::ExprStmt {
+                expr: bin(
+                    Eq,
+                    Expr::Index {
+                        target: Box::new(ident("xs")),
+                        index: Box::new(int(0)),
+                    },
+                    int(5),
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn list_display_round_trip() {
+        let source = "let xs = [1, \"a\", [2, 3]]\nprint xs[0]\nxs[1] = 9\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "let xs = [1, \"a\", [2, 3]]\nprint xs[0]\nxs[1] = 9"
+        );
         let reparsed = parse_ok(&prog.to_string());
         assert_eq!(reparsed, prog);
     }

@@ -91,6 +91,29 @@ works.
 - **Scopes:** every block (`if`/`while`/`for`/function body) runs in
   its own child scope. `let` inside a block is invisible outside;
   assignment updates the variable where it was defined.
+- **Lists:** a list is an ordered, mutable collection —
+  `[1, 2, 3]`, `[]`, nested and mixed (`[1, "ciao", true]`).
+  Indexing is `xs[0]`; negative indexes count from the end
+  (`xs[-1]` is the last element); out of range is a runtime error.
+  Assignment through an index works too: `xs[0] = 99`,
+  `m[0][1] = 2`. A list is **shared**: `let b = a` makes `b` an
+  alias of `a`, so a mutation through one name is visible through
+  the other. Lists compare element by element (`[1, 2] == [1, 2]`);
+  two distinct self-referential lists are reported unequal rather
+  than recursing forever. Printing a list shows its elements, with
+  strings quoted (`[1, "ciao"]`); past 16 levels of nesting it
+  prints `...`, so a list containing itself cannot blow the stack.
+  There is no `for x in xs` yet (it would need an `in` keyword):
+  loop by index, `for i = 0 to len(xs) - 1 then print xs[i] end`.
+
+```gg
+let xs = [10, 20, 30]
+push(xs, 40)
+print xs[3]
+print xs[-1]
+print len(xs)
+```
+
 - **Errors** are plain-English runtime errors (`undefined variable
   'x'`, `cannot add Int and Str`, `division by zero`,
   `cannot call Int`, `expected 1 argument(s) but got 2`,
@@ -132,23 +155,34 @@ end
 
 ## Builtins
 
-Nine builtin functions are predefined in the global environment of
+Eighteen builtin functions are predefined in the global environment of
 every program. They are first-class values: they can be assigned to
 variables (`let f = len`), passed as arguments and returned from
 functions. `type()` returns `"fn"` for user functions and builtins
-alike, and `print` shows them as `<fn>`.
+alike, and `print` shows them as `<fn>`. `type()` returns `"list"`
+for lists.
 
 | Function | Description | Example |
 | --- | --- | --- |
-| `len(x)` | Length of a string, in characters (not bytes: `len("è")` is 1) | `len("ciao")` → `4` |
-| `type(x)` | Type name as a string | `type(1)` → `"int"`, `type(len)` → `"fn"` |
-| `str(x)` | Convert to a string (same as `print` shows) | `str(42)` → `"42"` |
+| `len(x)` | Length of a string, in characters (not bytes: `len("è")` is 1), or number of elements in a list | `len("ciao")` → `4`, `len([1, 2])` → `2` |
+| `type(x)` | Type name as a string | `type(1)` → `"int"`, `type([1])` → `"list"`, `type(len)` → `"fn"` |
+| `str(x)` | Convert to a string (same as `print` shows) | `str(42)` → `"42"`, `str([1, "x"])` → `"[1, \"x\"]"` |
 | `int(x)` | Float truncated toward zero, string parsed, `true`→`1`, `false`→`0` | `int(3.9)` → `3`, `int("42")` → `42` |
 | `float(x)` | Int converted, string parsed, `true`→`1.0`, `false`→`0.0` | `float(3)` → `3.0` |
 | `input(prompt)` | Print the prompt (no newline), read one line, return it without the newline; `""` at end of input | `input("Name: ")` |
 | `abs(x)` | Absolute value of a number | `abs(-5)` → `5` |
 | `min(a, b)` | The smaller of two numbers (mixed int/float gives a float) | `min(2, 5)` → `2` |
 | `max(a, b)` | The larger of two numbers | `max(2, 5)` → `5` |
+| `push(list, value)` | Append `value` to the list (mutates it) and return `nil` | `push(xs, 3)` |
+| `pop(list)` | Remove and return the last element; an error on an empty list | `pop(xs)` → `3` |
+| `range(n)` | `[0, 1, ..., n-1]` | `range(3)` → `[0, 1, 2]` |
+| `range(a, b)` | `[a, ..., b-1]`; empty when `a >= b`; at most 1000000 elements | `range(2, 5)` → `[2, 3, 4]` |
+| `split(s, sep)` | Split the string on the separator (an empty separator is an error) | `split("a,b", ",")` → `["a", "b"]` |
+| `lines(s)` | The lines of the string (split on `\n`, trailing `\r` stripped, no empty line for a trailing newline) | `lines("a\nb\n")` → `["a", "b"]` |
+| `read_file(path)` | The whole file as a string | `read_file("notes.txt")` |
+| `write_file(path, text)` | Create or overwrite the file, return `nil` | `write_file("notes.txt", "ciao")` |
+| `append_file(path, text)` | Append to the file (creating it if needed), return `nil` | `append_file("notes.txt", " mondo")` |
+| `file_exists(path)` | `true` when the path exists | `file_exists("notes.txt")` → `true` |
 
 Wrong arity is a runtime error naming the builtin
 (`len() expects 1 argument(s) but got 0`); a wrong argument type
@@ -185,6 +219,37 @@ Come ti chiami? Ciao, Giuliano!
 Indovina un numero da 1 a 10: Troppo piccolo, era 7
 ```
 
+## Files
+
+File handling is whole-file only: GG has no open file handles.
+Paths are strings, relative to the current directory.
+`read_file`/`write_file`/`append_file` fail with a runtime error
+carrying the operating system's message when the file cannot be
+read or written (`read_file("x.gg"): No such file or directory`).
+
+Example — read a file, split it into lines, print them numbered:
+
+```gg
+let path = "notes.txt"
+if file_exists(path) then
+    let rows = lines(read_file(path))
+    for i = 0 to len(rows) - 1 then
+        print str(i + 1) + ". " + rows[i]
+    end
+else
+    print "file not found: " + path
+end
+```
+
+```
+$ cat notes.txt
+comprare il pane
+chiamare Fabiana
+$ gg run numbered.gg
+1. comprare il pane
+2. chiamare Fabiana
+```
+
 ## Grammar
 
 ```text
@@ -192,6 +257,7 @@ program   := statement* EOF
 block     := statement* ("end" | "else")
 statement := "let" ident "=" expr
            | ident "=" expr
+           | index "=" expr
            | "print" expr
            | "if" expr "then" block ["else" block] "end"
            | "while" expr "then" block "end"
@@ -206,10 +272,13 @@ equality  := comparison (("==" | "!=") comparison)*
 comparison:= term (("<" | "<=" | ">" | ">=") term)*
 term      := factor (("+" | "-") factor)*
 factor    := unary (("*" | "/" | "%") unary)*
-unary     := ("-" | "not") unary | primary
+unary     := ("-" | "not") unary | postfix
+postfix   := primary ("[" expr "]")*
 primary   := number | string | "true" | "false"
+           | "[" [expr ("," expr)*] "]"
            | ident ["(" [expr ("," expr)*] ")"]
            | "(" expr ")"
+index     := postfix "[" expr "]"
 ```
 
 Statements are separated by newlines and/or `;`. Assignment (`x = ...`)
@@ -237,7 +306,7 @@ print sum_to(10)
 | Numbers | integers `42`, floats `3.14` (`.5` and `5.` are errors) |
 | Strings | `"..."` with escapes `\"` `\\` `\n` `\t` |
 | Operators | `+ - * / % == != < <= > >= =` (`!` alone is not an operator) |
-| Punctuation | `( ) ,` |
+| Punctuation | `( ) , [ ]` |
 | Separators | newline, `;` |
 | Comments | `#` to end of line |
 
@@ -269,7 +338,8 @@ exit with code 1.
 3. **Interpreter** ✅ — `gg-interp` (variables, `print`, `if`/`while`/`for`, operators, functions, closures)
 4. **Builtins + standard library** ✅ — builtin functions (`len`, `type`, `str`, `int`, `float`, `input`, `abs`, `min`, `max`)
 5. **REPL** ✅ — interactive shell (`gg` / `gg repl`): persistent state, multi-line blocks, expression echo, error recovery
-6. **Lists + file handling** — lists (`[1, 2, 3]`), `read_file`/`write_file`
+6. **Lists + file handling** ✅ — lists (`[1, 2, 3]`, indexing, `push`/`pop`/`range`/`split`/`lines`) and whole-file helpers (`read_file`/`write_file`/`append_file`/`file_exists`).
+6. **Lists + file handling** ✅ — lists (`[1, 2, 3]`, indexing, aliasing, `push`/`pop`/`range`/`split`/`lines`) and whole-file helpers (`read_file`/`write_file`/`append_file`/`file_exists`)
 7. **OOP** — classes, methods, inheritance
 8. **Modules + virtual environments** — `import`, packages, per-project envs (like `venv`)
 

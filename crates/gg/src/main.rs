@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `gg` — the GG programming language.
 //!
-//! Phase 5: the lexer (`gg --tokens file.gg`), the parser
+//! Phase 6: the lexer (`gg --tokens file.gg`), the parser
 //! (`gg --ast file.gg`), the interpreter (`gg run file.gg`, with
 //! builtins and `input` from stdin) and the REPL (`gg` with no
-//! arguments, or `gg repl`) are available.
+//! arguments, or `gg repl`) are available. Lists and file handling
+//! are in.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -12,7 +13,7 @@ use std::process::ExitCode;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("gg {VERSION} — the GG programming language (Phase 5: REPL)");
+    println!("gg {VERSION} — the GG programming language (Phase 6: lists + files)");
     println!();
     println!("Usage: gg [options] <file.gg>");
     println!();

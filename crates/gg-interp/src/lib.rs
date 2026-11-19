@@ -414,4 +414,231 @@ mod tests {
         let src = "if true then\n    let len = 1\nend\nprint len(\"ab\")\n";
         assert_eq!(run_ok(src), "2\n");
     }
+
+    // ---- Phase 6: lists ----
+
+    #[test]
+    fn list_literals_print() {
+        assert_eq!(run_ok("print [1, 2, 3]\n"), "[1, 2, 3]\n");
+        assert_eq!(run_ok("print []\n"), "[]\n");
+        assert_eq!(
+            run_ok("print [1, \"ciao\", true]\n"),
+            "[1, \"ciao\", true]\n"
+        );
+        assert_eq!(run_ok("print [[1, 2], [3]]\n"), "[[1, 2], [3]]\n");
+        assert_eq!(run_ok("print [1 + 2, len(\"ab\")]\n"), "[3, 2]\n");
+    }
+
+    #[test]
+    fn indexing_positive_and_negative() {
+        let src = "let xs = [10, 20, 30]\nprint xs[0]\nprint xs[2]\nprint xs[-1]\nprint xs[-3]\n";
+        assert_eq!(run_ok(src), "10\n30\n30\n10\n");
+        // Indexing a literal and a call result.
+        assert_eq!(run_ok("print [7, 8][1]\n"), "8\n");
+        let src = "fn get()\n    return [1, 2]\nend\nprint get()[1]\n";
+        assert_eq!(run_ok(src), "2\n");
+    }
+
+    #[test]
+    fn indexing_errors() {
+        assert!(run_err("let xs = [1]\nprint xs[1]\n").contains("list index out of range"));
+        assert!(run_err("let xs = [1]\nprint xs[-2]\n").contains("list index out of range"));
+        assert!(
+            run_err("let xs = [1]\nprint xs[\"a\"]\n").contains("list index must be an integer")
+        );
+        assert!(run_err("let xs = [1]\nprint xs[1.0]\n").contains("list index must be an integer"));
+        assert!(run_err("print 5[0]\n").contains("cannot index Int"));
+        assert!(run_err("print \"abc\"[0]\n").contains("cannot index Str"));
+    }
+
+    #[test]
+    fn index_assignment_including_nested() {
+        let src = "let xs = [1, 2, 3]\nxs[0] = 99\nprint xs\n";
+        assert_eq!(run_ok(src), "[99, 2, 3]\n");
+        let src = "let xs = [1, 2, 3]\nxs[-1] = 9\nprint xs\n";
+        assert_eq!(run_ok(src), "[1, 2, 9]\n");
+        let src = "let m = [[1, 2], [3, 4]]\nm[0][1] = 20\nm[1][0] = 30\nprint m\n";
+        assert_eq!(run_ok(src), "[[1, 20], [30, 4]]\n");
+        // The index may be an expression.
+        let src = "let xs = [0, 0]\nxs[1 - 1] = 5\nprint xs\n";
+        assert_eq!(run_ok(src), "[5, 0]\n");
+        // Errors: out of range, and a non-list target.
+        assert!(run_err("let xs = [1]\nxs[5] = 2\n").contains("list index out of range"));
+        assert!(run_err("let x = 5\nx[0] = 2\n").contains("cannot index Int"));
+        // A call result is not a valid assignment target.
+        assert!(run_err("f() = 1\n").contains("invalid assignment target"));
+    }
+
+    #[test]
+    fn list_aliasing_shares_the_list() {
+        let src = "let a = [1, 2]\nlet b = a\npush(b, 3)\nprint a\nprint b\n";
+        assert_eq!(run_ok(src), "[1, 2, 3]\n[1, 2, 3]\n");
+        // Index assignment through the alias is visible too.
+        let src = "let a = [1]\nlet b = a\nb[0] = 9\nprint a[0]\n";
+        assert_eq!(run_ok(src), "9\n");
+    }
+
+    #[test]
+    fn len_on_lists() {
+        assert_eq!(run_ok("print len([1, 2, 3])\n"), "3\n");
+        assert_eq!(run_ok("print len([])\n"), "0\n");
+        assert_eq!(run_ok("print len([[1], [2, 3]])\n"), "2\n");
+        assert!(run_err("print len(5)\n").contains("len() expects a Str or a List"));
+    }
+
+    #[test]
+    fn push_and_pop() {
+        let src = "let xs = []\npush(xs, 1)\npush(xs, 2)\nprint xs\nprint pop(xs)\nprint xs\n";
+        assert_eq!(run_ok(src), "[1, 2]\n2\n[1]\n");
+        // push returns nil.
+        assert_eq!(run_ok("let xs = []\nprint push(xs, 1)\n"), "nil\n");
+        assert!(run_err("print pop([])\n").contains("pop() on empty list"));
+        assert!(run_err("print push(5, 1)\n").contains("push() expects a List"));
+        assert!(run_err("print pop(\"s\")\n").contains("pop() expects a List"));
+    }
+
+    #[test]
+    fn range_forms() {
+        assert_eq!(run_ok("print range(3)\n"), "[0, 1, 2]\n");
+        assert_eq!(run_ok("print range(0)\n"), "[]\n");
+        assert_eq!(run_ok("print range(2, 5)\n"), "[2, 3, 4]\n");
+        assert_eq!(run_ok("print range(3, 3)\n"), "[]\n");
+        assert_eq!(run_ok("print range(5, 2)\n"), "[]\n");
+        assert_eq!(run_ok("print range(-2, 2)\n"), "[-2, -1, 0, 1]\n");
+        assert_eq!(run_ok("print len(range(100))\n"), "100\n");
+        assert!(
+            run_err("print range()\n").contains("range() expects 1 or 2 argument(s) but got 0")
+        );
+        assert!(
+            run_err("print range(1, 2, 3)\n")
+                .contains("range() expects 1 or 2 argument(s) but got 3")
+        );
+        assert!(run_err("print range(\"a\")\n").contains("range() expects an Int"));
+        assert!(run_err("print range(0, 1000001)\n").contains("range() is too large"));
+    }
+
+    #[test]
+    fn split_and_lines() {
+        assert_eq!(
+            run_ok("print split(\"a,b,c\", \",\")\n"),
+            "[\"a\", \"b\", \"c\"]\n"
+        );
+        assert_eq!(run_ok("print split(\"abc\", \",\")\n"), "[\"abc\"]\n");
+        assert_eq!(run_ok("print split(\"\", \",\")\n"), "[\"\"]\n");
+        assert_eq!(
+            run_ok("print split(\"a--b\", \"--\")\n"),
+            "[\"a\", \"b\"]\n"
+        );
+        assert!(
+            run_err("print split(\"a\", \"\")\n").contains("split() separator must not be empty")
+        );
+        assert!(run_err("print split(5, \",\")\n").contains("split() expects a Str"));
+        assert_eq!(
+            run_ok("print lines(\"a\\nb\\nc\")\n"),
+            "[\"a\", \"b\", \"c\"]\n"
+        );
+        assert_eq!(run_ok("print lines(\"a\\nb\\n\")\n"), "[\"a\", \"b\"]\n");
+        assert_eq!(run_ok("print lines(\"\")\n"), "[]\n");
+        assert_eq!(run_ok("print lines(\"solo\")\n"), "[\"solo\"]\n");
+    }
+
+    #[test]
+    fn list_equality() {
+        assert_eq!(run_ok("print [1, 2] == [1, 2]\n"), "true\n");
+        assert_eq!(run_ok("print [1, 2] == [1, 3]\n"), "false\n");
+        assert_eq!(run_ok("print [1, 2] == [1, 2, 3]\n"), "false\n");
+        assert_eq!(run_ok("print [] == []\n"), "true\n");
+        assert_eq!(run_ok("print [1, [2]] == [1, [2]]\n"), "true\n");
+        assert_eq!(run_ok("print [1] == 1\n"), "false\n");
+        // The same list is equal to itself, even when cyclic.
+        let src = "let a = [1]\npush(a, a)\nprint a == a\n";
+        assert_eq!(run_ok(src), "true\n");
+        // Two distinct cyclic lists are reported unequal (and the
+        // comparison terminates instead of recursing forever).
+        let src = "let a = [1]\npush(a, a)\nlet b = [1]\npush(b, b)\nprint a == b\n";
+        assert_eq!(run_ok(src), "false\n");
+    }
+
+    #[test]
+    fn list_display_quotes_strings_and_caps_depth() {
+        assert_eq!(
+            run_ok("print [\"a\", \"b\\n c\"]\n"),
+            "[\"a\", \"b\\n c\"]\n"
+        );
+        assert_eq!(run_ok("print type([1])\n"), "list\n");
+        assert_eq!(run_ok("print str([1, \"x\"])\n"), "[1, \"x\"]\n");
+        // A self-referential list prints with `...` past the depth
+        // cap instead of recursing forever.
+        let src = "let a = [1]\npush(a, a)\nprint a\n";
+        let out = run_ok(src);
+        assert!(out.contains("..."), "{out}");
+        assert!(out.starts_with("[1, [1,"), "{out}");
+    }
+
+    #[test]
+    fn iterating_a_list_with_for_and_len() {
+        let src = "let xs = [10, 20, 30]\nfor i = 0 to len(xs) - 1 then\n    print xs[i]\nend\n";
+        assert_eq!(run_ok(src), "10\n20\n30\n");
+    }
+
+    // ---- Phase 6: files ----
+
+    /// A fresh scratch directory for a file test (unique per test
+    /// tag, removed when the test is done).
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gg-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_write_read_append_and_exists() {
+        let dir = temp_dir("files");
+        let path = dir.join("hello.txt");
+        let path_str = path.to_str().unwrap();
+        let src = format!(
+            "print file_exists(\"{path_str}\")\nwrite_file(\"{path_str}\", \"ciao\")\nprint file_exists(\"{path_str}\")\nprint read_file(\"{path_str}\")\nappend_file(\"{path_str}\", \" mondo\")\nprint read_file(\"{path_str}\")\n"
+        );
+        assert_eq!(run_ok(&src), "false\ntrue\nciao\nciao mondo\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ciao mondo");
+        // `lines` strips the `\r` of CRLF endings too (the file is
+        // written from Rust here, since GG string literals have no
+        // `\r` escape).
+        let crlf = dir.join("crlf.txt");
+        std::fs::write(&crlf, "a\r\nb\r\n").unwrap();
+        let crlf_str = crlf.to_str().unwrap();
+        let src = format!("print lines(read_file(\"{crlf_str}\"))\n");
+        assert_eq!(run_ok(&src), "[\"a\", \"b\"]\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_errors() {
+        let dir = temp_dir("file-errors");
+        let missing = dir.join("nope.txt");
+        let missing_str = missing.to_str().unwrap();
+        let err = run_err(&format!("print read_file(\"{missing_str}\")\n"));
+        assert!(
+            err.contains(&format!(
+                "read_file(\"{missing_str}\"): No such file or directory"
+            )),
+            "{err}"
+        );
+        // Writing where the parent directory does not exist fails.
+        let bad = dir.join("no-such-dir").join("f.txt");
+        let bad_str = bad.to_str().unwrap();
+        let err = run_err(&format!("write_file(\"{bad_str}\", \"x\")\n"));
+        assert!(
+            err.contains(&format!("write_file(\"{bad_str}\"):")),
+            "{err}"
+        );
+        assert!(err.contains("No such file or directory"), "{err}");
+        // Non-string arguments are type errors.
+        assert!(run_err("print read_file(5)\n").contains("read_file() expects a Str"));
+        assert!(run_err("print write_file(\"a\", 5)\n").contains("write_file() expects a Str"));
+        assert!(run_err("print file_exists(5)\n").contains("file_exists() expects a Str"));
+        assert!(run_err("print append_file(5, \"x\")\n").contains("append_file() expects a Str"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

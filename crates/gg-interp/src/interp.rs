@@ -9,6 +9,7 @@
 //! - functions are closures: they capture the defining environment
 //!   (and therefore see themselves, so recursion works).
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
@@ -108,6 +109,13 @@ impl Interpreter {
             Stmt::Assign { name, value } => {
                 let value = self.eval_expr(value, env, input, out)?;
                 env.assign(name, value)?;
+                Ok(Flow::Normal)
+            }
+            Stmt::IndexAssign { target, value } => {
+                // The right-hand side is evaluated first (like
+                // Python), then the index assignment happens.
+                let value = self.eval_expr(value, env, input, out)?;
+                self.assign_index(target, value, env, input, out)?;
                 Ok(Flow::Normal)
             }
             Stmt::Print { expr } => {
@@ -214,6 +222,18 @@ impl Interpreter {
             Expr::Str(s) => Ok(Value::Str(s.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Ident(name) => env.get(name),
+            Expr::List(elements) => {
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    values.push(self.eval_expr(element, env, input, out)?);
+                }
+                Ok(Value::List(Rc::new(RefCell::new(values))))
+            }
+            Expr::Index { target, index } => {
+                let target = self.eval_expr(target, env, input, out)?;
+                let index = self.eval_expr(index, env, input, out)?;
+                index_list(&target, index)
+            }
             Expr::Unary { op, expr } => {
                 let value = self.eval_expr(expr, env, input, out)?;
                 match op {
@@ -250,11 +270,11 @@ impl Interpreter {
                         self.call(&function, values, input, out)
                     }
                     Value::Builtin(builtin) => {
-                        if args.len() != builtin.arity {
+                        if !builtin.arity.accepts(args.len()) {
                             return Err(RuntimeError::new(format!(
                                 "{}() expects {} argument(s) but got {}",
                                 builtin.name,
-                                builtin.arity,
+                                builtin.arity.describe(),
                                 args.len()
                             )));
                         }
@@ -324,6 +344,33 @@ impl Interpreter {
         }
     }
 
+    /// Assign through an index: the target must be an `Index`
+    /// expression (`xs[0]`, `m[0][1]`). The container is evaluated
+    /// first, then the final index, and the element is replaced.
+    fn assign_index(
+        &mut self,
+        target: &Expr,
+        value: Value,
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        let Expr::Index { target, index } = target else {
+            return Err(RuntimeError::new("invalid assignment target"));
+        };
+        let container = self.eval_expr(target, env, input, out)?;
+        let index = self.eval_expr(index, env, input, out)?;
+        let Value::List(list) = container else {
+            return Err(RuntimeError::new(format!(
+                "cannot index {}",
+                container.type_name()
+            )));
+        };
+        let pos = resolve_index(&list.borrow(), index)?;
+        list.borrow_mut()[pos] = value;
+        Ok(())
+    }
+
     /// Call a user function: fresh scope under the captured environment,
     /// parameters bound, `return` caught as the result.
     fn call(
@@ -342,6 +389,33 @@ impl Interpreter {
             Flow::Return(value) => Ok(value),
         }
     }
+}
+
+/// Resolve a (possibly negative) index into a position: `-1` is the
+/// last element, `-len` the first. Out of range is an error.
+fn resolve_index(list: &[Value], index: Value) -> Result<usize, RuntimeError> {
+    let Value::Int(i) = index else {
+        return Err(RuntimeError::new("list index must be an integer"));
+    };
+    let len = list.len() as i64;
+    let pos = if i < 0 { len + i } else { i };
+    if pos < 0 || pos >= len {
+        return Err(RuntimeError::new("list index out of range"));
+    }
+    Ok(pos as usize)
+}
+
+/// `xs[i]`: read one element (negative indexes count from the end).
+fn index_list(target: &Value, index: Value) -> Result<Value, RuntimeError> {
+    let Value::List(list) = target else {
+        return Err(RuntimeError::new(format!(
+            "cannot index {}",
+            target.type_name()
+        )));
+    };
+    let borrowed = list.borrow();
+    let pos = resolve_index(&borrowed, index)?;
+    Ok(borrowed[pos].clone())
 }
 
 /// `+`: integer/float arithmetic, or string concatenation.

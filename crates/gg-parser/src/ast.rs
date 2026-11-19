@@ -31,6 +31,11 @@ pub enum Stmt {
         name: String,
         value: Expr,
     },
+    /// Assignment through an index: `xs[0] = 99`, `m[0][1] = 2`.
+    IndexAssign {
+        target: Expr,
+        value: Expr,
+    },
     Print {
         expr: Expr,
     },
@@ -82,6 +87,14 @@ pub enum Expr {
     Call {
         name: String,
         args: Vec<Expr>,
+    },
+    /// A list literal: `[1, 2, 3]`, `[]`, nested and mixed.
+    List(Vec<Expr>),
+    /// Indexing: `xs[0]`, `f()[0]`, `xs[0][1]`. Binds as tightly as
+    /// a call (it is a postfix operator, see the parser).
+    Index {
+        target: Box<Expr>,
+        index: Box<Expr>,
     },
 }
 
@@ -189,6 +202,22 @@ impl Expr {
                 }
                 write!(f, ")")?;
             }
+            Expr::List(elements) => {
+                write!(f, "[")?;
+                for (i, element) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    element.fmt_prec(f, 0)?;
+                }
+                write!(f, "]")?;
+            }
+            Expr::Index { target, index } => {
+                target.fmt_prec(f, 8)?;
+                write!(f, "[")?;
+                index.fmt_prec(f, 0)?;
+                write!(f, "]")?;
+            }
         }
         if need_parens {
             write!(f, ")")?;
@@ -255,6 +284,7 @@ impl Stmt {
         match self {
             Stmt::Let { name, value } => write!(f, "{pad}let {name} = {value}"),
             Stmt::Assign { name, value } => write!(f, "{pad}{name} = {value}"),
+            Stmt::IndexAssign { target, value } => write!(f, "{pad}{target} = {value}"),
             Stmt::Print { expr } => write!(f, "{pad}print {expr}"),
             Stmt::If {
                 cond,

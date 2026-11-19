@@ -76,6 +76,8 @@ pub enum TokenKind {
     // Punctuation
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     // Separators
     Newline,
@@ -121,6 +123,8 @@ impl TokenKind {
             TokenKind::Eq => "Eq",
             TokenKind::LParen => "LParen",
             TokenKind::RParen => "RParen",
+            TokenKind::LBracket => "LBracket",
+            TokenKind::RBracket => "RBracket",
             TokenKind::Comma => "Comma",
             TokenKind::Newline => "Newline",
             TokenKind::Semicolon => "Semicolon",
@@ -164,6 +168,8 @@ impl TokenKind {
             TokenKind::Eq => "=".to_string(),
             TokenKind::LParen => "(".to_string(),
             TokenKind::RParen => ")".to_string(),
+            TokenKind::LBracket => "[".to_string(),
+            TokenKind::RBracket => "]".to_string(),
             TokenKind::Comma => ",".to_string(),
             TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof => String::new(),
         }
@@ -307,6 +313,14 @@ impl Lexer {
                 ')' => {
                     self.advance();
                     return Ok(self.token(TokenKind::RParen, line, col));
+                }
+                '[' => {
+                    self.advance();
+                    return Ok(self.token(TokenKind::LBracket, line, col));
+                }
+                ']' => {
+                    self.advance();
+                    return Ok(self.token(TokenKind::RBracket, line, col));
                 }
                 ',' => {
                     self.advance();
@@ -705,7 +719,7 @@ mod tests {
     #[test]
     fn arithmetic_operators_and_punctuation() {
         assert_eq!(
-            kinds_no_eof("+ - * / % ( ) ,"),
+            kinds_no_eof("+ - * / % ( ) , [ ]"),
             vec![
                 TokenKind::Plus,
                 TokenKind::Minus,
@@ -715,6 +729,8 @@ mod tests {
                 TokenKind::LParen,
                 TokenKind::RParen,
                 TokenKind::Comma,
+                TokenKind::LBracket,
+                TokenKind::RBracket,
             ]
         );
     }
