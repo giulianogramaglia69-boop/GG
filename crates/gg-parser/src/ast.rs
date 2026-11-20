@@ -36,6 +36,13 @@ pub enum Stmt {
         target: Expr,
         value: Expr,
     },
+    /// Assignment through a field: `p.nome = "Giuliano"`,
+    /// `self.eta = eta`. Sets a field on the instance — never a
+    /// method (a field with the same name as a method shadows it).
+    FieldAssign {
+        target: Expr,
+        value: Expr,
+    },
     Print {
         expr: Expr,
     },
@@ -59,12 +66,29 @@ pub enum Stmt {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    /// A class definition: `class Persona ... end`, optionally
+    /// `class Studente extends Persona ... end`. The body holds
+    /// only method definitions.
+    Class {
+        name: String,
+        parent: Option<String>,
+        methods: Vec<MethodDef>,
+    },
     Return {
         expr: Option<Expr>,
     },
     ExprStmt {
         expr: Expr,
     },
+}
+
+/// One method definition inside a `class` body. The first
+/// parameter must be named `self` (enforced by the parser).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 /// One expression.
@@ -105,6 +129,28 @@ pub enum Expr {
     Index {
         target: Box<Expr>,
         index: Box<Expr>,
+    },
+    /// The `self` keyword: the instance a method was called on.
+    SelfExpr,
+    /// Field access: `p.nome`, `self.eta`. On an instance it reads
+    /// a field first, then a method (bound); on a class it reads an
+    /// unbound method.
+    Field {
+        target: Box<Expr>,
+        name: String,
+    },
+    /// A method call: `p.saluta("ciao")`, `self.nome()`. The
+    /// instance is passed as `self` implicitly.
+    MethodCall {
+        target: Box<Expr>,
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// A call into the parent class: `super.init(nome, eta)`,
+    /// `super.saluta()`. Only valid inside a method.
+    SuperCall {
+        name: String,
+        args: Vec<Expr>,
     },
 }
 
@@ -265,6 +311,32 @@ impl Expr {
                 index.fmt_prec(f, 0)?;
                 write!(f, "]")?;
             }
+            Expr::SelfExpr => write!(f, "self")?,
+            Expr::Field { target, name } => {
+                target.fmt_prec(f, 8)?;
+                write!(f, ".{name}")?;
+            }
+            Expr::MethodCall { target, name, args } => {
+                target.fmt_prec(f, 8)?;
+                write!(f, ".{name}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    arg.fmt_prec(f, 0)?;
+                }
+                write!(f, ")")?;
+            }
+            Expr::SuperCall { name, args } => {
+                write!(f, "super.{name}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    arg.fmt_prec(f, 0)?;
+                }
+                write!(f, ")")?;
+            }
         }
         if need_parens {
             write!(f, ")")?;
@@ -332,6 +404,7 @@ impl Stmt {
             Stmt::Let { name, value } => write!(f, "{pad}let {name} = {value}"),
             Stmt::Assign { name, value } => write!(f, "{pad}{name} = {value}"),
             Stmt::IndexAssign { target, value } => write!(f, "{pad}{target} = {value}"),
+            Stmt::FieldAssign { target, value } => write!(f, "{pad}{target} = {value}"),
             Stmt::Print { expr } => write!(f, "{pad}print {expr}"),
             Stmt::If {
                 cond,
@@ -367,6 +440,34 @@ impl Stmt {
             Stmt::Fn { name, params, body } => {
                 write!(f, "{pad}fn {name}({})", params.join(", "))?;
                 write_block(f, body, indent + 1)?;
+                write!(f, "{pad}end")
+            }
+            Stmt::Class {
+                name,
+                parent,
+                methods,
+            } => {
+                write!(f, "{pad}class {name}")?;
+                if let Some(parent) = parent {
+                    write!(f, " extends {parent}")?;
+                }
+                writeln!(f)?;
+                for (i, method) in methods.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                    }
+                    write!(
+                        f,
+                        "{pad}    fn {}({})",
+                        method.name,
+                        method.params.join(", ")
+                    )?;
+                    write_block(f, &method.body, indent + 2)?;
+                    write!(f, "{pad}    end")?;
+                }
+                if !methods.is_empty() {
+                    writeln!(f)?;
+                }
                 write!(f, "{pad}end")
             }
             Stmt::Return { expr } => match expr {

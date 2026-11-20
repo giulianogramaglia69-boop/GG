@@ -19,7 +19,10 @@ use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 use crate::builtin;
 use crate::env::Environment;
 use crate::error::RuntimeError;
-use crate::value::{DictData, Function, Value, elem_type_of, values_equal};
+use crate::value::{
+    BoundMethod, ClassDef, DictData, Function, InstanceData, Value, elem_type_of, lookup_method,
+    values_equal,
+};
 
 /// What executing a statement produced: either control flows on
 /// normally, or a `return` was hit with its value.
@@ -30,8 +33,13 @@ enum Flow {
 
 /// The interpreter. One instance keeps a global environment across
 /// `run` calls, so a REPL can reuse it later.
+///
+/// `super_stack` tracks the class whose method is currently
+/// executing (innermost first): `super.foo()` looks the method up
+/// in that class's parent. It is empty outside methods.
 pub struct Interpreter {
     globals: Rc<Environment>,
+    super_stack: Vec<Rc<ClassDef>>,
 }
 
 impl Default for Interpreter {
@@ -44,7 +52,41 @@ impl Interpreter {
     pub fn new() -> Self {
         let globals = Environment::new();
         builtin::define_all(&globals);
-        Self { globals }
+        Self {
+            globals,
+            super_stack: Vec::new(),
+        }
+    }
+
+    /// The string to show for a value: an instance whose class
+    /// defines a `str` method uses it; anything else uses its
+    /// Display form. Used by `print`, by the REPL echo, and by
+    /// `str()` on instances (see `call_value`).
+    pub fn display(
+        &mut self,
+        value: &Value,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<String, RuntimeError> {
+        let custom = match value {
+            Value::Instance(inst) => lookup_method(&inst.borrow().class, "str")
+                .map(|(function, class)| (Rc::clone(inst), function, class)),
+            _ => None,
+        };
+        if let Some((inst, function, class)) = custom {
+            let bound = BoundMethod {
+                name: "str".to_string(),
+                instance: inst,
+                function,
+                class,
+            };
+            let result = self.call_method(&bound, vec![], input, out)?;
+            let Value::Str(s) = result else {
+                return Err(RuntimeError::new("str() method must return a Str"));
+            };
+            return Ok(s);
+        }
+        Ok(format!("{value}"))
     }
 
     /// Evaluate one expression in the global environment and return
@@ -118,9 +160,61 @@ impl Interpreter {
                 self.assign_index(target, value, env, input, out)?;
                 Ok(Flow::Normal)
             }
+            Stmt::FieldAssign { target, value } => {
+                let value = self.eval_expr(value, env, input, out)?;
+                self.assign_field(target, value, env, input, out)?;
+                Ok(Flow::Normal)
+            }
+            Stmt::Class {
+                name,
+                parent,
+                methods,
+            } => {
+                let parent_class = match parent {
+                    Some(parent_name) => {
+                        let value = env.get(parent_name)?;
+                        let Value::Class(class) = value else {
+                            return Err(RuntimeError::new(format!(
+                                "parent '{parent_name}' is not a class"
+                            )));
+                        };
+                        Some(class)
+                    }
+                    None => None,
+                };
+                // Methods capture the environment where the class is
+                // defined, so they see globals — and the class name
+                // itself, for creating more instances inside a
+                // method. A later method with the same name replaces
+                // an earlier one (like Python).
+                let mut def_methods: Vec<(String, Rc<Function>)> = Vec::new();
+                for method in methods {
+                    let function = Rc::new(Function {
+                        params: method.params.clone(),
+                        body: method.body.clone(),
+                        env: Rc::clone(env),
+                        // Methods get their `super` context from the
+                        // call, not from where the class is defined.
+                        super_class: None,
+                    });
+                    if let Some(slot) = def_methods.iter_mut().find(|(n, _)| *n == method.name) {
+                        slot.1 = Rc::clone(&function);
+                    } else {
+                        def_methods.push((method.name.clone(), function));
+                    }
+                }
+                let class = Rc::new(ClassDef {
+                    name: name.clone(),
+                    parent: parent_class,
+                    methods: def_methods,
+                });
+                env.define(name, Value::Class(class));
+                Ok(Flow::Normal)
+            }
             Stmt::Print { expr } => {
                 let value = self.eval_expr(expr, env, input, out)?;
-                writeln!(out, "{value}")
+                let text = self.display(&value, input, out)?;
+                writeln!(out, "{text}")
                     .map_err(|e| RuntimeError::new(format!("output error: {e}")))?;
                 Ok(Flow::Normal)
             }
@@ -185,11 +279,14 @@ impl Interpreter {
             }
             Stmt::Fn { name, params, body } => {
                 // The function captures `env` itself, so it can see the
-                // name being defined here: recursion works.
+                // name being defined here: recursion works. It also
+                // captures the class of the method it is defined in
+                // (if any), so `super` inside it resolves lexically.
                 let function = Function {
                     params: params.clone(),
                     body: body.clone(),
                     env: Rc::clone(env),
+                    super_class: self.super_stack.last().cloned(),
                 };
                 env.define(name, Value::Function(Rc::new(function)));
                 Ok(Flow::Normal)
@@ -273,6 +370,49 @@ impl Interpreter {
                 let index = self.eval_expr(index, env, input, out)?;
                 index_value(&target, index)
             }
+            Expr::SelfExpr => env.get("self"),
+            Expr::Field { target, name } => {
+                let obj = self.eval_expr(target, env, input, out)?;
+                self.get_field(&obj, name)
+            }
+            Expr::MethodCall { target, name, args } => {
+                let obj = self.eval_expr(target, env, input, out)?;
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval_expr(arg, env, input, out)?);
+                }
+                self.call_method_on(&obj, name, values, input, out)
+            }
+            Expr::SuperCall { name, args } => {
+                // `super` only means something inside a method: the
+                // defining class is the top of the super stack.
+                let Some(defining) = self.super_stack.last() else {
+                    return Err(RuntimeError::new("'super' outside a method"));
+                };
+                let Some(parent) = &defining.parent else {
+                    return Err(RuntimeError::new(format!(
+                        "class '{}' has no parent (no super)",
+                        defining.name
+                    )));
+                };
+                let (function, class) = lookup_method(parent, name).ok_or_else(|| {
+                    RuntimeError::new(format!("parent class has no method '{name}'"))
+                })?;
+                let Value::Instance(instance) = env.get("self")? else {
+                    return Err(RuntimeError::new("'self' is not an instance"));
+                };
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval_expr(arg, env, input, out)?);
+                }
+                let bound = BoundMethod {
+                    name: name.to_string(),
+                    instance,
+                    function,
+                    class,
+                };
+                self.call_method(&bound, values, input, out)
+            }
             Expr::Unary { op, expr } => {
                 let value = self.eval_expr(expr, env, input, out)?;
                 match op {
@@ -293,8 +433,151 @@ impl Interpreter {
             Expr::Binary { op, left, right } => self.eval_binary(*op, left, right, env, input, out),
             Expr::Call { name, args } => {
                 let callee = env.get(name)?;
-                match callee {
-                    Value::Function(function) => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval_expr(arg, env, input, out)?);
+                }
+                self.call_value(&callee, values, input, out)
+            }
+        }
+    }
+
+    /// Call any callable value with already-evaluated arguments:
+    /// a user function, a builtin, a bound method, or a class
+    /// (which creates an instance).
+    fn call_value(
+        &mut self,
+        callee: &Value,
+        args: Vec<Value>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match callee {
+            Value::Function(function) => {
+                if args.len() != function.params.len() {
+                    return Err(RuntimeError::new(format!(
+                        "expected {} argument(s) but got {}",
+                        function.params.len(),
+                        args.len()
+                    )));
+                }
+                self.call(function, args, input, out)
+            }
+            Value::Builtin(builtin) => {
+                if !builtin.arity.accepts(args.len()) {
+                    return Err(RuntimeError::new(format!(
+                        "{}() expects {} argument(s) but got {}",
+                        builtin.name,
+                        builtin.arity.describe(),
+                        args.len()
+                    )));
+                }
+                // `str` on an instance with a custom `str` method
+                // uses it (see `display`); anything else goes to
+                // the builtin itself.
+                if builtin.name == "str" && matches!(args.first(), Some(Value::Instance(_))) {
+                    return Ok(Value::Str(self.display(&args[0], input, out)?));
+                }
+                (builtin.func)(&args, input, out)
+            }
+            Value::BoundMethod(bound) => self.call_method(bound, args, input, out),
+            Value::Class(class) => self.construct(class, args, input, out),
+            other => Err(RuntimeError::new(format!(
+                "cannot call {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Read a field or method from a value. On an instance, fields
+    /// win over methods; on a class, a method is returned unbound
+    /// (call it with the instance as its first argument).
+    fn get_field(&mut self, obj: &Value, name: &str) -> Result<Value, RuntimeError> {
+        match obj {
+            Value::Instance(inst) => {
+                if let Some(value) = inst.borrow().get_field(name) {
+                    return Ok(value.clone());
+                }
+                match lookup_method(&inst.borrow().class, name) {
+                    Some((function, class)) => Ok(Value::BoundMethod(Rc::new(BoundMethod {
+                        name: name.to_string(),
+                        instance: Rc::clone(inst),
+                        function,
+                        class,
+                    }))),
+                    None => Err(RuntimeError::new(format!(
+                        "instance of '{}' has no field or method '{}'",
+                        inst.borrow().class.name,
+                        name
+                    ))),
+                }
+            }
+            Value::Class(class) => match lookup_method(class, name) {
+                Some((function, _)) => Ok(Value::Function(function)),
+                None => Err(RuntimeError::new(format!(
+                    "class '{}' has no method '{}'",
+                    class.name, name
+                ))),
+            },
+            other => Err(RuntimeError::new(format!(
+                "cannot access field '{}' of {}",
+                name,
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Call a method on a value: `obj.name(args)`. On an instance,
+    /// a field holding a function wins over a method (fields are
+    /// checked first, like for plain field access); on a class the
+    /// method is unbound, so the caller passes `self` explicitly.
+    fn call_method_on(
+        &mut self,
+        obj: &Value,
+        name: &str,
+        args: Vec<Value>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match obj {
+            Value::Instance(inst) => {
+                if let Some(value) = inst.borrow().get_field(name) {
+                    let value = value.clone();
+                    return self.call_value(&value, args, input, out);
+                }
+                match lookup_method(&inst.borrow().class, name) {
+                    Some((function, class)) => {
+                        let bound = BoundMethod {
+                            name: name.to_string(),
+                            instance: Rc::clone(inst),
+                            function,
+                            class,
+                        };
+                        self.call_method(&bound, args, input, out)
+                    }
+                    None => Err(RuntimeError::new(format!(
+                        "instance of '{}' has no method '{}'",
+                        inst.borrow().class.name,
+                        name
+                    ))),
+                }
+            }
+            Value::Class(class) => match lookup_method(class, name) {
+                Some((function, defining)) => {
+                    // Unbound: the caller passes `self` explicitly.
+                    // When it is an instance, go through the method
+                    // call so `super` works inside; otherwise call
+                    // the function plainly and let it fail on `self`.
+                    if let Some(Value::Instance(inst)) = args.first() {
+                        let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+                        let bound = BoundMethod {
+                            name: name.to_string(),
+                            instance: Rc::clone(inst),
+                            function,
+                            class: defining,
+                        };
+                        self.call_method(&bound, rest, input, out)
+                    } else {
                         if args.len() != function.params.len() {
                             return Err(RuntimeError::new(format!(
                                 "expected {} argument(s) but got {}",
@@ -302,33 +585,118 @@ impl Interpreter {
                                 args.len()
                             )));
                         }
-                        let mut values = Vec::with_capacity(args.len());
-                        for arg in args {
-                            values.push(self.eval_expr(arg, env, input, out)?);
-                        }
-                        self.call(&function, values, input, out)
+                        self.call(&function, args, input, out)
                     }
-                    Value::Builtin(builtin) => {
-                        if !builtin.arity.accepts(args.len()) {
-                            return Err(RuntimeError::new(format!(
-                                "{}() expects {} argument(s) but got {}",
-                                builtin.name,
-                                builtin.arity.describe(),
-                                args.len()
-                            )));
-                        }
-                        let mut values = Vec::with_capacity(args.len());
-                        for arg in args {
-                            values.push(self.eval_expr(arg, env, input, out)?);
-                        }
-                        (builtin.func)(&values, input, out)
-                    }
-                    other => Err(RuntimeError::new(format!(
-                        "cannot call {}",
-                        other.type_name()
-                    ))),
+                }
+                None => Err(RuntimeError::new(format!(
+                    "class '{}' has no method '{}'",
+                    class.name, name
+                ))),
+            },
+            other => Err(RuntimeError::new(format!(
+                "cannot call method '{}' on {}",
+                name,
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Call a method on an instance: bind the instance as `self`
+    /// (the method's first parameter) and run the body with the
+    /// defining class as the `super` context, so `super` works
+    /// inside. The previous context is restored afterwards, so a
+    /// plain function called from the method does not inherit it.
+    fn call_method(
+        &mut self,
+        bound: &BoundMethod,
+        args: Vec<Value>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        let function = &bound.function;
+        if args.len() + 1 != function.params.len() {
+            return Err(RuntimeError::new(format!(
+                "method '{}' expects {} argument(s) but got {}",
+                bound.name,
+                function.params.len() - 1,
+                args.len()
+            )));
+        }
+        let call_env = Environment::child(&function.env);
+        call_env.define(
+            &function.params[0],
+            Value::Instance(Rc::clone(&bound.instance)),
+        );
+        for (param, value) in function.params.iter().skip(1).zip(args) {
+            call_env.define(param, value);
+        }
+        let saved = std::mem::replace(&mut self.super_stack, vec![Rc::clone(&bound.class)]);
+        let result = self.exec_block(&function.body, &call_env, input, out);
+        self.super_stack = saved;
+        match result? {
+            Flow::Normal => Ok(Value::Nil),
+            Flow::Return(value) => Ok(value),
+        }
+    }
+
+    /// Create an instance of a class: run its `init` method (looked
+    /// up the inheritance chain) with the given arguments, or fail
+    /// when arguments are given but there is no `init`.
+    fn construct(
+        &mut self,
+        class: &Rc<ClassDef>,
+        args: Vec<Value>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        let instance = Rc::new(RefCell::new(InstanceData::new(Rc::clone(class))));
+        match lookup_method(class, "init") {
+            Some((function, defining)) => {
+                let bound = BoundMethod {
+                    name: "init".to_string(),
+                    instance: Rc::clone(&instance),
+                    function,
+                    class: defining,
+                };
+                self.call_method(&bound, args, input, out)?;
+            }
+            None => {
+                if !args.is_empty() {
+                    return Err(RuntimeError::new(format!(
+                        "class '{}' takes no arguments (no init method)",
+                        class.name
+                    )));
                 }
             }
+        }
+        Ok(Value::Instance(instance))
+    }
+
+    /// Assign to a field: the target is a `Field` expression
+    /// (`p.nome`, `self.eta`) and the object must be an instance.
+    /// The field is created when it does not exist yet.
+    fn assign_field(
+        &mut self,
+        target: &Expr,
+        value: Value,
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        let Expr::Field { target, name } = target else {
+            return Err(RuntimeError::new("invalid assignment target"));
+        };
+        let obj = self.eval_expr(target, env, input, out)?;
+        match obj {
+            Value::Instance(inst) => {
+                inst.borrow_mut().set_field(name, value);
+                Ok(())
+            }
+            other => Err(RuntimeError::new(format!(
+                "cannot set field '{}' on {}",
+                name,
+                other.type_name()
+            ))),
         }
     }
 
@@ -446,7 +814,10 @@ impl Interpreter {
     }
 
     /// Call a user function: fresh scope under the captured environment,
-    /// parameters bound, `return` caught as the result.
+    /// parameters bound, `return` caught as the result. The `super`
+    /// context is the class the function was defined in (if any): a
+    /// plain function called from a method does not inherit the
+    /// method's `super`.
     fn call(
         &mut self,
         function: &Rc<Function>,
@@ -458,7 +829,16 @@ impl Interpreter {
         for (param, value) in function.params.iter().zip(args) {
             call_env.define(param, value);
         }
-        match self.exec_block(&function.body, &call_env, input, out)? {
+        let saved = std::mem::replace(
+            &mut self.super_stack,
+            match &function.super_class {
+                Some(class) => vec![Rc::clone(class)],
+                None => Vec::new(),
+            },
+        );
+        let result = self.exec_block(&function.body, &call_env, input, out);
+        self.super_stack = saved;
+        match result? {
             Flow::Normal => Ok(Value::Nil),
             Flow::Return(value) => Ok(value),
         }

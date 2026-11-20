@@ -45,6 +45,15 @@ pub enum Value {
     Queue(Rc<RefCell<VecDeque<Value>>>),
     /// A LIFO stack.
     Stack(Rc<RefCell<Vec<Value>>>),
+    /// A class: `class Persona ... end` defines one. Calling it
+    /// creates an instance (its `init` method runs, if any).
+    Class(Rc<ClassDef>),
+    /// An instance of a class: the class plus its fields, in
+    /// insertion order. Instances compare by identity.
+    Instance(Rc<RefCell<InstanceData>>),
+    /// A method bound to an instance: `p.saluta` without the call.
+    /// Calling it passes the instance as `self`.
+    BoundMethod(Rc<BoundMethod>),
 }
 
 /// Max collection nesting depth when printing; deeper levels print
@@ -58,11 +67,18 @@ const MAX_COMPARE_DEPTH: usize = 64;
 
 /// A user-defined function: parameters, body, and the environment
 /// captured at definition time.
+///
+/// `super_class` is the class whose method the function was defined
+/// in, if any (a nested function inside a method): `super` inside
+/// it resolves against that class — lexical, like Python's
+/// `__class__` cell. A plain top-level function has none, so
+/// `super` inside it is an error even when called from a method.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
     pub env: Rc<Environment>,
+    pub super_class: Option<Rc<ClassDef>>,
 }
 
 /// A dict/set key: only the scalar values are hashable. Note that
@@ -132,6 +148,82 @@ impl DictData {
     }
 }
 
+/// A class definition: its name, its parent (single inheritance)
+/// and its methods in definition order (a later method with the
+/// same name replaces an earlier one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDef {
+    pub name: String,
+    pub parent: Option<Rc<ClassDef>>,
+    pub methods: Vec<(String, Rc<Function>)>,
+}
+
+impl ClassDef {
+    /// True when this class is `class` or inherits from it.
+    pub fn is_a(&self, class: &Rc<ClassDef>) -> bool {
+        let mut current: Option<&ClassDef> = Some(self);
+        while let Some(c) = current {
+            if std::ptr::eq(c, class.as_ref()) {
+                return true;
+            }
+            current = c.parent.as_deref();
+        }
+        false
+    }
+}
+
+/// Find a method by name, walking up the parent chain. Returns the
+/// function and the class it was defined in (needed for `super`).
+pub fn lookup_method(class: &Rc<ClassDef>, name: &str) -> Option<(Rc<Function>, Rc<ClassDef>)> {
+    let mut current = Some(Rc::clone(class));
+    while let Some(c) = current {
+        if let Some((_, function)) = c.methods.iter().find(|(n, _)| n == name) {
+            return Some((Rc::clone(function), Rc::clone(&c)));
+        }
+        current = c.parent.clone();
+    }
+    None
+}
+
+/// The fields of an instance, in insertion order (updating a field
+/// keeps its original position, like a dict).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceData {
+    pub class: Rc<ClassDef>,
+    pub fields: Vec<(String, Value)>,
+}
+
+impl InstanceData {
+    pub fn new(class: Rc<ClassDef>) -> Self {
+        Self {
+            class,
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn get_field(&self, name: &str) -> Option<&Value> {
+        self.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+
+    pub fn set_field(&mut self, name: &str, value: Value) {
+        if let Some(slot) = self.fields.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = value;
+        } else {
+            self.fields.push((name.to_string(), value));
+        }
+    }
+}
+
+/// A method bound to an instance: `p.saluta` without the call.
+/// `class` is where the method was defined (for `super`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundMethod {
+    pub name: String,
+    pub instance: Rc<RefCell<InstanceData>>,
+    pub function: Rc<Function>,
+    pub class: Rc<ClassDef>,
+}
+
 /// The element type of an array: the type of its first element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElemType {
@@ -187,6 +279,9 @@ impl Value {
             Value::Array(_) => "Array",
             Value::Queue(_) => "Queue",
             Value::Stack(_) => "Stack",
+            Value::Class(_) => "Class",
+            Value::Instance(_) => "Instance",
+            Value::BoundMethod(_) => "Function",
         }
     }
 
@@ -325,6 +420,25 @@ impl Value {
                     element.fmt_nested(f, depth + 1)?;
                 }
                 write!(f, "])")
+            }
+            Value::Class(class) => write!(f, "<class {}>", class.name),
+            Value::Instance(inst) => {
+                if depth >= MAX_DEPTH {
+                    return write!(f, "...");
+                }
+                let inst = inst.borrow();
+                write!(f, "{}{{", inst.class.name)?;
+                for (i, (name, value)) in inst.fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: ")?;
+                    value.fmt_nested(f, depth + 1)?;
+                }
+                write!(f, "}}")
+            }
+            Value::BoundMethod(bound) => {
+                write!(f, "<bound method {}.{}>", bound.class.name, bound.name)
             }
         }
     }
@@ -466,6 +580,14 @@ fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
                 && x.iter()
                     .zip(y.iter())
                     .all(|(a, b)| values_equal_depth(a, b, depth + 1))
+        }
+        (Value::Class(x), Value::Class(y)) => Rc::ptr_eq(x, y),
+        // Instances compare by identity: two calls to the same
+        // class make two different instances, even with the same
+        // fields. Use `is_a` to test the class instead.
+        (Value::Instance(x), Value::Instance(y)) => Rc::ptr_eq(x, y),
+        (Value::BoundMethod(x), Value::BoundMethod(y)) => {
+            Rc::ptr_eq(&x.instance, &y.instance) && Rc::ptr_eq(&x.function, &y.function)
         }
         _ => false,
     }

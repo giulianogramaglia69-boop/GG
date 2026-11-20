@@ -244,4 +244,16 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn classes_work_in_the_repl_across_lines() {
+        assert_eq!(
+            session(
+                "class Persona\nfn init(self, nome)\nself.nome = nome\nend\nfn saluta(self)\nreturn \"Ciao \" + self.nome\nend\nend\nlet p = Persona(\"Giuliano\")\np.saluta()\np\np.nome = \"Fabiana\"\np\nexit\n"
+            ),
+            format!(
+                "{WELCOME}gg> ... ... ... ... ... ... ... gg> gg> Ciao Giuliano\ngg> Persona{{nome: \"Giuliano\"}}\ngg> gg> Persona{{nome: \"Fabiana\"}}\ngg> "
+            )
+        );
+    }
 }

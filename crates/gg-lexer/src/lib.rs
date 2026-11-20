@@ -11,6 +11,8 @@
 //! - `#` comments run to the end of the line.
 //! - Newlines are real tokens: the parser (Phase 2) uses them as
 //!   statement separators. `;` is also accepted as a separator.
+//! - `.` is the field-access operator (`p.nome`, `p.saluta()`);
+//!   a dot inside a number (`1.5`) belongs to the number.
 
 use std::fmt;
 
@@ -56,6 +58,10 @@ pub enum TokenKind {
     Or,
     Not,
     To,
+    Class,
+    Extends,
+    Super,
+    SelfKw,
     // Literals
     Ident(String),
     Int(i64),
@@ -83,6 +89,7 @@ pub enum TokenKind {
     RBrace,
     Colon,
     Comma,
+    Dot,
     // Separators
     Newline,
     Semicolon,
@@ -109,6 +116,10 @@ impl TokenKind {
             TokenKind::Or => "Or",
             TokenKind::Not => "Not",
             TokenKind::To => "To",
+            TokenKind::Class => "Class",
+            TokenKind::Extends => "Extends",
+            TokenKind::Super => "Super",
+            TokenKind::SelfKw => "Self",
             TokenKind::Ident(_) => "Ident",
             TokenKind::Int(_) => "Int",
             TokenKind::Float(_) => "Float",
@@ -133,6 +144,7 @@ impl TokenKind {
             TokenKind::RBrace => "RBrace",
             TokenKind::Colon => "Colon",
             TokenKind::Comma => "Comma",
+            TokenKind::Dot => "Dot",
             TokenKind::Newline => "Newline",
             TokenKind::Semicolon => "Semicolon",
             TokenKind::Eof => "Eof",
@@ -157,6 +169,10 @@ impl TokenKind {
             TokenKind::Or => "or".to_string(),
             TokenKind::Not => "not".to_string(),
             TokenKind::To => "to".to_string(),
+            TokenKind::Class => "class".to_string(),
+            TokenKind::Extends => "extends".to_string(),
+            TokenKind::Super => "super".to_string(),
+            TokenKind::SelfKw => "self".to_string(),
             TokenKind::Ident(name) => name.clone(),
             TokenKind::Int(n) => n.to_string(),
             TokenKind::Float(f) => f.to_string(),
@@ -181,6 +197,7 @@ impl TokenKind {
             TokenKind::RBrace => "}".to_string(),
             TokenKind::Colon => ":".to_string(),
             TokenKind::Comma => ",".to_string(),
+            TokenKind::Dot => ".".to_string(),
             TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof => String::new(),
         }
     }
@@ -230,6 +247,10 @@ fn keyword_or_ident(word: &str) -> TokenKind {
         "or" => TokenKind::Or,
         "not" => TokenKind::Not,
         "to" => TokenKind::To,
+        "class" => TokenKind::Class,
+        "extends" => TokenKind::Extends,
+        "super" => TokenKind::Super,
+        "self" => TokenKind::SelfKw,
         _ => TokenKind::Ident(word.to_string()),
     }
 }
@@ -347,6 +368,10 @@ impl Lexer {
                 ',' => {
                     self.advance();
                     return Ok(self.token(TokenKind::Comma, line, col));
+                }
+                '.' => {
+                    self.advance();
+                    return Ok(self.token(TokenKind::Dot, line, col));
                 }
                 '+' => {
                     self.advance();
@@ -611,7 +636,9 @@ mod tests {
     #[test]
     fn keywords_are_not_identifiers_but_prefixes_are() {
         assert_eq!(
-            kinds_no_eof("let letter endif endless truex not_now total"),
+            kinds_no_eof(
+                "let letter endif endless truex not_now total selfish classy superb extends2"
+            ),
             vec![
                 TokenKind::Let,
                 TokenKind::Ident("letter".to_string()),
@@ -620,6 +647,10 @@ mod tests {
                 TokenKind::Ident("truex".to_string()),
                 TokenKind::Ident("not_now".to_string()),
                 TokenKind::Ident("total".to_string()),
+                TokenKind::Ident("selfish".to_string()),
+                TokenKind::Ident("classy".to_string()),
+                TokenKind::Ident("superb".to_string()),
+                TokenKind::Ident("extends2".to_string()),
             ]
         );
     }
@@ -632,7 +663,9 @@ mod tests {
     #[test]
     fn all_keywords() {
         assert_eq!(
-            kinds_no_eof("let if then else end while for fn return print true false and or not to"),
+            kinds_no_eof(
+                "let if then else end while for fn return print true false and or not to class extends super self"
+            ),
             vec![
                 TokenKind::Let,
                 TokenKind::If,
@@ -650,8 +683,37 @@ mod tests {
                 TokenKind::Or,
                 TokenKind::Not,
                 TokenKind::To,
+                TokenKind::Class,
+                TokenKind::Extends,
+                TokenKind::Super,
+                TokenKind::SelfKw,
             ]
         );
+    }
+
+    #[test]
+    fn dot_is_the_field_access_operator() {
+        assert_eq!(
+            kinds_no_eof("p.nome p.saluta() super.init(x)"),
+            vec![
+                TokenKind::Ident("p".to_string()),
+                TokenKind::Dot,
+                TokenKind::Ident("nome".to_string()),
+                TokenKind::Ident("p".to_string()),
+                TokenKind::Dot,
+                TokenKind::Ident("saluta".to_string()),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Super,
+                TokenKind::Dot,
+                TokenKind::Ident("init".to_string()),
+                TokenKind::LParen,
+                TokenKind::Ident("x".to_string()),
+                TokenKind::RParen,
+            ]
+        );
+        // A dot inside a number still belongs to the number.
+        assert_eq!(kinds_no_eof("1.5"), vec![TokenKind::Float(1.5)]);
     }
 
     #[test]
@@ -671,11 +733,16 @@ mod tests {
     fn numbers_invalid() {
         // `5.` — a dot with no digit after it.
         assert!(lex("5.").is_err());
-        // `.5` — a leading dot is not a number.
-        let err = lex(".5").unwrap_err();
-        assert!(err.message.contains("unexpected character '.'"));
-        // `1.2.3` — the second dot is unexpected.
-        assert!(lex("1.2.3").is_err());
+        // `.5` lexes as a dot followed by 5 (the dot is the field
+        // operator now): it is the *parser* that rejects it, since
+        // no expression can start with a dot.
+        assert_eq!(kinds_no_eof(".5"), vec![TokenKind::Dot, TokenKind::Int(5)]);
+        // `1.2.3` lexes (a float, a dot, an int) but no expression
+        // can use it: the parser rejects the stray dot.
+        assert_eq!(
+            kinds_no_eof("1.2.3"),
+            vec![TokenKind::Float(1.2), TokenKind::Dot, TokenKind::Int(3),]
+        );
     }
 
     #[test]
@@ -741,7 +808,7 @@ mod tests {
     #[test]
     fn arithmetic_operators_and_punctuation() {
         assert_eq!(
-            kinds_no_eof("+ - * / % ( ) , [ ] { } :"),
+            kinds_no_eof("+ - * / % ( ) , [ ] { } : ."),
             vec![
                 TokenKind::Plus,
                 TokenKind::Minus,
@@ -756,6 +823,7 @@ mod tests {
                 TokenKind::LBrace,
                 TokenKind::RBrace,
                 TokenKind::Colon,
+                TokenKind::Dot,
             ]
         );
     }

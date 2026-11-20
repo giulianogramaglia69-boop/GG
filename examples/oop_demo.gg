@@ -1,0 +1,43 @@
+class Persona
+    fn init(self, nome, eta)
+        self.nome = nome
+        self.eta = eta
+    end
+    fn saluta(self)
+        return "Ciao, sono " + self.nome
+    end
+    fn str(self)
+        return self.nome + " (" + str(self.eta) + " anni)"
+    end
+end
+
+class Studente extends Persona
+    fn init(self, nome, eta, corso)
+        super.init(nome, eta)
+        self.corso = corso
+    end
+    fn saluta(self)
+        return super.saluta() + ", studio " + self.corso
+    end
+end
+
+class Laureando extends Studente
+    fn init(self, nome, eta, corso, tesi)
+        super.init(nome, eta, corso)
+        self.tesi = tesi
+    end
+end
+
+let s = Laureando("Giuliano", 14, "Data Science & AI", "GG")
+print s.saluta()
+print s
+print "is_a Persona: " + str(is_a(s, Persona))
+print "is_a Studente: " + str(is_a(s, Studente))
+print "is_a Laureando: " + str(is_a(s, Laureando))
+print type(s)
+print type(Laureando)
+let m = s.saluta
+print m()
+print s == s
+print s == Studente("Giuliano", 14, "Data Science & AI")
+print Studente("A", 1, "X")

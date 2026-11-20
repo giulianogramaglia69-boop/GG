@@ -31,7 +31,10 @@ helpers (`read_file`/`write_file`/`append_file`/`file_exists`).
 **Phase 7 — collections: done.** Tuples, dicts, sets, arrays, queues
 and stacks, with new builtins (`array`, `queue`, `stack`, `enqueue`,
 `dequeue`, `peek`, `keys`, `contains`, `list`) and `len`/`push`/`pop`
-extended to the new types.
+extended to the new types. **Phase 8 — OOP: done.** Classes with
+single inheritance, methods with explicit `self`, bound methods,
+`super`, dynamic fields, and a new builtin `is_a`; `type`/`str`
+extended to instances (see the OOP section below).
 
 ## The REPL
 
@@ -193,6 +196,101 @@ array is the strict one — one element type, fixed size, no
 `push`/`pop`; the type check on every assignment is what makes it
 safe as a building block for numeric code later.
 
+- **OOP (Phase 8):** classes, methods, single inheritance.
+  - **Declaration** — `class Persona` ... `end`; a class body
+    holds *only* method definitions (`fn`): anything else is a
+    parse error (`only method definitions (fn) are allowed inside
+    a class`). Single inheritance: `class Studente extends
+    Persona` ... `end`. Classes are values: `let C = Persona`
+    works, and a class can be defined inside a block (normal
+    scope). `class`, `extends`, `super` and `self` are keywords and
+    cannot be used as identifiers.
+  - **Methods** — `fn nome(self, args)` ... `end`: `self` is the
+    first parameter, explicit like in Python. The parser rejects a
+    method whose first parameter is not `self`. Calling
+    `p.saluta("ciao")` passes `self` implicitly. `p.saluta` on its
+    own returns a **bound method**, which can be stored and called
+    later (`let m = p.saluta` then `m()`). A method taken from the
+    class (`Persona.saluta`) is unbound: `self` must be passed
+    explicitly (`Persona.saluta(p)`).
+  - **Fields** — dynamic, Python style: they are created by
+    assigning inside a method, `self.nome = nome`. Reading an
+    instance attribute looks in the instance's fields first, then
+    in the class's methods (bound). A missing field is a runtime
+    error (`no field 'x'`); assigning `p.campo = v` sets only
+    fields, never methods — a field with the same name as a method
+    shadows it. Fields keep insertion order.
+  - **Constructor** — the method is called `init`:
+    `fn init(self, nome, eta)` ... `end`. An instance is created
+    by calling the class like a function:
+    `let p = Persona("Giuliano", 14)` — the instance is created,
+    then `init` runs with the same arguments. With no `init`,
+    `C()` makes an empty instance and `C(1)` is an error
+    (`takes no arguments (no init method)`). Calling something
+    that is not a class or function is an error
+    (`cannot call Int`).
+  - **Inheritance** — method lookup walks up the chain (class →
+    parent → ...); a method in the child hides the parent's
+    (override). `super.metodo(args)` inside a method calls the
+    parent's method with the same `self` — `super.init(nome, eta)`
+    in the child's constructor is the usual case. `super` outside
+    a method is a runtime error (`'super' outside a method`); a
+    class with no parent has no super (`has no parent (no super)`).
+    `super` is resolved **lexically**: a plain function defined
+    outside a method has no super even when called from a method,
+    while a function defined *inside* a method captures that
+    method's class (like Python's `__class__` cell) and can use
+    `super`.
+  - **Values** — `type(p)` is the class name as a string
+    (`"Persona"`), `type(Persona)` is `"class"`. `str(p)` is
+    `Persona{nome: "Giuliano", eta: 14}` by default, but a
+    `fn str(self)` method wins — for both `print p` and `str(p)`;
+    inside a collection the default form is used instead (like
+    Python's `repr` inside a list). `is_a(x, Classe)` is true when
+    `x` is an instance of that class or any of its ancestors.
+    **Instance equality is by identity** (the same object), not by
+    fields: `p == p` is true, `Persona("A", 1) == Persona("A", 1)`
+    is false. `len` and the other builtins on an instance are a
+    runtime error (except `str` above).
+
+```gg
+class Persona
+    fn init(self, nome, eta)
+        self.nome = nome
+        self.eta = eta
+    end
+    fn saluta(self)
+        return "Ciao, sono " + self.nome
+    end
+    fn str(self)
+        return self.nome + " (" + str(self.eta) + " anni)"
+    end
+end
+
+class Studente extends Persona
+    fn init(self, nome, eta, corso)
+        super.init(nome, eta)
+        self.corso = corso
+    end
+    fn saluta(self)
+        return super.saluta() + ", studio " + self.corso
+    end
+end
+
+let s = Studente("Giuliano", 14, "Data Science & AI")
+print s.saluta()
+print s
+print is_a(s, Persona)
+print is_a(s, Studente)
+```
+
+```
+Ciao, sono Giuliano, studio Data Science & AI
+Giuliano (14 anni)
+true
+true
+```
+
 - **Errors** are plain-English runtime errors (`undefined variable
   'x'`, `cannot add Int and Str`, `division by zero`,
   `cannot call Int`, `expected 1 argument(s) but got 2`,
@@ -234,13 +332,14 @@ end
 
 ## Builtins
 
-Twenty-seven builtin functions are predefined in the global environment of
+Twenty-eight builtin functions are predefined in the global environment of
 every program. They are first-class values: they can be assigned to
 variables (`let f = len`), passed as arguments and returned from
 functions. `type()` returns `"fn"` for user functions and builtins
 alike, and `print` shows them as `<fn>`. `type()` returns `"list"`
 for lists, `"tuple"`, `"dict"`, `"set"`, `"array"`, `"queue"` and
-`"stack"` for the Phase 7 collections.
+`"stack"` for the Phase 7 collections, the class name for an
+instance and `"class"` for a class (Phase 8).
 
 | Function | Description | Example |
 | --- | --- | --- |
@@ -274,6 +373,7 @@ for lists, `"tuple"`, `"dict"`, `"set"`, `"array"`, `"queue"` and
 | `keys(d)` | The keys of a dict as a list, in insertion order | `keys({"b": 1, "a": 2})` → `["b", "a"]` |
 | `contains(coll, x)` | Membership: in a list, tuple, array or set; a key in a dict; a substring in a string | `contains([1, 2], 2)` → `true`, `contains("ciao", "ia")` → `true` |
 | `list(x)` | Convert a tuple, set, array, queue or stack — or a dict (its keys) — into a list; an error on strings and other types | `list((1, 2))` → `[1, 2]`, `list({"a": 1})` → `["a"]` |
+| `is_a(x, Classe)` | `true` when `x` is an instance of `Classe` or of any class inheriting from it; the second argument must be a class | `is_a(s, Persona)` → `true`, `is_a(5, Persona)` → `false` |
 
 Wrong arity is a runtime error naming the builtin
 (`len() expects 1 argument(s) but got 0`); a wrong argument type
@@ -354,8 +454,11 @@ statement := "let" ident "=" expr
            | "while" expr "then" block "end"
            | "for" ident "=" expr "to" expr "then" block "end"
            | "fn" ident "(" [ident ("," ident)*] ")" block "end"
+           | "class" ident ["extends" ident] class_body "end"
            | "return" [expr]
            | expr
+class_body:= ("fn" ident "(" [ident ("," ident)*] ")" block "end")*
+           ; a method's first parameter must be "self"
 expr      := or
 or        := and ("or" and)*
 and       := equality ("and" equality)*
@@ -364,8 +467,9 @@ comparison:= term (("<" | "<=" | ">" | ">=") term)*
 term      := factor (("+" | "-") factor)*
 factor    := unary (("*" | "/" | "%") unary)*
 unary     := ("-" | "not") unary | postfix
-postfix   := primary ("[" expr "]")*
-primary   := number | string | "true" | "false"
+postfix   := primary ("[" expr "]" | "." ident ["(" [expr ("," expr)*] ")"])*
+primary   := number | string | "true" | "false" | "self"
+           | "super" "." ident ["(" [expr ("," expr)*] ")"]
            | "[" [expr ("," expr)*] "]"
            | "(" [expr ("," expr)*] ")"   ; one comma or more → tuple, else grouping
            | "{" [dict | set] "}"         ; "k: v" entries → dict, plain values → set, "{}" → empty dict
@@ -373,11 +477,18 @@ primary   := number | string | "true" | "false"
 dict      := expr ":" expr ("," expr ":" expr)* [","]
 set       := expr ("," expr)* [","]
 index     := postfix "[" expr "]"
+field     := postfix "." ident
+           ; ".5" lexes as Dot + Int(5) and the parser rejects it;
+           ; "5." is still a lex error (malformed number)
 ```
 
 Statements are separated by newlines and/or `;`. Assignment (`x = ...`)
 is a statement, not an expression. `to` was added as a keyword in
 Phase 2 for the `for` loop (`total` is still a plain identifier).
+`class`, `extends`, `super` and `self` were added as keywords in
+Phase 8 (`selfish` and `classy` are still plain identifiers); `.`
+is the field-access operator since Phase 8, so `5.` is a lex error
+and `.5` is rejected by the parser instead.
 
 ```gg
 fn sum_to(n)
@@ -395,12 +506,12 @@ print sum_to(10)
 
 | Kind | Examples |
 | --- | --- |
-| Keywords | `let if then else end while for fn return print true false and or not to` |
+| Keywords | `let if then else end while for fn return print true false and or not to class extends super self` |
 | Identifiers | `[A-Za-z_][A-Za-z0-9_]*` (keywords are reserved) |
 | Numbers | integers `42`, floats `3.14` (`.5` and `5.` are errors) |
 | Strings | `"..."` with escapes `\"` `\\` `\n` `\t` |
 | Operators | `+ - * / % == != < <= > >= =` (`!` alone is not an operator) |
-| Punctuation | `( ) , [ ] { } :` (braces are dict/set literals, not blocks) |
+| Punctuation | `( ) , [ ] { } : .` (braces are dict/set literals, not blocks; `.` is field access) |
 | Separators | newline, `;` |
 | Comments | `#` to end of line |
 
@@ -434,7 +545,7 @@ exit with code 1.
 5. **REPL** ✅ — interactive shell (`gg` / `gg repl`): persistent state, multi-line blocks, expression echo, error recovery
 6. **Lists + file handling** ✅ — lists (`[1, 2, 3]`, indexing, aliasing, `push`/`pop`/`range`/`split`/`lines`) and whole-file helpers (`read_file`/`write_file`/`append_file`/`file_exists`)
 7. **Collections** ✅ — tuples `(1, "a")`, dicts `{"k": v}`, sets `{1, 2}`, arrays `array([1, 2])`, queues `queue()`/`enqueue`/`dequeue`, stacks `stack()`/`push`/`pop`, plus `peek`/`keys`/`contains`/`list`
-8. **OOP** — classes, methods, inheritance
+8. **OOP** ✅ — classes, methods, inheritance (see below)
 9. **Modules + virtual environments** — `import`, packages, per-project envs (like `venv`)
 
 Long term, after lists exist: data libraries in the spirit of NumPy/Pandas, and a web framework in the spirit of Django — each is a large project of its own, not a single phase.

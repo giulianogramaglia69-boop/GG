@@ -980,4 +980,267 @@ mod tests {
         let src = "let text = \"pane pane latte pane\"\nlet words = split(text, \" \")\nlet counts = {}\nfor i = 0 to len(words) - 1 then\n    let w = words[i]\n    if contains(counts, w) then\n        counts[w] = counts[w] + 1\n    else\n        counts[w] = 1\n    end\nend\nprint counts\nprint counts[\"pane\"]\n";
         assert_eq!(run_ok(src), "{\"pane\": 3, \"latte\": 1}\n3\n");
     }
+
+    // ---- Phase 8: OOP ----
+
+    const PERSONA: &str = "class Persona\n    fn init(self, nome, eta)\n        self.nome = nome\n        self.eta = eta\n    end\n    fn saluta(self)\n        return \"Ciao, sono \" + self.nome\n    end\nend\n";
+
+    #[test]
+    fn class_init_fields_and_default_display() {
+        let src = format!(
+            "{PERSONA}let p = Persona(\"Giuliano\", 14)\nprint p.nome\nprint p.eta\nprint p\n"
+        );
+        assert_eq!(
+            run_ok(&src),
+            "Giuliano\n14\nPersona{nome: \"Giuliano\", eta: 14}\n"
+        );
+        // Fields are created by assignment inside a method: an
+        // instance with no init has no fields.
+        let src = "class Vuota\nend\nlet v = Vuota()\nprint v\n";
+        assert_eq!(run_ok(src), "Vuota{}\n");
+        // Fields are added in insertion order, and updating one
+        // keeps its position.
+        let src = "class C\n    fn init(self)\n        self.a = 1\n        self.b = 2\n        self.a = 9\n    end\nend\nprint C()\n";
+        assert_eq!(run_ok(src), "C{a: 9, b: 2}\n");
+        // A string field prints quoted inside the instance.
+        let src =
+            "class C\n    fn init(self)\n        self.nome = \"x\"\n    end\nend\nprint C()\n";
+        assert_eq!(run_ok(src), "C{nome: \"x\"}\n");
+    }
+
+    #[test]
+    fn methods_with_self_and_return_values() {
+        let src = format!("{PERSONA}let p = Persona(\"Giuliano\", 14)\nprint p.saluta()\n");
+        assert_eq!(run_ok(&src), "Ciao, sono Giuliano\n");
+        // A method with arguments, and a method calling another
+        // method on the same instance.
+        let src = "class Calcolatrice\n    fn somma(self, a, b)\n        return a + b\n    end\n    fn doppio(self, x)\n        return self.somma(x, x)\n    end\nend\nlet c = Calcolatrice()\nprint c.somma(2, 3)\nprint c.doppio(4)\n";
+        assert_eq!(run_ok(src), "5\n8\n");
+        // A method without a return gives nil.
+        let src = "class C\n    fn niente(self)\n    end\nend\nprint C().niente()\n";
+        assert_eq!(run_ok(src), "nil\n");
+        // Methods see globals, and the class itself.
+        let src = "let prefix = \"sig. \"\nclass Persona\n    fn init(self, nome, eta)\n        self.nome = nome\n        self.eta = eta\n    end\n    fn presentazione(self)\n        return prefix + self.nome\n    end\n    fn amico(self, nome)\n        return Persona(nome, 0)\n    end\nend\nlet p = Persona(\"Giuliano\", 14)\nprint p.presentazione()\nprint p.amico(\"Fabiana\").nome\n";
+        assert_eq!(run_ok(src), "sig. Giuliano\nFabiana\n");
+    }
+
+    #[test]
+    fn bound_method_saved_in_a_variable() {
+        let src = format!(
+            "{PERSONA}let p = Persona(\"Giuliano\", 14)\nlet m = p.saluta\nprint m()\nprint type(m)\n"
+        );
+        assert_eq!(run_ok(&src), "Ciao, sono Giuliano\nfn\n");
+        // The bound method keeps its instance even when the
+        // variable is passed around.
+        let src = format!(
+            "{PERSONA}fn chiama(f)\n    return f()\nend\nlet p = Persona(\"Giuliano\", 14)\nprint chiama(p.saluta)\n"
+        );
+        assert_eq!(run_ok(&src), "Ciao, sono Giuliano\n");
+        // Two accesses to the same method are equal (same instance
+        // and same function); different instances are not.
+        let src = format!(
+            "{PERSONA}let p = Persona(\"A\", 1)\nlet q = Persona(\"B\", 2)\nprint p.saluta == p.saluta\nprint p.saluta == q.saluta\n"
+        );
+        assert_eq!(run_ok(&src), "true\nfalse\n");
+    }
+
+    #[test]
+    fn missing_field_and_method_errors() {
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1)\nprint p.cognome\n");
+        assert!(run_err(&src).contains("has no field or method 'cognome'"));
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1)\nprint p.cognome()\n");
+        assert!(run_err(&src).contains("has no method 'cognome'"));
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1)\nprint p.nome()\n");
+        assert!(run_err(&src).contains("cannot call Str"));
+        // Assigning the missing field creates it.
+        let src =
+            format!("{PERSONA}let p = Persona(\"A\", 1)\np.cognome = \"Rossi\"\nprint p.cognome\n");
+        assert_eq!(run_ok(&src), "Rossi\n");
+        // A field with the same name as a method shadows it.
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1)\np.saluta = 5\nprint p.saluta\n");
+        assert_eq!(run_ok(&src), "5\n");
+        // Fields can only be set on instances.
+        assert!(run_err("let x = 5\nx.campo = 1\n").contains("cannot set field 'campo' on Int"));
+        assert!(run_err("let x = 5\nprint x.nome\n").contains("cannot access field 'nome' of Int"));
+        // Setting a field on a call result works when it returns an
+        // instance, and fails otherwise.
+        let src = "fn get()\n    return 5\nend\nget().nome = 1\n";
+        assert!(run_err(src).contains("cannot set field 'nome' on Int"));
+    }
+
+    #[test]
+    fn override_and_three_level_chain() {
+        let src = "class Animale\n    fn verso(self)\n        return \"...\"\n    end\n    fn zampe(self)\n        return 4\n    end\nend\nclass Cane extends Animale\n    fn verso(self)\n        return \"bau\"\n    end\nend\nclass Cucciolo extends Cane\nend\nlet c = Cucciolo()\nprint c.verso()\nprint c.zampe()\nprint type(c)\n";
+        assert_eq!(run_ok(src), "bau\n4\nCucciolo\n");
+        // An override in the middle of the chain hides the grandparent.
+        let src = "class A\n    fn chi(self)\n        return \"A\"\n    end\nend\nclass B extends A\n    fn chi(self)\n        return \"B\"\n    end\nend\nclass C extends B\nend\nprint C().chi()\nprint B().chi()\nprint A().chi()\n";
+        assert_eq!(run_ok(src), "B\nB\nA\n");
+        // A subclass inherits the parent's init when it has none.
+        let src = "class A\n    fn init(self, x)\n        self.x = x\n    end\nend\nclass B extends A\nend\nprint B(7).x\n";
+        assert_eq!(run_ok(src), "7\n");
+    }
+
+    #[test]
+    fn super_init_and_super_method() {
+        let src = "class Persona\n    fn init(self, nome, eta)\n        self.nome = nome\n        self.eta = eta\n    end\n    fn saluta(self)\n        return \"Ciao, sono \" + self.nome\n    end\nend\nclass Studente extends Persona\n    fn init(self, nome, eta, scuola)\n        super.init(nome, eta)\n        self.scuola = scuola\n    end\n    fn saluta(self)\n        return super.saluta() + \" e studio a \" + self.scuola\n    end\nend\nlet s = Studente(\"Giuliano\", 14, \"Leonardo\")\nprint s.nome\nprint s.scuola\nprint s.saluta()\n";
+        assert_eq!(
+            run_ok(src),
+            "Giuliano\nLeonardo\nCiao, sono Giuliano e studio a Leonardo\n"
+        );
+        // `super` in a grandchild reaches the parent, and the
+        // parent's own `super` reaches the grandparent.
+        let src = "class A\n    fn chi(self)\n        return \"A\"\n    end\nend\nclass B extends A\n    fn chi(self)\n        return \"B(\" + super.chi() + \")\"\n    end\nend\nclass C extends B\n    fn chi(self)\n        return \"C(\" + super.chi() + \")\"\n    end\nend\nprint C().chi()\n";
+        assert_eq!(run_ok(src), "C(B(A))\n");
+    }
+
+    #[test]
+    fn super_outside_a_method_is_an_error() {
+        assert!(run_err("print super.foo()\n").contains("'super' outside a method"));
+        // A plain function has no super, even when called from a
+        // method — the method's own super does not leak into it.
+        let src = "fn helper()\n    return super.foo()\nend\nclass C\n    fn m(self)\n        return helper()\n    end\nend\nprint C().m()\n";
+        assert!(run_err(src).contains("'super' outside a method"));
+        // A class without a parent has no super.
+        let src =
+            "class C\n    fn m(self)\n        return super.foo()\n    end\nend\nprint C().m()\n";
+        assert!(run_err(src).contains("has no parent (no super)"));
+        // A missing method in the parent is an error.
+        let src = "class A\nend\nclass B extends A\n    fn m(self)\n        return super.niente()\n    end\nend\nprint B().m()\n";
+        assert!(run_err(src).contains("parent class has no method 'niente'"));
+    }
+
+    #[test]
+    fn super_in_a_nested_function_uses_the_enclosing_method() {
+        // A function defined inside a method captures that method's
+        // class, so `super` inside it works (like Python's
+        // `__class__` cell) — even when the function is called
+        // after the method returned.
+        let src = "class A\n    fn chi(self)\n        return \"A\"\n    end\nend\nclass B extends A\n    fn crea(self)\n        fn saluto()\n            return super.chi()\n        end\n        return saluto\n    end\nend\nlet f = B().crea()\nprint f()\n";
+        assert_eq!(run_ok(src), "A\n");
+    }
+
+    #[test]
+    fn class_without_init_and_wrong_arguments() {
+        let src = "class C\nend\nlet c = C()\nprint type(c)\n";
+        assert_eq!(run_ok(src), "C\n");
+        assert!(
+            run_err("class C\nend\nlet c = C(1)\n").contains("takes no arguments (no init method)")
+        );
+        // Wrong argument counts: constructor and method.
+        let src = format!("{PERSONA}let p = Persona(\"A\")\n");
+        assert!(run_err(&src).contains("method 'init' expects 2 argument(s) but got 1"));
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1, 2)\n");
+        assert!(run_err(&src).contains("method 'init' expects 2 argument(s) but got 3"));
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1)\nprint p.saluta(1)\n");
+        assert!(run_err(&src).contains("method 'saluta' expects 0 argument(s) but got 1"));
+        // Calling something that is not a class or a function.
+        assert!(run_err("let x = 1\nprint x()\n").contains("cannot call Int"));
+        // The parent must be a class.
+        assert!(
+            run_err("let x = 5\nclass C extends x\nend\n").contains("parent 'x' is not a class")
+        );
+        assert!(
+            run_err("class C extends Inesistente\nend\n")
+                .contains("undefined variable 'Inesistente'")
+        );
+    }
+
+    #[test]
+    fn type_str_and_is_a() {
+        let src = format!(
+            "{PERSONA}let p = Persona(\"A\", 1)\nprint type(p)\nprint type(Persona)\nprint str(p)\n"
+        );
+        assert_eq!(
+            run_ok(&src),
+            "Persona\nclass\nPersona{nome: \"A\", eta: 1}\n"
+        );
+        // A custom `str` method wins for both `print` and `str()`.
+        let src = "class Persona\n    fn init(self, nome)\n        self.nome = nome\n    end\n    fn str(self)\n        return \"Persona: \" + self.nome\n    end\nend\nlet p = Persona(\"Giuliano\")\nprint p\nprint str(p)\nprint type(p)\n";
+        assert_eq!(
+            run_ok(src),
+            "Persona: Giuliano\nPersona: Giuliano\nPersona\n"
+        );
+        // ...but inside a collection the default form is used (like
+        // Python's repr inside a list).
+        let src = "class C\n    fn init(self)\n        self.x = 1\n    end\n    fn str(self)\n        return \"custom\"\n    end\nend\nprint [C()]\nprint C()\n";
+        assert_eq!(run_ok(src), "[C{x: 1}]\ncustom\n");
+        // A `str` method must return a string.
+        let src = "class C\n    fn str(self)\n        return 5\n    end\nend\nprint C()\n";
+        assert!(run_err(src).contains("str() method must return a Str"));
+        assert!(
+            run_err("class C\n    fn str(self)\n        return 5\n    end\nend\nprint str(C())\n")
+                .contains("str() method must return a Str")
+        );
+        // `is_a`: ancestors count, anything else is false.
+        let src = "class A\nend\nclass B extends A\nend\nclass C extends B\nend\nlet c = C()\nprint is_a(c, C)\nprint is_a(c, B)\nprint is_a(c, A)\nprint is_a(c, 5)\nprint is_a(5, A)\nprint is_a(B(), A)\n";
+        assert!(run_err(src).contains("is_a() expects a Class as its second argument"));
+        let src = "class A\nend\nclass B extends A\nend\nclass C extends B\nend\nlet c = C()\nprint is_a(c, C)\nprint is_a(c, B)\nprint is_a(c, A)\nprint is_a(5, A)\nprint is_a(B(), A)\nprint is_a(A(), C)\n";
+        assert_eq!(run_ok(src), "true\ntrue\ntrue\nfalse\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn instances_compare_by_identity() {
+        let src = format!(
+            "{PERSONA}let p = Persona(\"A\", 1)\nlet q = p\nprint p == q\nprint p == Persona(\"A\", 1)\nprint Persona == Persona\n"
+        );
+        assert_eq!(run_ok(&src), "true\nfalse\ntrue\n");
+        // An instance inside a list compares by identity too.
+        let src = format!(
+            "{PERSONA}let p = Persona(\"A\", 1)\nprint [p] == [p]\nprint [p] == [Persona(\"A\", 1)]\n"
+        );
+        assert_eq!(run_ok(&src), "true\nfalse\n");
+        // `len` on an instance is an error.
+        let src = format!("{PERSONA}print len(Persona(\"A\", 1))\n");
+        assert!(run_err(&src).contains("len() expects a Str"));
+    }
+
+    #[test]
+    fn classes_are_values_and_methods_can_be_unbound() {
+        // A class can be stored in a variable and called through it.
+        let src =
+            format!("{PERSONA}let C = Persona\nlet p = C(\"A\", 1)\nprint p.nome\nprint type(C)\n");
+        assert_eq!(run_ok(&src), "A\nclass\n");
+        // A class can be defined inside a block (normal scope).
+        let src = "if true then\n    class Dentro\n        fn init(self)\n            self.x = 3\n        end\n    end\nend\nprint Dentro()\n";
+        assert!(run_err(src).contains("undefined variable 'Dentro'"));
+        let src = "fn niente()\nend\nlet C = niente()\nif true then\n    class Dentro\n        fn init(self)\n            self.x = 3\n        end\n    end\n    C = Dentro\nend\nprint C().x\n";
+        assert_eq!(run_ok(src), "3\n");
+        // An unbound method from the class: pass `self` explicitly.
+        let src = format!("{PERSONA}let p = Persona(\"A\", 1)\nprint Persona.saluta(p)\n");
+        assert_eq!(run_ok(&src), "Ciao, sono A\n");
+        // A missing method on the class is an error.
+        let src = format!("{PERSONA}print Persona.niente\n");
+        assert!(run_err(&src).contains("class 'Persona' has no method 'niente'"));
+    }
+
+    #[test]
+    fn field_holding_a_function_is_called_plainly() {
+        // A function stored in a field is called without injecting
+        // `self`: it is just a value that happens to be callable.
+        let src = "fn doppia(x)\n    return x * 2\nend\nclass C\nend\nlet c = C()\nc.doppia = doppia\nprint c.doppia(21)\n";
+        assert_eq!(run_ok(src), "42\n");
+        // A field holding a non-function cannot be called.
+        let src = "class C\nend\nlet c = C()\nc.x = 5\nprint c.x()\n";
+        assert!(run_err(src).contains("cannot call Int"));
+        // A method name given to a plain function call still goes
+        // through the field first: the field shadows the method.
+        let src = "class C\n    fn f(self)\n        return \"metodo\"\n    end\nend\nlet c = C()\nc.f = 5\nprint c.f\n";
+        assert_eq!(run_ok(src), "5\n");
+    }
+
+    #[test]
+    fn method_arity_and_self_rules() {
+        // `self` outside a method is an undefined variable.
+        assert!(run_err("print self\n").contains("undefined variable 'self'"));
+        // `self` cannot be a variable name...
+        assert!(run_err("let self = 1\n").contains("expected variable name after 'let'"));
+        // ...nor `class`, `extends` or `super`.
+        assert!(run_err("let class = 1\n").contains("expected variable name after 'let'"));
+        assert!(run_err("let super = 1\n").contains("expected variable name after 'let'"));
+        // A method whose first parameter is not `self` is a parse
+        // error (checked in the parser tests too).
+        assert!(
+            run_err("class C\n    fn m(x)\n    end\nend\n").contains("methods must take 'self'")
+        );
+    }
 }

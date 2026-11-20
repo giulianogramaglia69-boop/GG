@@ -6,7 +6,7 @@
 //! or block). Blocks end with `end` — or with `else` in the `then`
 //! branch of an `if`.
 
-use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, MethodDef, Program, Stmt, UnaryOp};
 use gg_lexer::{Token, TokenKind};
 use std::fmt;
 
@@ -185,14 +185,16 @@ impl<'a> Parser<'a> {
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Fn => self.parse_fn(),
+            TokenKind::Class => self.parse_class(),
             TokenKind::Return => self.parse_return(),
             TokenKind::Print => self.parse_print(),
-            TokenKind::Ident(_) => {
+            _ => {
                 // An assignment starts with an expression (a plain
-                // name, or an index like `xs[0]`): if an `=` follows
-                // it, this is an assignment; otherwise it is an
-                // expression statement (`x == 1` is a comparison,
-                // not an assignment).
+                // name, an index like `xs[0]`, or a field like
+                // `p.nome` / `self.eta`): if an `=` follows it, this
+                // is an assignment; otherwise it is an expression
+                // statement (`x == 1` is a comparison, not an
+                // assignment).
                 let expr = self.parse_expr()?;
                 if self.check(&TokenKind::Eq) {
                     self.advance(); // =
@@ -203,13 +205,16 @@ impl<'a> Parser<'a> {
                             target: expr,
                             value,
                         }),
+                        Expr::Field { .. } => Ok(Stmt::FieldAssign {
+                            target: expr,
+                            value,
+                        }),
                         _ => Err(self.error_here("invalid assignment target")),
                     }
                 } else {
                     Ok(Stmt::ExprStmt { expr })
                 }
             }
-            _ => self.parse_expr_stmt(),
         }
     }
 
@@ -279,16 +284,95 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, "'(' after function name")?;
         let mut params = Vec::new();
         if !self.check(&TokenKind::RParen) {
-            params.push(self.expect_ident("parameter name")?);
+            params.push(self.expect_param_name()?);
             while self.check(&TokenKind::Comma) {
                 self.advance(); // ,
-                params.push(self.expect_ident("parameter name")?);
+                params.push(self.expect_param_name()?);
             }
         }
         self.expect(&TokenKind::RParen, "')' after parameter list")?;
         let body = self.parse_block()?;
         self.expect(&TokenKind::End, "'end' to close function body")?;
         Ok(Stmt::Fn { name, params, body })
+    }
+
+    /// A parameter name: a plain identifier, or `self` (methods
+    /// take `self` as their first parameter, like Python).
+    fn expect_param_name(&mut self) -> Result<String, ParserError> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            TokenKind::SelfKw => {
+                self.advance();
+                Ok("self".to_string())
+            }
+            _ => Err(self.error_here(format!(
+                "expected parameter name but found {}",
+                describe(self.peek())
+            ))),
+        }
+    }
+
+    fn parse_class(&mut self) -> Result<Stmt, ParserError> {
+        self.advance(); // class
+        let name = self.expect_ident("class name after 'class'")?;
+        let parent = if self.check(&TokenKind::Extends) {
+            self.advance(); // extends
+            Some(self.expect_ident("parent class name after 'extends'")?)
+        } else {
+            None
+        };
+        // The class body holds only method definitions.
+        let mut methods = Vec::new();
+        loop {
+            self.skip_separators();
+            match self.peek_kind() {
+                TokenKind::End => {
+                    self.advance(); // end
+                    break;
+                }
+                TokenKind::Eof => {
+                    return Err(self.error_here("expected 'end' to close class body"));
+                }
+                TokenKind::Fn => {
+                    let fn_token = self.peek().clone();
+                    let Stmt::Fn {
+                        name: method_name,
+                        params,
+                        body,
+                    } = self.parse_fn()?
+                    else {
+                        unreachable!("parse_fn always returns Stmt::Fn")
+                    };
+                    if params.is_empty() || params[0] != "self" {
+                        return Err(ParserError::new(
+                            "methods must take 'self' as their first parameter",
+                            fn_token.line,
+                            fn_token.col,
+                            false,
+                        ));
+                    }
+                    methods.push(MethodDef {
+                        name: method_name,
+                        params,
+                        body,
+                    });
+                }
+                _ => {
+                    return Err(
+                        self.error_here("only method definitions (fn) are allowed inside a class")
+                    );
+                }
+            }
+        }
+        Ok(Stmt::Class {
+            name,
+            parent,
+            methods,
+        })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParserError> {
@@ -302,11 +386,6 @@ impl<'a> Parser<'a> {
             _ => Some(self.parse_expr()?),
         };
         Ok(Stmt::Return { expr })
-    }
-
-    fn parse_expr_stmt(&mut self) -> Result<Stmt, ParserError> {
-        let expr = self.parse_expr()?;
-        Ok(Stmt::ExprStmt { expr })
     }
 
     // ----- expressions (lowest precedence first) -----
@@ -445,17 +524,47 @@ impl<'a> Parser<'a> {
     }
 
     /// Postfix operators, as tight as a call: indexing (`xs[0]`,
-    /// `f()[0]`, `xs[0][1]`). Applies after any primary.
+    /// `f()[0]`, `xs[0][1]`) and field access / method calls
+    /// (`p.nome`, `p.saluta("ciao")`). Applies after any primary.
     fn parse_postfix(&mut self) -> Result<Expr, ParserError> {
         let mut expr = self.parse_primary()?;
-        while self.check(&TokenKind::LBracket) {
-            self.advance(); // [
-            let index = self.parse_expr()?;
-            self.expect(&TokenKind::RBracket, "']' after index")?;
-            expr = Expr::Index {
-                target: Box::new(expr),
-                index: Box::new(index),
-            };
+        loop {
+            if self.check(&TokenKind::LBracket) {
+                self.advance(); // [
+                let index = self.parse_expr()?;
+                self.expect(&TokenKind::RBracket, "']' after index")?;
+                expr = Expr::Index {
+                    target: Box::new(expr),
+                    index: Box::new(index),
+                };
+            } else if self.check(&TokenKind::Dot) {
+                self.advance(); // .
+                let name = self.expect_ident("field name after '.'")?;
+                if self.check(&TokenKind::LParen) {
+                    self.advance(); // (
+                    let mut args = Vec::new();
+                    if !self.check(&TokenKind::RParen) {
+                        args.push(self.parse_expr()?);
+                        while self.check(&TokenKind::Comma) {
+                            self.advance(); // ,
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    self.expect(&TokenKind::RParen, "')' after method arguments")?;
+                    expr = Expr::MethodCall {
+                        target: Box::new(expr),
+                        name,
+                        args,
+                    };
+                } else {
+                    expr = Expr::Field {
+                        target: Box::new(expr),
+                        name,
+                    };
+                }
+            } else {
+                break;
+            }
         }
         Ok(expr)
     }
@@ -481,6 +590,26 @@ impl<'a> Parser<'a> {
             TokenKind::False => {
                 self.advance();
                 Ok(Expr::Bool(false))
+            }
+            TokenKind::SelfKw => {
+                self.advance();
+                Ok(Expr::SelfExpr)
+            }
+            TokenKind::Super => {
+                self.advance(); // super
+                self.expect(&TokenKind::Dot, "'.' after 'super'")?;
+                let name = self.expect_ident("method name after 'super.'")?;
+                self.expect(&TokenKind::LParen, "'(' after super method name")?;
+                let mut args = Vec::new();
+                if !self.check(&TokenKind::RParen) {
+                    args.push(self.parse_expr()?);
+                    while self.check(&TokenKind::Comma) {
+                        self.advance(); // ,
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&TokenKind::RParen, "')' after super method arguments")?;
+                Ok(Expr::SuperCall { name, args })
             }
             TokenKind::Ident(name) => {
                 self.advance();
@@ -1323,6 +1452,284 @@ mod tests {
         );
         let reparsed = parse_ok(&prog.to_string());
         assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn class_with_init_and_methods() {
+        let src = "class Persona\n    fn init(self, nome, eta)\n        self.nome = nome\n        self.eta = eta\n    end\n    fn saluta(self)\n        print self.nome\n    end\nend\n";
+        assert_eq!(
+            parse_ok(src).stmts,
+            vec![Stmt::Class {
+                name: "Persona".to_string(),
+                parent: None,
+                methods: vec![
+                    MethodDef {
+                        name: "init".to_string(),
+                        params: vec!["self".to_string(), "nome".to_string(), "eta".to_string()],
+                        body: vec![
+                            Stmt::FieldAssign {
+                                target: Expr::Field {
+                                    target: Box::new(Expr::SelfExpr),
+                                    name: "nome".to_string(),
+                                },
+                                value: ident("nome"),
+                            },
+                            Stmt::FieldAssign {
+                                target: Expr::Field {
+                                    target: Box::new(Expr::SelfExpr),
+                                    name: "eta".to_string(),
+                                },
+                                value: ident("eta"),
+                            },
+                        ],
+                    },
+                    MethodDef {
+                        name: "saluta".to_string(),
+                        params: vec!["self".to_string()],
+                        body: vec![Stmt::Print {
+                            expr: Expr::Field {
+                                target: Box::new(Expr::SelfExpr),
+                                name: "nome".to_string(),
+                            },
+                        }],
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn class_extends_and_empty_class() {
+        assert_eq!(
+            parse_ok("class Studente extends Persona\nend").stmts,
+            vec![Stmt::Class {
+                name: "Studente".to_string(),
+                parent: Some("Persona".to_string()),
+                methods: vec![],
+            }]
+        );
+        assert_eq!(
+            parse_ok("class Vuota\nend").stmts,
+            vec![Stmt::Class {
+                name: "Vuota".to_string(),
+                parent: None,
+                methods: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn field_access_method_calls_and_super() {
+        // p.nome
+        assert_eq!(
+            parse_ok("print p.nome").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Field {
+                    target: Box::new(ident("p")),
+                    name: "nome".to_string(),
+                },
+            }]
+        );
+        // p.saluta("ciao")
+        assert_eq!(
+            parse_ok("print p.saluta(\"ciao\")").stmts,
+            vec![Stmt::Print {
+                expr: Expr::MethodCall {
+                    target: Box::new(ident("p")),
+                    name: "saluta".to_string(),
+                    args: vec![Expr::Str("ciao".to_string())],
+                },
+            }]
+        );
+        // Chained: self.amico.nome, a.b.c()
+        assert_eq!(
+            parse_ok("print self.amico.nome").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Field {
+                    target: Box::new(Expr::Field {
+                        target: Box::new(Expr::SelfExpr),
+                        name: "amico".to_string(),
+                    }),
+                    name: "nome".to_string(),
+                },
+            }]
+        );
+        assert_eq!(
+            parse_ok("a.b.c()").stmts,
+            vec![Stmt::ExprStmt {
+                expr: Expr::MethodCall {
+                    target: Box::new(Expr::Field {
+                        target: Box::new(ident("a")),
+                        name: "b".to_string(),
+                    }),
+                    name: "c".to_string(),
+                    args: vec![],
+                },
+            }]
+        );
+        // super.init(nome, eta)
+        assert_eq!(
+            parse_ok("super.init(nome, eta)").stmts,
+            vec![Stmt::ExprStmt {
+                expr: Expr::SuperCall {
+                    name: "init".to_string(),
+                    args: vec![ident("nome"), ident("eta")],
+                },
+            }]
+        );
+        // A field access binds as tightly as a call: p.nome + 1.
+        assert_eq!(
+            parse_ok("print p.nome + 1").stmts,
+            vec![Stmt::Print {
+                expr: bin(
+                    Add,
+                    Expr::Field {
+                        target: Box::new(ident("p")),
+                        name: "nome".to_string(),
+                    },
+                    int(1),
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn field_assignment() {
+        assert_eq!(
+            parse_ok("p.nome = \"Giuliano\"").stmts,
+            vec![Stmt::FieldAssign {
+                target: Expr::Field {
+                    target: Box::new(ident("p")),
+                    name: "nome".to_string(),
+                },
+                value: Expr::Str("Giuliano".to_string()),
+            }]
+        );
+        assert_eq!(
+            parse_ok("self.eta = eta + 1").stmts,
+            vec![Stmt::FieldAssign {
+                target: Expr::Field {
+                    target: Box::new(Expr::SelfExpr),
+                    name: "eta".to_string(),
+                },
+                value: bin(Add, ident("eta"), int(1)),
+            }]
+        );
+        // A field access is not an assignment without `=`.
+        assert_eq!(
+            parse_ok("p.nome == \"x\"").stmts,
+            vec![Stmt::ExprStmt {
+                expr: bin(
+                    Eq,
+                    Expr::Field {
+                        target: Box::new(ident("p")),
+                        name: "nome".to_string(),
+                    },
+                    Expr::Str("x".to_string()),
+                ),
+            }]
+        );
+        // A field of a call result is a valid target: the call is
+        // evaluated, then the field is set on what it returns.
+        assert_eq!(
+            parse_ok("f().nome = 1").stmts,
+            vec![Stmt::FieldAssign {
+                target: Expr::Field {
+                    target: Box::new(Expr::Call {
+                        name: "f".to_string(),
+                        args: vec![],
+                    }),
+                    name: "nome".to_string(),
+                },
+                value: int(1),
+            }]
+        );
+        // But a bare call is not a valid assignment target.
+        let err = parse_err("f() = 1");
+        assert!(
+            err.message.contains("invalid assignment target"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn class_body_errors() {
+        // A method without `self` as first parameter.
+        let err = parse_err("class C\n    fn m(x)\n        return x\n    end\nend\n");
+        assert!(
+            err.message.contains("methods must take 'self'"),
+            "{}",
+            err.message
+        );
+        // A method with no parameters at all.
+        let err = parse_err("class C\n    fn m()\n    end\nend\n");
+        assert!(
+            err.message.contains("methods must take 'self'"),
+            "{}",
+            err.message
+        );
+        // Anything that is not a method definition.
+        let err = parse_err("class C\n    let x = 1\nend\n");
+        assert!(
+            err.message.contains("only method definitions"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("class C\n    print 1\nend\n");
+        assert!(
+            err.message.contains("only method definitions"),
+            "{}",
+            err.message
+        );
+        // `super` without a method call.
+        let err = parse_err("print super.nome");
+        assert!(
+            err.message.contains("expected '(' after super method name"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("print super");
+        assert!(
+            err.message.contains("expected '.' after 'super'"),
+            "{}",
+            err.message
+        );
+        // A class without a name, or without a parent name.
+        let err = parse_err("class\nend");
+        assert!(
+            err.message.contains("expected class name"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("class C extends\nend");
+        assert!(
+            err.message.contains("expected parent class name"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn class_display_round_trip() {
+        let source = "class Studente extends Persona\n    fn init(self, nome)\n        super.init(nome)\n        self.nome = nome\n    end\n    fn saluta(self)\n        print self.nome\n    end\nend\nlet s = Studente(\"Giuliano\")\nprint s.saluta()\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "class Studente extends Persona\n    fn init(self, nome)\n        super.init(nome)\n        self.nome = nome\n    end\n    fn saluta(self)\n        print self.nome\n    end\nend\nlet s = Studente(\"Giuliano\")\nprint s.saluta()"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+        // An empty class prints cleanly too.
+        let prog = parse_ok("class Vuota\nend");
+        assert_eq!(prog.to_string(), "class Vuota\nend");
+        assert_eq!(parse_ok(&prog.to_string()), prog);
+    }
+
+    #[test]
+    fn class_missing_end_is_incomplete() {
+        assert!(parse_err("class C\n    fn m(self)\n    end\n").is_incomplete());
+        assert!(parse_err("class C").is_incomplete());
     }
 
     #[test]

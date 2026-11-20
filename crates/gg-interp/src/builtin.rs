@@ -121,6 +121,11 @@ pub fn all() -> Vec<Builtin> {
             func: int,
         },
         Builtin {
+            name: "is_a",
+            arity: Arity::Exact(2),
+            func: is_a,
+        },
+        Builtin {
             name: "keys",
             arity: Arity::Exact(1),
             func: keys,
@@ -238,31 +243,38 @@ fn len(
     }
 }
 
-/// `type(x)` — the type name as a string.
+/// `type(x)` — the type name as a string. An instance reports
+/// its class name (`type(p)` is `"Persona"`); a class reports
+/// `"class"`.
 fn type_of(
     args: &[Value],
     _input: &mut dyn BufRead,
     _out: &mut dyn Write,
 ) -> Result<Value, RuntimeError> {
     let name = match &args[0] {
-        Value::Int(_) => "int",
-        Value::Float(_) => "float",
-        Value::Str(_) => "str",
-        Value::Bool(_) => "bool",
-        Value::Nil => "nil",
-        Value::List(_) => "list",
-        Value::Tuple(_) => "tuple",
-        Value::Dict(_) => "dict",
-        Value::Set(_) => "set",
-        Value::Array(_) => "array",
-        Value::Queue(_) => "queue",
-        Value::Stack(_) => "stack",
-        Value::Function(_) | Value::Builtin(_) => "fn",
+        Value::Int(_) => "int".to_string(),
+        Value::Float(_) => "float".to_string(),
+        Value::Str(_) => "str".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Nil => "nil".to_string(),
+        Value::List(_) => "list".to_string(),
+        Value::Tuple(_) => "tuple".to_string(),
+        Value::Dict(_) => "dict".to_string(),
+        Value::Set(_) => "set".to_string(),
+        Value::Array(_) => "array".to_string(),
+        Value::Queue(_) => "queue".to_string(),
+        Value::Stack(_) => "stack".to_string(),
+        Value::Function(_) | Value::Builtin(_) | Value::BoundMethod(_) => "fn".to_string(),
+        Value::Class(_) => "class".to_string(),
+        Value::Instance(inst) => inst.borrow().class.name.clone(),
     };
-    Ok(Value::Str(name.to_string()))
+    Ok(Value::Str(name))
 }
 
 /// `str(x)` — convert to a string, same representation as `print`.
+/// Note: the interpreter intercepts `str()` on an instance whose
+/// class defines a `str` method, so that method wins (see
+/// `Interpreter::display`); this function only sees the rest.
 fn str_of(
     args: &[Value],
     _input: &mut dyn BufRead,
@@ -841,4 +853,27 @@ fn list_of(
         }
     };
     Ok(Value::List(Rc::new(RefCell::new(values))))
+}
+
+// ---- Phase 8: OOP ----
+
+/// `is_a(x, Classe)` — true when `x` is an instance of `Classe`
+/// or of one of its subclasses (`is_a(studente, Persona)` is true
+/// when `Studente extends Persona`). Anything that is not an
+/// instance is false; the second argument must be a class.
+fn is_a(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let Value::Class(class) = &args[1] else {
+        return Err(RuntimeError::new(
+            "is_a() expects a Class as its second argument",
+        ));
+    };
+    let result = match &args[0] {
+        Value::Instance(inst) => inst.borrow().class.is_a(class),
+        _ => false,
+    };
+    Ok(Value::Bool(result))
 }
