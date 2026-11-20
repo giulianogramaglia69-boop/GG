@@ -483,7 +483,10 @@ mod tests {
         assert_eq!(run_ok("print len([1, 2, 3])\n"), "3\n");
         assert_eq!(run_ok("print len([])\n"), "0\n");
         assert_eq!(run_ok("print len([[1], [2, 3]])\n"), "2\n");
-        assert!(run_err("print len(5)\n").contains("len() expects a Str or a List"));
+        assert!(
+            run_err("print len(5)\n")
+                .contains("len() expects a Str, List, Tuple, Dict, Set, Array, Queue or Stack")
+        );
     }
 
     #[test]
@@ -493,8 +496,8 @@ mod tests {
         // push returns nil.
         assert_eq!(run_ok("let xs = []\nprint push(xs, 1)\n"), "nil\n");
         assert!(run_err("print pop([])\n").contains("pop() on empty list"));
-        assert!(run_err("print push(5, 1)\n").contains("push() expects a List"));
-        assert!(run_err("print pop(\"s\")\n").contains("pop() expects a List"));
+        assert!(run_err("print push(5, 1)\n").contains("push() expects a List or a Stack"));
+        assert!(run_err("print pop(\"s\")\n").contains("pop() expects a List or a Stack"));
     }
 
     #[test]
@@ -640,5 +643,341 @@ mod tests {
         assert!(run_err("print file_exists(5)\n").contains("file_exists() expects a Str"));
         assert!(run_err("print append_file(5, \"x\")\n").contains("append_file() expects a Str"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 7: collections ----
+
+    #[test]
+    fn tuple_literals_and_grouping() {
+        assert_eq!(run_ok("print (1, \"a\", true)\n"), "(1, \"a\", true)\n");
+        assert_eq!(run_ok("print ()\n"), "()\n");
+        assert_eq!(run_ok("print (1,)\n"), "(1,)\n");
+        // `(1)` is grouping, not a tuple.
+        assert_eq!(run_ok("print (1)\n"), "1\n");
+        assert_eq!(run_ok("print (1 + 2)\n"), "3\n");
+        // Nested and mixed tuples.
+        assert_eq!(run_ok("print ((1, 2), 3)\n"), "((1, 2), 3)\n");
+        assert_eq!(run_ok("print type((1, 2))\n"), "tuple\n");
+        assert_eq!(run_ok("print type(())\n"), "tuple\n");
+        assert_eq!(run_ok("print len((1, 2, 3))\n"), "3\n");
+        assert_eq!(run_ok("print str((1, \"x\"))\n"), "(1, \"x\")\n");
+        // Tuples compare by content.
+        assert_eq!(run_ok("print (1, 2) == (1, 2)\n"), "true\n");
+        assert_eq!(run_ok("print (1, 2) == (1, 3)\n"), "false\n");
+        assert_eq!(run_ok("print (1,) == (1,)\n"), "true\n");
+        assert_eq!(run_ok("print () == ()\n"), "true\n");
+        assert_eq!(run_ok("print (1, 2) == [1, 2]\n"), "false\n");
+    }
+
+    #[test]
+    fn tuple_indexing_and_immutability() {
+        let src = "let t = (10, 20, 30)\nprint t[0]\nprint t[2]\nprint t[-1]\nprint t[-3]\n";
+        assert_eq!(run_ok(src), "10\n30\n30\n10\n");
+        assert!(run_err("let t = (1,)\nprint t[1]\n").contains("tuple index out of range"));
+        assert!(run_err("let t = (1,)\nprint t[-2]\n").contains("tuple index out of range"));
+        assert!(
+            run_err("let t = (1,)\nprint t[\"a\"]\n").contains("tuple index must be an integer")
+        );
+        // Tuples are immutable.
+        assert!(run_err("let t = (1, 2)\nt[0] = 99\n").contains("cannot assign to tuple"));
+    }
+
+    #[test]
+    fn dict_literals_access_and_insertion() {
+        let src =
+            "let d = {\"nome\": \"Giuliano\", \"eta\": 14}\nprint d[\"nome\"]\nprint d[\"eta\"]\n";
+        assert_eq!(run_ok(src), "Giuliano\n14\n");
+        assert_eq!(run_ok("print {}\n"), "{}\n");
+        assert_eq!(run_ok("print {\"a\": 1}\n"), "{\"a\": 1}\n");
+        assert_eq!(run_ok("print type({\"a\": 1})\n"), "dict\n");
+        assert_eq!(run_ok("print type({})\n"), "dict\n");
+        // Insertion of a missing key, and update of an existing one.
+        let src = "let d = {}\nd[\"x\"] = 1\nd[\"y\"] = 2\nd[\"x\"] = 9\nprint d\nprint len(d)\n";
+        assert_eq!(run_ok(src), "{\"x\": 9, \"y\": 2}\n2\n");
+        // Integer, float and bool keys work too.
+        let src = "let d = {1: \"a\", 2.5: \"b\", true: \"c\"}\nprint d[1]\nprint d[2.5]\nprint d[true]\n";
+        assert_eq!(run_ok(src), "a\nb\nc\n");
+        // A missing key is an error.
+        assert!(run_err("let d = {}\nprint d[\"x\"]\n").contains("key not found"));
+        // Updating keeps the original position.
+        let src = "let d = {\"a\": 1, \"b\": 2}\nd[\"a\"] = 9\nprint keys(d)\n";
+        assert_eq!(run_ok(src), "[\"a\", \"b\"]\n");
+        // Nested dicts.
+        let src =
+            "let d = {\"a\": {\"b\": 5}}\nprint d[\"a\"][\"b\"]\nd[\"a\"][\"b\"] = 6\nprint d\n";
+        assert_eq!(run_ok(src), "5\n{\"a\": {\"b\": 6}}\n");
+    }
+
+    #[test]
+    fn dict_key_errors() {
+        // Lists, dicts, sets and tuples cannot be keys.
+        assert!(run_err("print {[1]: 2}\n").contains("dict key must be Int, Float, Str or Bool"));
+        assert!(run_err("print {{}: 2}\n").contains("dict key must be Int, Float, Str or Bool"));
+        assert!(run_err("print {{1}: 2}\n").contains("dict key must be Int, Float, Str or Bool"));
+        assert!(run_err("print {(1,): 2}\n").contains("dict key must be Int, Float, Str or Bool"));
+        assert!(
+            run_err("let d = {}\nd[[1]] = 2\n")
+                .contains("dict key must be Int, Float, Str or Bool")
+        );
+        // `1` and `1.0` are different keys.
+        let src =
+            "let d = {1: \"int\"}\nd[1.0] = \"float\"\nprint len(d)\nprint d[1]\nprint d[1.0]\n";
+        assert_eq!(run_ok(src), "2\nint\nfloat\n");
+    }
+
+    #[test]
+    fn dict_equality() {
+        assert_eq!(run_ok("print {\"a\": 1} == {\"a\": 1}\n"), "true\n");
+        // Order does not matter for dict equality.
+        assert_eq!(
+            run_ok("print {\"a\": 1, \"b\": 2} == {\"b\": 2, \"a\": 1}\n"),
+            "true\n"
+        );
+        assert_eq!(run_ok("print {\"a\": 1} == {\"a\": 2}\n"), "false\n");
+        assert_eq!(run_ok("print {\"a\": 1} == {\"b\": 1}\n"), "false\n");
+        assert_eq!(run_ok("print {} == {}\n"), "true\n");
+        assert_eq!(run_ok("print {\"a\": 1} == 1\n"), "false\n");
+        // Nested dicts compare by content.
+        assert_eq!(
+            run_ok("print {\"a\": {\"b\": [1]}} == {\"a\": {\"b\": [1]}}\n"),
+            "true\n"
+        );
+    }
+
+    #[test]
+    fn set_literals_and_duplicates() {
+        assert_eq!(run_ok("print {1, 2, 3}\n"), "{1, 2, 3}\n");
+        // Duplicates are ignored silently.
+        assert_eq!(run_ok("print {1, 1, 2}\n"), "{1, 2}\n");
+        assert_eq!(run_ok("print len({1, 1, 2})\n"), "2\n");
+        assert_eq!(run_ok("print type({1})\n"), "set\n");
+        // `{}` is the empty dict, not an empty set.
+        assert_eq!(run_ok("print type({})\n"), "dict\n");
+        assert_eq!(run_ok("print {\"a\", \"b\"} == {\"b\", \"a\"}\n"), "true\n");
+        assert_eq!(run_ok("print {1, 2} == {1, 2, 3}\n"), "false\n");
+        assert_eq!(run_ok("print {1, 2} == [1, 2]\n"), "false\n");
+        // Sets print in insertion order.
+        assert_eq!(run_ok("print {3, 1, 2}\n"), "{3, 1, 2}\n");
+        // Unhashable elements are an error.
+        assert!(
+            run_err("print {[1], 2}\n").contains("set element must be Int, Float, Str or Bool")
+        );
+        assert!(run_err("print {{}, 1}\n").contains("set element must be Int, Float, Str or Bool"));
+        // Sets have no indexes and cannot be assigned to.
+        assert!(run_err("let s = {1, 2}\nprint s[0]\n").contains("cannot index Set"));
+        assert!(run_err("let s = {1, 2}\ns[0] = 9\n").contains("cannot assign to set"));
+    }
+
+    #[test]
+    fn array_construction_and_type_rules() {
+        assert_eq!(run_ok("print array([1, 2, 3])\n"), "array([1, 2, 3])\n");
+        assert_eq!(run_ok("print array([\"a\"])\n"), "array([\"a\"])\n");
+        assert_eq!(run_ok("print type(array([1]))\n"), "array\n");
+        assert_eq!(run_ok("print len(array([1, 2]))\n"), "2\n");
+        assert_eq!(
+            run_ok("print str(array([1.5, 2.5]))\n"),
+            "array([1.5, 2.5])\n"
+        );
+        assert_eq!(run_ok("print array([1, 2]) == array([1, 2])\n"), "true\n");
+        assert_eq!(run_ok("print array([1]) == array([1.0])\n"), "false\n");
+        assert_eq!(run_ok("print array([1]) == [1]\n"), "false\n");
+        // Empty list: no type to infer.
+        assert!(run_err("print array([])\n").contains("cannot infer array type from empty list"));
+        // Mixed types are an error.
+        assert!(
+            run_err("print array([1, \"a\"])\n")
+                .contains("array() elements must all have the same type")
+        );
+        assert!(
+            run_err("print array([1, 2.0])\n")
+                .contains("array() elements must all have the same type")
+        );
+        // Lists as elements are not allowed.
+        assert!(
+            run_err("print array([[1]])\n")
+                .contains("array() elements must be Int, Float, Str or Bool")
+        );
+        // A non-list argument is a type error.
+        assert!(run_err("print array(5)\n").contains("array() expects a List"));
+    }
+
+    #[test]
+    fn array_indexing_and_assignment() {
+        let src = "let a = array([10, 20, 30])\nprint a[0]\nprint a[-1]\na[1] = 99\nprint a\n";
+        assert_eq!(run_ok(src), "10\n30\narray([10, 99, 30])\n");
+        assert!(run_err("let a = array([1])\nprint a[1]\n").contains("array index out of range"));
+        assert!(
+            run_err("let a = array([1])\nprint a[\"x\"]\n")
+                .contains("array index must be an integer")
+        );
+        // The new value must have the same type.
+        assert!(
+            run_err("let a = array([1, 2])\na[0] = \"x\"\n")
+                .contains("array element must be Int, not Str")
+        );
+        assert!(
+            run_err("let a = array([1.5])\na[0] = 1\n")
+                .contains("array element must be Float, not Int")
+        );
+        // Fixed size: no push or pop.
+        assert!(
+            run_err("let a = array([1])\npush(a, 2)\n")
+                .contains("push() expects a List or a Stack")
+        );
+        assert!(
+            run_err("let a = array([1])\npop(a)\n").contains("pop() expects a List or a Stack")
+        );
+    }
+
+    #[test]
+    fn queue_is_fifo() {
+        assert_eq!(run_ok("print queue()\n"), "queue([])\n");
+        assert_eq!(run_ok("print queue([1, 2])\n"), "queue([1, 2])\n");
+        assert_eq!(run_ok("print type(queue())\n"), "queue\n");
+        assert_eq!(run_ok("print len(queue([1, 2, 3]))\n"), "3\n");
+        let src = "let q = queue()\nenqueue(q, 1)\nenqueue(q, 2)\nenqueue(q, 3)\nprint dequeue(q)\nprint dequeue(q)\nprint q\n";
+        assert_eq!(run_ok(src), "1\n2\nqueue([3])\n");
+        // dequeue on an empty queue is an error.
+        assert!(run_err("print dequeue(queue())\n").contains("dequeue() on empty queue"));
+        assert!(run_err("print dequeue([1])\n").contains("dequeue() expects a Queue"));
+        assert!(run_err("print enqueue([1], 2)\n").contains("enqueue() expects a Queue"));
+        assert!(run_err("print queue(5)\n").contains("queue() expects a List"));
+        assert!(
+            run_err("print queue([1], [2])\n")
+                .contains("queue() expects 0 or 1 argument(s) but got 2")
+        );
+        // peek sees the front without removing it.
+        let src = "let q = queue([1, 2])\nprint peek(q)\nprint q\n";
+        assert_eq!(run_ok(src), "1\nqueue([1, 2])\n");
+        assert!(run_err("print peek(queue())\n").contains("peek() on empty queue"));
+    }
+
+    #[test]
+    fn stack_is_lifo_and_push_pop_are_extended() {
+        assert_eq!(run_ok("print stack()\n"), "stack([])\n");
+        assert_eq!(run_ok("print stack([1, 2])\n"), "stack([1, 2])\n");
+        assert_eq!(run_ok("print type(stack())\n"), "stack\n");
+        assert_eq!(run_ok("print len(stack([1, 2]))\n"), "2\n");
+        let src = "let s = stack()\npush(s, 1)\npush(s, 2)\nprint pop(s)\nprint pop(s)\nprint s\n";
+        assert_eq!(run_ok(src), "2\n1\nstack([])\n");
+        // pop on an empty stack is an error.
+        assert!(run_err("print pop(stack())\n").contains("pop() on empty stack"));
+        assert!(run_err("print stack(5)\n").contains("stack() expects a List"));
+        // peek sees the top without removing it.
+        let src = "let s = stack([1, 2])\nprint peek(s)\nprint s\n";
+        assert_eq!(run_ok(src), "2\nstack([1, 2])\n");
+        assert!(run_err("print peek(stack())\n").contains("peek() on empty stack"));
+        // peek on a list gives the last element.
+        assert_eq!(run_ok("print peek([1, 2, 3])\n"), "3\n");
+        assert!(run_err("print peek([])\n").contains("peek() on empty list"));
+        assert!(run_err("print peek(5)\n").contains("peek() expects a List, a Queue or a Stack"));
+        // push returns nil, like on lists.
+        assert_eq!(run_ok("let s = stack()\nprint push(s, 1)\n"), "nil\n");
+    }
+
+    #[test]
+    fn keys_in_insertion_order() {
+        let src = "let d = {\"b\": 2, \"a\": 1}\nprint keys(d)\n";
+        assert_eq!(run_ok(src), "[\"b\", \"a\"]\n");
+        assert_eq!(run_ok("print keys({})\n"), "[]\n");
+        let src = "let d = {1: \"x\", \"s\": \"y\", true: \"z\"}\nprint keys(d)\n";
+        assert_eq!(run_ok(src), "[1, \"s\", true]\n");
+        assert!(run_err("print keys([1])\n").contains("keys() expects a Dict"));
+    }
+
+    #[test]
+    fn contains_on_every_collection() {
+        assert_eq!(run_ok("print contains([1, 2], 2)\n"), "true\n");
+        assert_eq!(run_ok("print contains([1, 2], 3)\n"), "false\n");
+        assert_eq!(run_ok("print contains((1, 2), 2)\n"), "true\n");
+        assert_eq!(run_ok("print contains(array([1, 2]), 2)\n"), "true\n");
+        assert_eq!(run_ok("print contains({1, 2}, 2)\n"), "true\n");
+        assert_eq!(run_ok("print contains({1, 2}, 3)\n"), "false\n");
+        // Dicts: the key exists.
+        assert_eq!(run_ok("print contains({\"a\": 1}, \"a\")\n"), "true\n");
+        assert_eq!(run_ok("print contains({\"a\": 1}, \"b\")\n"), "false\n");
+        // Strings: substring search.
+        assert_eq!(run_ok("print contains(\"ciao\", \"ia\")\n"), "true\n");
+        assert_eq!(run_ok("print contains(\"ciao\", \"z\")\n"), "false\n");
+        // Membership uses value equality (1 == 1.0).
+        assert_eq!(run_ok("print contains([1], 1.0)\n"), "true\n");
+        // An unhashable value can never be a set/dict member: false.
+        assert_eq!(run_ok("print contains({1}, [1])\n"), "false\n");
+        assert_eq!(run_ok("print contains({\"a\": 1}, [1])\n"), "false\n");
+        assert!(
+            run_err("print contains(\"ciao\", 1)\n")
+                .contains("contains() expects a Str to search in a Str")
+        );
+        assert!(
+            run_err("print contains(5, 1)\n")
+                .contains("contains() expects a List, Tuple, Dict, Set, Array or Str")
+        );
+    }
+
+    #[test]
+    fn list_converts_collections() {
+        assert_eq!(run_ok("print list((1, 2))\n"), "[1, 2]\n");
+        assert_eq!(run_ok("print list({3, 1})\n"), "[3, 1]\n");
+        assert_eq!(run_ok("print list(array([1, 2]))\n"), "[1, 2]\n");
+        assert_eq!(run_ok("print list(queue([1, 2]))\n"), "[1, 2]\n");
+        assert_eq!(run_ok("print list(stack([1, 2]))\n"), "[1, 2]\n");
+        assert_eq!(
+            run_ok("print list({\"b\": 1, \"a\": 2})\n"),
+            "[\"b\", \"a\"]\n"
+        );
+        // A list converts to a fresh copy: mutating it does not
+        // touch the original.
+        let src = "let a = [1, 2]\nlet b = list(a)\npush(b, 3)\nprint a\nprint b\n";
+        assert_eq!(run_ok(src), "[1, 2]\n[1, 2, 3]\n");
+        // A string is an error (use split/lines for text).
+        assert!(run_err("print list(\"ciao\")\n").contains("list() cannot convert Str to List"));
+        assert!(run_err("print list(5)\n").contains("list() cannot convert Int to List"));
+    }
+
+    #[test]
+    fn len_str_and_type_on_all_collections() {
+        assert_eq!(run_ok("print len((1, 2))\n"), "2\n");
+        assert_eq!(run_ok("print len({\"a\": 1, \"b\": 2})\n"), "2\n");
+        assert_eq!(run_ok("print len({1, 2, 3})\n"), "3\n");
+        assert_eq!(run_ok("print len(array([1]))\n"), "1\n");
+        assert_eq!(run_ok("print len(queue([1, 2]))\n"), "2\n");
+        assert_eq!(run_ok("print len(stack([1]))\n"), "1\n");
+        assert_eq!(run_ok("print type((1,))\n"), "tuple\n");
+        assert_eq!(run_ok("print type({\"a\": 1})\n"), "dict\n");
+        assert_eq!(run_ok("print type({1})\n"), "set\n");
+        assert_eq!(run_ok("print type(array([1]))\n"), "array\n");
+        assert_eq!(run_ok("print type(queue())\n"), "queue\n");
+        assert_eq!(run_ok("print type(stack())\n"), "stack\n");
+        assert_eq!(run_ok("print str({1, 2})\n"), "{1, 2}\n");
+        assert_eq!(run_ok("print str({\"a\": 1})\n"), "{\"a\": 1}\n");
+        assert_eq!(run_ok("print str(queue([1]))\n"), "queue([1])\n");
+        assert_eq!(run_ok("print str(stack([1]))\n"), "stack([1])\n");
+        assert_eq!(run_ok("print str(())\n"), "()\n");
+    }
+
+    #[test]
+    fn nested_collections_equality_and_display_cap() {
+        // Nested equality by content.
+        assert_eq!(
+            run_ok("print {\"a\": (1, [2])} == {\"a\": (1, [2])}\n"),
+            "true\n"
+        );
+        assert_eq!(run_ok("print [{1, 2}] == [{2, 1}]\n"), "true\n");
+        // A self-referential list inside a dict prints with `...`
+        // instead of recursing forever.
+        let src = "let a = [1]\npush(a, a)\nlet d = {\"x\": a}\nprint d\n";
+        let out = run_ok(src);
+        assert!(out.contains("..."), "{out}");
+        assert!(out.starts_with("{\"x\": [1, [1,"), "{out}");
+        // A dict containing itself, compared to itself, is equal.
+        let src = "let d = {}\nd[\"self\"] = d\nprint d == d\n";
+        assert_eq!(run_ok(src), "true\n");
+    }
+
+    #[test]
+    fn word_count_with_a_dict() {
+        // `for x in ...` does not exist yet: count by index instead.
+        let src = "let text = \"pane pane latte pane\"\nlet words = split(text, \" \")\nlet counts = {}\nfor i = 0 to len(words) - 1 then\n    let w = words[i]\n    if contains(counts, w) then\n        counts[w] = counts[w] + 1\n    else\n        counts[w] = 1\n    end\nend\nprint counts\nprint counts[\"pane\"]\n";
+        assert_eq!(run_ok(src), "{\"pane\": 3, \"latte\": 1}\n3\n");
     }
 }

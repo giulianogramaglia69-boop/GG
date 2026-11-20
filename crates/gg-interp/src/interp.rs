@@ -19,7 +19,7 @@ use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 use crate::builtin;
 use crate::env::Environment;
 use crate::error::RuntimeError;
-use crate::value::{Function, Value, values_equal};
+use crate::value::{DictData, Function, Value, elem_type_of, values_equal};
 
 /// What executing a statement produced: either control flows on
 /// normally, or a `return` was hit with its value.
@@ -229,10 +229,49 @@ impl Interpreter {
                 }
                 Ok(Value::List(Rc::new(RefCell::new(values))))
             }
+            Expr::Tuple(elements) => {
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    values.push(self.eval_expr(element, env, input, out)?);
+                }
+                Ok(Value::Tuple(Rc::new(values)))
+            }
+            Expr::Dict(entries) => {
+                let mut data = DictData::new();
+                for (key_expr, value_expr) in entries {
+                    let key = self.eval_expr(key_expr, env, input, out)?;
+                    let Some(key) = key.to_key() else {
+                        return Err(RuntimeError::new(format!(
+                            "dict key must be Int, Float, Str or Bool, not {}",
+                            key.type_name()
+                        )));
+                    };
+                    let value = self.eval_expr(value_expr, env, input, out)?;
+                    data.insert(key, value);
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(data))))
+            }
+            Expr::Set(elements) => {
+                let mut items = Vec::new();
+                for element in elements {
+                    let value = self.eval_expr(element, env, input, out)?;
+                    let Some(key) = value.to_key() else {
+                        return Err(RuntimeError::new(format!(
+                            "set element must be Int, Float, Str or Bool, not {}",
+                            value.type_name()
+                        )));
+                    };
+                    // Duplicates are ignored silently.
+                    if !items.contains(&key) {
+                        items.push(key);
+                    }
+                }
+                Ok(Value::Set(Rc::new(RefCell::new(items))))
+            }
             Expr::Index { target, index } => {
                 let target = self.eval_expr(target, env, input, out)?;
                 let index = self.eval_expr(index, env, input, out)?;
-                index_list(&target, index)
+                index_value(&target, index)
             }
             Expr::Unary { op, expr } => {
                 let value = self.eval_expr(expr, env, input, out)?;
@@ -345,8 +384,9 @@ impl Interpreter {
     }
 
     /// Assign through an index: the target must be an `Index`
-    /// expression (`xs[0]`, `m[0][1]`). The container is evaluated
-    /// first, then the final index, and the element is replaced.
+    /// expression (`xs[0]`, `m[0][1]`, `d["k"]`). The container is
+    /// evaluated first, then the final index, and the element is
+    /// replaced — or inserted, for dicts.
     fn assign_index(
         &mut self,
         target: &Expr,
@@ -360,15 +400,49 @@ impl Interpreter {
         };
         let container = self.eval_expr(target, env, input, out)?;
         let index = self.eval_expr(index, env, input, out)?;
-        let Value::List(list) = container else {
-            return Err(RuntimeError::new(format!(
+        match container {
+            Value::List(list) => {
+                let pos = resolve_index(list.borrow().len(), index, "list")?;
+                list.borrow_mut()[pos] = value;
+                Ok(())
+            }
+            Value::Dict(dict) => {
+                let Some(key) = index.to_key() else {
+                    return Err(RuntimeError::new(format!(
+                        "dict key must be Int, Float, Str or Bool, not {}",
+                        index.type_name()
+                    )));
+                };
+                dict.borrow_mut().insert(key, value);
+                Ok(())
+            }
+            Value::Array(array) => {
+                let mut array = array.borrow_mut();
+                let pos = resolve_index(array.items.len(), index, "array")?;
+                let wanted = array.elem;
+                match elem_type_of(&value) {
+                    Some(elem) if elem == wanted => {
+                        array.items[pos] = value;
+                        Ok(())
+                    }
+                    _ => Err(RuntimeError::new(format!(
+                        "array element must be {}, not {}",
+                        wanted.name(),
+                        value.type_name()
+                    ))),
+                }
+            }
+            Value::Tuple(_) => Err(RuntimeError::new(
+                "cannot assign to tuple (tuples are immutable)",
+            )),
+            Value::Set(_) => Err(RuntimeError::new(
+                "cannot assign to set (sets have no indexes)",
+            )),
+            other => Err(RuntimeError::new(format!(
                 "cannot index {}",
-                container.type_name()
-            )));
-        };
-        let pos = resolve_index(&list.borrow(), index)?;
-        list.borrow_mut()[pos] = value;
-        Ok(())
+                other.type_name()
+            ))),
+        }
     }
 
     /// Call a user function: fresh scope under the captured environment,
@@ -393,29 +467,58 @@ impl Interpreter {
 
 /// Resolve a (possibly negative) index into a position: `-1` is the
 /// last element, `-len` the first. Out of range is an error.
-fn resolve_index(list: &[Value], index: Value) -> Result<usize, RuntimeError> {
+/// `kind` names the collection in the message ("list", "tuple",
+/// "array").
+fn resolve_index(len: usize, index: Value, kind: &str) -> Result<usize, RuntimeError> {
     let Value::Int(i) = index else {
-        return Err(RuntimeError::new("list index must be an integer"));
+        return Err(RuntimeError::new(format!(
+            "{kind} index must be an integer"
+        )));
     };
-    let len = list.len() as i64;
+    let len = len as i64;
     let pos = if i < 0 { len + i } else { i };
     if pos < 0 || pos >= len {
-        return Err(RuntimeError::new("list index out of range"));
+        return Err(RuntimeError::new(format!("{kind} index out of range")));
     }
     Ok(pos as usize)
 }
 
-/// `xs[i]`: read one element (negative indexes count from the end).
-fn index_list(target: &Value, index: Value) -> Result<Value, RuntimeError> {
-    let Value::List(list) = target else {
-        return Err(RuntimeError::new(format!(
+/// `xs[i]` / `t[i]` / `a[i]` / `d[k]`: read one element. Lists,
+/// tuples and arrays take an integer index (negative from the end);
+/// dicts take a hashable key and fail on a missing key.
+fn index_value(target: &Value, index: Value) -> Result<Value, RuntimeError> {
+    match target {
+        Value::List(list) => {
+            let borrowed = list.borrow();
+            let pos = resolve_index(borrowed.len(), index, "list")?;
+            Ok(borrowed[pos].clone())
+        }
+        Value::Tuple(items) => {
+            let pos = resolve_index(items.len(), index, "tuple")?;
+            Ok(items[pos].clone())
+        }
+        Value::Array(array) => {
+            let borrowed = array.borrow();
+            let pos = resolve_index(borrowed.items.len(), index, "array")?;
+            Ok(borrowed.items[pos].clone())
+        }
+        Value::Dict(dict) => {
+            let Some(key) = index.to_key() else {
+                return Err(RuntimeError::new(format!(
+                    "dict key must be Int, Float, Str or Bool, not {}",
+                    index.type_name()
+                )));
+            };
+            match dict.borrow().get(&key) {
+                Some(value) => Ok(value.clone()),
+                None => Err(RuntimeError::new("key not found")),
+            }
+        }
+        other => Err(RuntimeError::new(format!(
             "cannot index {}",
-            target.type_name()
-        )));
-    };
-    let borrowed = list.borrow();
-    let pos = resolve_index(&borrowed, index)?;
-    Ok(borrowed[pos].clone())
+            other.type_name()
+        ))),
+    }
 }
 
 /// `+`: integer/float arithmetic, or string concatenation.

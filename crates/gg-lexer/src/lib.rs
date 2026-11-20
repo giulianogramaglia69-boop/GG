@@ -6,7 +6,8 @@
 //!
 //! Syntax decisions (final):
 //! - English keywords, blocks closed by `end` (Ruby/Lua style).
-//! - No significant indentation, no braces.
+//! - No significant indentation; blocks do not use braces — `{...}`
+//!   is the dict/set literal syntax.
 //! - `#` comments run to the end of the line.
 //! - Newlines are real tokens: the parser (Phase 2) uses them as
 //!   statement separators. `;` is also accepted as a separator.
@@ -78,6 +79,9 @@ pub enum TokenKind {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
+    Colon,
     Comma,
     // Separators
     Newline,
@@ -125,6 +129,9 @@ impl TokenKind {
             TokenKind::RParen => "RParen",
             TokenKind::LBracket => "LBracket",
             TokenKind::RBracket => "RBracket",
+            TokenKind::LBrace => "LBrace",
+            TokenKind::RBrace => "RBrace",
+            TokenKind::Colon => "Colon",
             TokenKind::Comma => "Comma",
             TokenKind::Newline => "Newline",
             TokenKind::Semicolon => "Semicolon",
@@ -170,6 +177,9 @@ impl TokenKind {
             TokenKind::RParen => ")".to_string(),
             TokenKind::LBracket => "[".to_string(),
             TokenKind::RBracket => "]".to_string(),
+            TokenKind::LBrace => "{".to_string(),
+            TokenKind::RBrace => "}".to_string(),
+            TokenKind::Colon => ":".to_string(),
             TokenKind::Comma => ",".to_string(),
             TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof => String::new(),
         }
@@ -321,6 +331,18 @@ impl Lexer {
                 ']' => {
                     self.advance();
                     return Ok(self.token(TokenKind::RBracket, line, col));
+                }
+                '{' => {
+                    self.advance();
+                    return Ok(self.token(TokenKind::LBrace, line, col));
+                }
+                '}' => {
+                    self.advance();
+                    return Ok(self.token(TokenKind::RBrace, line, col));
+                }
+                ':' => {
+                    self.advance();
+                    return Ok(self.token(TokenKind::Colon, line, col));
                 }
                 ',' => {
                     self.advance();
@@ -719,7 +741,7 @@ mod tests {
     #[test]
     fn arithmetic_operators_and_punctuation() {
         assert_eq!(
-            kinds_no_eof("+ - * / % ( ) , [ ]"),
+            kinds_no_eof("+ - * / % ( ) , [ ] { } :"),
             vec![
                 TokenKind::Plus,
                 TokenKind::Minus,
@@ -731,6 +753,9 @@ mod tests {
                 TokenKind::Comma,
                 TokenKind::LBracket,
                 TokenKind::RBracket,
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+                TokenKind::Colon,
             ]
         );
     }

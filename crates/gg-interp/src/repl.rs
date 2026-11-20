@@ -232,4 +232,16 @@ mod tests {
             format!("{WELCOME}gg> gg> [1, 2]\ngg> 2\ngg> gg> [1, 2, 3]\ngg> ")
         );
     }
+
+    #[test]
+    fn tuples_and_dicts_work_in_the_repl() {
+        assert_eq!(
+            session(
+                "let t = (1, \"a\")\nt\nt[1]\nlet d = {\"k\": 5}\nd[\"k\"]\nd[\"j\"] = 6\nd\nexit\n"
+            ),
+            format!(
+                "{WELCOME}gg> gg> (1, \"a\")\ngg> a\ngg> gg> 5\ngg> gg> {{\"k\": 5, \"j\": 6}}\ngg> "
+            )
+        );
+    }
 }

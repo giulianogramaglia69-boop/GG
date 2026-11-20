@@ -90,6 +90,16 @@ pub enum Expr {
     },
     /// A list literal: `[1, 2, 3]`, `[]`, nested and mixed.
     List(Vec<Expr>),
+    /// A tuple literal: `(1, "a")`, `()`, `(1,)` (the trailing
+    /// comma is what makes a one-element tuple — `(1)` is just
+    /// grouping). Tuples are immutable.
+    Tuple(Vec<Expr>),
+    /// A dict literal: `{"nome": "Giuliano"}`, `{}`. Keys are
+    /// validated at runtime (only Int/Float/Str/Bool).
+    Dict(Vec<(Expr, Expr)>),
+    /// A set literal: `{1, 2, 3}`. `{}` is the empty dict, not an
+    /// empty set (Python convention).
+    Set(Vec<Expr>),
     /// Indexing: `xs[0]`, `f()[0]`, `xs[0][1]`. Binds as tightly as
     /// a call (it is a postfix operator, see the parser).
     Index {
@@ -211,6 +221,43 @@ impl Expr {
                     element.fmt_prec(f, 0)?;
                 }
                 write!(f, "]")?;
+            }
+            Expr::Tuple(elements) => {
+                write!(f, "(")?;
+                for (i, element) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    element.fmt_prec(f, 0)?;
+                }
+                // A one-element tuple keeps its trailing comma, so it
+                // re-parses as a tuple and not as grouping.
+                if elements.len() == 1 {
+                    write!(f, ",")?;
+                }
+                write!(f, ")")?;
+            }
+            Expr::Dict(entries) => {
+                write!(f, "{{")?;
+                for (i, (key, value)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    key.fmt_prec(f, 0)?;
+                    write!(f, ": ")?;
+                    value.fmt_prec(f, 0)?;
+                }
+                write!(f, "}}")?;
+            }
+            Expr::Set(elements) => {
+                write!(f, "{{")?;
+                for (i, element) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    element.fmt_prec(f, 0)?;
+                }
+                write!(f, "}}")?;
             }
             Expr::Index { target, index } => {
                 target.fmt_prec(f, 8)?;

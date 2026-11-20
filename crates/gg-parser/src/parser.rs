@@ -502,10 +502,30 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.advance(); // (
-                let expr = self.parse_expr()?;
-                self.expect(&TokenKind::RParen, "')' after expression")?;
-                Ok(expr)
+                if self.check(&TokenKind::RParen) {
+                    self.advance(); // )
+                    return Ok(Expr::Tuple(vec![]));
+                }
+                let first = self.parse_expr()?;
+                if self.check(&TokenKind::Comma) {
+                    // Tuple: one or more elements, trailing comma
+                    // allowed (`(1,)` is a one-element tuple).
+                    let mut elements = vec![first];
+                    while self.check(&TokenKind::Comma) {
+                        self.advance(); // ,
+                        if self.check(&TokenKind::RParen) {
+                            break;
+                        }
+                        elements.push(self.parse_expr()?);
+                    }
+                    self.expect(&TokenKind::RParen, "')' after tuple elements")?;
+                    Ok(Expr::Tuple(elements))
+                } else {
+                    self.expect(&TokenKind::RParen, "')' after expression")?;
+                    Ok(first)
+                }
             }
+            TokenKind::LBrace => self.parse_brace(),
             TokenKind::LBracket => {
                 self.advance(); // [
                 let mut elements = Vec::new();
@@ -523,6 +543,48 @@ impl<'a> Parser<'a> {
                 "expected expression but found {}",
                 describe(self.peek())
             ))),
+        }
+    }
+
+    /// `{...}`: a dict when the entries have `:`, a set otherwise.
+    /// `{}` is the empty dict (Python convention).
+    fn parse_brace(&mut self) -> Result<Expr, ParserError> {
+        self.advance(); // {
+        if self.check(&TokenKind::RBrace) {
+            self.advance(); // }
+            return Ok(Expr::Dict(vec![]));
+        }
+        let first = self.parse_expr()?;
+        if self.check(&TokenKind::Colon) {
+            // Dict: key: value, key: value, ... (trailing comma ok).
+            let mut entries = Vec::new();
+            self.advance(); // :
+            let value = self.parse_expr()?;
+            entries.push((first, value));
+            while self.check(&TokenKind::Comma) {
+                self.advance(); // ,
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+                let key = self.parse_expr()?;
+                self.expect(&TokenKind::Colon, "':' after dict key")?;
+                let value = self.parse_expr()?;
+                entries.push((key, value));
+            }
+            self.expect(&TokenKind::RBrace, "'}' after dict entries")?;
+            Ok(Expr::Dict(entries))
+        } else {
+            // Set: elements separated by commas (trailing comma ok).
+            let mut elements = vec![first];
+            while self.check(&TokenKind::Comma) {
+                self.advance(); // ,
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+                elements.push(self.parse_expr()?);
+            }
+            self.expect(&TokenKind::RBrace, "'}' after set elements")?;
+            Ok(Expr::Set(elements))
         }
     }
 }
@@ -1111,6 +1173,153 @@ mod tests {
         assert_eq!(
             prog.to_string(),
             "let xs = [1, \"a\", [2, 3]]\nprint xs[0]\nxs[1] = 9"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn tuple_literals_and_grouping() {
+        // A two-element tuple.
+        assert_eq!(
+            parse_ok("print (1, \"a\")").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Tuple(vec![int(1), Expr::Str("a".to_string())]),
+            }]
+        );
+        // The empty tuple.
+        assert_eq!(
+            parse_ok("print ()").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Tuple(vec![]),
+            }]
+        );
+        // One element with a trailing comma is a tuple...
+        assert_eq!(
+            parse_ok("print (1,)").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Tuple(vec![int(1)]),
+            }]
+        );
+        // ...but without the comma it is just grouping.
+        assert_eq!(
+            parse_ok("print (1)").stmts,
+            vec![Stmt::Print { expr: int(1) }]
+        );
+        assert_eq!(
+            parse_ok("print (1 + 2)").stmts,
+            vec![Stmt::Print {
+                expr: bin(Add, int(1), int(2)),
+            }]
+        );
+        // Trailing comma after several elements is fine.
+        assert_eq!(
+            parse_ok("print (1, 2,)").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Tuple(vec![int(1), int(2)]),
+            }]
+        );
+        // Elements may be any expression, including nested tuples.
+        assert_eq!(
+            parse_ok("print ((1, 2), f(3))").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Tuple(vec![
+                    Expr::Tuple(vec![int(1), int(2)]),
+                    Expr::Call {
+                        name: "f".to_string(),
+                        args: vec![int(3)],
+                    },
+                ]),
+            }]
+        );
+    }
+
+    #[test]
+    fn dict_literals() {
+        assert_eq!(
+            parse_ok("print {\"nome\": \"Giuliano\", \"eta\": 14}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Dict(vec![
+                    (
+                        Expr::Str("nome".to_string()),
+                        Expr::Str("Giuliano".to_string())
+                    ),
+                    (Expr::Str("eta".to_string()), int(14)),
+                ]),
+            }]
+        );
+        // The empty braces are the empty dict.
+        assert_eq!(
+            parse_ok("print {}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Dict(vec![]),
+            }]
+        );
+        // Keys may be any expression (validated at runtime).
+        assert_eq!(
+            parse_ok("print {1: \"a\", true: 2}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Dict(vec![
+                    (int(1), Expr::Str("a".to_string())),
+                    (Expr::Bool(true), int(2)),
+                ]),
+            }]
+        );
+        // A trailing comma is fine.
+        assert_eq!(
+            parse_ok("print {\"a\": 1,}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Dict(vec![(Expr::Str("a".to_string()), int(1))]),
+            }]
+        );
+    }
+
+    #[test]
+    fn set_literals() {
+        assert_eq!(
+            parse_ok("print {1, 2, 3}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Set(vec![int(1), int(2), int(3)]),
+            }]
+        );
+        assert_eq!(
+            parse_ok("print {\"a\"}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Set(vec![Expr::Str("a".to_string())]),
+            }]
+        );
+        // A trailing comma is fine.
+        assert_eq!(
+            parse_ok("print {1,}").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Set(vec![int(1)]),
+            }]
+        );
+        // A missing colon in a dict entry is an error...
+        let err = parse_err("print {\"a\": 1, 2}");
+        assert!(
+            err.message.contains("':' after dict key"),
+            "{}",
+            err.message
+        );
+        // ...and a colon inside a set is an error too.
+        let err = parse_err("print {1, \"a\": 2}");
+        assert!(
+            err.message.contains("expected '}' after set elements"),
+            "{}",
+            err.message
+        );
+        // An unclosed brace is incomplete (the REPL keeps reading).
+        assert!(parse_err("print {1, 2").is_incomplete());
+    }
+
+    #[test]
+    fn collections_display_round_trip() {
+        let source = "let t = (1, \"a\")\nlet e = ()\nlet s = (1,)\nlet d = {\"k\": [1, 2]}\nlet u = {1, 2}\nprint t\nprint e\nprint s\nprint d\nprint u\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "let t = (1, \"a\")\nlet e = ()\nlet s = (1,)\nlet d = {\"k\": [1, 2]}\nlet u = {1, 2}\nprint t\nprint e\nprint s\nprint d\nprint u"
         );
         let reparsed = parse_ok(&prog.to_string());
         assert_eq!(reparsed, prog);

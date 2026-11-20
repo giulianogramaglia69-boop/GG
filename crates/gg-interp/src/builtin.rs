@@ -12,12 +12,13 @@
 //! `Cursor` and a `Vec<u8>`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use crate::env::Environment;
 use crate::error::RuntimeError;
-use crate::value::Value;
+use crate::value::{ArrayData, Value, elem_type_of, values_equal};
 
 /// A builtin function implementation: evaluated arguments, an input
 /// reader and an output writer.
@@ -80,6 +81,26 @@ pub fn all() -> Vec<Builtin> {
             func: append_file,
         },
         Builtin {
+            name: "array",
+            arity: Arity::Exact(1),
+            func: array,
+        },
+        Builtin {
+            name: "contains",
+            arity: Arity::Exact(2),
+            func: contains,
+        },
+        Builtin {
+            name: "dequeue",
+            arity: Arity::Exact(1),
+            func: dequeue,
+        },
+        Builtin {
+            name: "enqueue",
+            arity: Arity::Exact(2),
+            func: enqueue,
+        },
+        Builtin {
             name: "file_exists",
             arity: Arity::Exact(1),
             func: file_exists,
@@ -100,6 +121,11 @@ pub fn all() -> Vec<Builtin> {
             func: int,
         },
         Builtin {
+            name: "keys",
+            arity: Arity::Exact(1),
+            func: keys,
+        },
+        Builtin {
             name: "len",
             arity: Arity::Exact(1),
             func: len,
@@ -108,6 +134,11 @@ pub fn all() -> Vec<Builtin> {
             name: "lines",
             arity: Arity::Exact(1),
             func: lines,
+        },
+        Builtin {
+            name: "list",
+            arity: Arity::Exact(1),
+            func: list_of,
         },
         Builtin {
             name: "max",
@@ -120,6 +151,11 @@ pub fn all() -> Vec<Builtin> {
             func: min,
         },
         Builtin {
+            name: "peek",
+            arity: Arity::Exact(1),
+            func: peek,
+        },
+        Builtin {
             name: "pop",
             arity: Arity::Exact(1),
             func: pop,
@@ -128,6 +164,11 @@ pub fn all() -> Vec<Builtin> {
             name: "push",
             arity: Arity::Exact(2),
             func: push,
+        },
+        Builtin {
+            name: "queue",
+            arity: Arity::Range(0, 1),
+            func: queue_of,
         },
         Builtin {
             name: "range",
@@ -143,6 +184,11 @@ pub fn all() -> Vec<Builtin> {
             name: "split",
             arity: Arity::Exact(2),
             func: split,
+        },
+        Builtin {
+            name: "stack",
+            arity: Arity::Range(0, 1),
+            func: stack_of,
         },
         Builtin {
             name: "str",
@@ -170,7 +216,8 @@ pub fn define_all(env: &Environment) {
 }
 
 /// `len(x)` — number of characters in a string (not bytes:
-/// `"è"` has length 1), or number of elements in a list.
+/// `"è"` has length 1), or number of elements in any collection
+/// (list, tuple, dict, set, array, queue, stack).
 fn len(
     args: &[Value],
     _input: &mut dyn BufRead,
@@ -179,7 +226,15 @@ fn len(
     match &args[0] {
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::List(list) => Ok(Value::Int(list.borrow().len() as i64)),
-        _ => Err(RuntimeError::new("len() expects a Str or a List")),
+        Value::Tuple(items) => Ok(Value::Int(items.len() as i64)),
+        Value::Dict(dict) => Ok(Value::Int(dict.borrow().entries.len() as i64)),
+        Value::Set(set) => Ok(Value::Int(set.borrow().len() as i64)),
+        Value::Array(array) => Ok(Value::Int(array.borrow().items.len() as i64)),
+        Value::Queue(queue) => Ok(Value::Int(queue.borrow().len() as i64)),
+        Value::Stack(stack) => Ok(Value::Int(stack.borrow().len() as i64)),
+        _ => Err(RuntimeError::new(
+            "len() expects a Str, List, Tuple, Dict, Set, Array, Queue or Stack",
+        )),
     }
 }
 
@@ -196,6 +251,12 @@ fn type_of(
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
         Value::List(_) => "list",
+        Value::Tuple(_) => "tuple",
+        Value::Dict(_) => "dict",
+        Value::Set(_) => "set",
+        Value::Array(_) => "array",
+        Value::Queue(_) => "queue",
+        Value::Stack(_) => "stack",
         Value::Function(_) | Value::Builtin(_) => "fn",
     };
     Ok(Value::Str(name.to_string()))
@@ -385,29 +446,66 @@ fn as_int(name: &str, value: &Value) -> Result<i64, RuntimeError> {
     }
 }
 
+/// The argument as a queue, or a clear error naming the builtin.
+fn as_queue<'a>(
+    name: &str,
+    value: &'a Value,
+) -> Result<&'a Rc<RefCell<VecDeque<Value>>>, RuntimeError> {
+    match value {
+        Value::Queue(queue) => Ok(queue),
+        _ => Err(RuntimeError::new(format!("{name}() expects a Queue"))),
+    }
+}
+
+/// The argument as a dict, or a clear error naming the builtin.
+fn as_dict<'a>(
+    name: &str,
+    value: &'a Value,
+) -> Result<&'a Rc<RefCell<crate::value::DictData>>, RuntimeError> {
+    match value {
+        Value::Dict(dict) => Ok(dict),
+        _ => Err(RuntimeError::new(format!("{name}() expects a Dict"))),
+    }
+}
+
 /// `push(list, value)` — append `value` to the list (the list is
-/// mutated in place) and return `nil`.
+/// mutated in place) and return `nil`. Also works on a stack.
 fn push(
     args: &[Value],
     _input: &mut dyn BufRead,
     _out: &mut dyn Write,
 ) -> Result<Value, RuntimeError> {
-    let list = as_list("push", &args[0])?;
-    list.borrow_mut().push(args[1].clone());
-    Ok(Value::Nil)
+    match &args[0] {
+        Value::List(list) => {
+            list.borrow_mut().push(args[1].clone());
+            Ok(Value::Nil)
+        }
+        Value::Stack(stack) => {
+            stack.borrow_mut().push(args[1].clone());
+            Ok(Value::Nil)
+        }
+        _ => Err(RuntimeError::new("push() expects a List or a Stack")),
+    }
 }
 
 /// `pop(list)` — remove and return the last element; an error on
-/// an empty list.
+/// an empty list. Also works on a stack.
 fn pop(
     args: &[Value],
     _input: &mut dyn BufRead,
     _out: &mut dyn Write,
 ) -> Result<Value, RuntimeError> {
-    let list = as_list("pop", &args[0])?;
-    list.borrow_mut()
-        .pop()
-        .ok_or_else(|| RuntimeError::new("pop() on empty list"))
+    match &args[0] {
+        Value::List(list) => list
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| RuntimeError::new("pop() on empty list")),
+        Value::Stack(stack) => stack
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| RuntimeError::new("pop() on empty stack")),
+        _ => Err(RuntimeError::new("pop() expects a List or a Stack")),
+    }
 }
 
 /// Max number of elements `range` may produce, so a huge range
@@ -533,4 +631,214 @@ fn file_exists(
 ) -> Result<Value, RuntimeError> {
     let path = as_str("file_exists", &args[0])?;
     Ok(Value::Bool(std::path::Path::new(path).exists()))
+}
+
+// ---- Phase 7: collections ----
+
+/// `array([1, 2, 3])` — a fixed-size array with the element type of
+/// the list's first element. An empty list has no type to infer and
+/// mixed types are an error.
+fn array(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let list = as_list("array", &args[0])?;
+    let borrowed = list.borrow();
+    let Some(first) = borrowed.first() else {
+        return Err(RuntimeError::new("cannot infer array type from empty list"));
+    };
+    let Some(elem) = elem_type_of(first) else {
+        return Err(RuntimeError::new(format!(
+            "array() elements must be Int, Float, Str or Bool, not {}",
+            first.type_name()
+        )));
+    };
+    for item in borrowed.iter() {
+        if elem_type_of(item) != Some(elem) {
+            return Err(RuntimeError::new(
+                "array() elements must all have the same type",
+            ));
+        }
+    }
+    Ok(Value::Array(Rc::new(RefCell::new(ArrayData {
+        elem,
+        items: borrowed.clone(),
+    }))))
+}
+
+/// `queue()` — an empty FIFO queue; `queue([1, 2])` — a queue with
+/// the list's elements, front first.
+fn queue_of(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Value::Queue(Rc::new(RefCell::new(VecDeque::new()))));
+    }
+    let list = as_list("queue", &args[0])?;
+    Ok(Value::Queue(Rc::new(RefCell::new(VecDeque::from(
+        list.borrow().clone(),
+    )))))
+}
+
+/// `stack()` — an empty LIFO stack; `stack([1, 2])` — a stack with
+/// the list's elements, the last one on top.
+fn stack_of(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Value::Stack(Rc::new(RefCell::new(Vec::new()))));
+    }
+    let list = as_list("stack", &args[0])?;
+    Ok(Value::Stack(Rc::new(RefCell::new(list.borrow().clone()))))
+}
+
+/// `enqueue(q, x)` — add `x` at the back of the queue.
+fn enqueue(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let queue = as_queue("enqueue", &args[0])?;
+    queue.borrow_mut().push_back(args[1].clone());
+    Ok(Value::Nil)
+}
+
+/// `dequeue(q)` — remove and return the front element; an error on
+/// an empty queue.
+fn dequeue(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let queue = as_queue("dequeue", &args[0])?;
+    queue
+        .borrow_mut()
+        .pop_front()
+        .ok_or_else(|| RuntimeError::new("dequeue() on empty queue"))
+}
+
+/// `peek(x)` — the top of a stack, the front of a queue, or the
+/// last element of a list; an error on an empty one.
+fn peek(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    match &args[0] {
+        Value::Stack(stack) => stack
+            .borrow()
+            .last()
+            .cloned()
+            .ok_or_else(|| RuntimeError::new("peek() on empty stack")),
+        Value::Queue(queue) => queue
+            .borrow()
+            .front()
+            .cloned()
+            .ok_or_else(|| RuntimeError::new("peek() on empty queue")),
+        Value::List(list) => list
+            .borrow()
+            .last()
+            .cloned()
+            .ok_or_else(|| RuntimeError::new("peek() on empty list")),
+        other => Err(RuntimeError::new(format!(
+            "peek() expects a List, a Queue or a Stack, not {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `keys(d)` — the keys of a dict as a list, in insertion order.
+fn keys(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let dict = as_dict("keys", &args[0])?;
+    let values: Vec<Value> = dict
+        .borrow()
+        .keys()
+        .into_iter()
+        .map(|key| key.to_value())
+        .collect();
+    Ok(Value::List(Rc::new(RefCell::new(values))))
+}
+
+/// `contains(coll, x)` — membership: an element of a list, tuple,
+/// array or set; a key of a dict; a substring of a string. A value
+/// that can never be a member (unhashable, for sets and dicts)
+/// simply returns `false`.
+fn contains(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let (coll, x) = (&args[0], &args[1]);
+    let found = match coll {
+        Value::List(list) => list.borrow().iter().any(|item| values_equal(item, x)),
+        Value::Tuple(items) => items.iter().any(|item| values_equal(item, x)),
+        Value::Array(array) => array
+            .borrow()
+            .items
+            .iter()
+            .any(|item| values_equal(item, x)),
+        Value::Set(set) => match x.to_key() {
+            Some(key) => set.borrow().contains(&key),
+            None => false,
+        },
+        Value::Dict(dict) => match x.to_key() {
+            Some(key) => dict.borrow().get(&key).is_some(),
+            None => false,
+        },
+        Value::Str(s) => {
+            let Value::Str(needle) = x else {
+                return Err(RuntimeError::new(
+                    "contains() expects a Str to search in a Str",
+                ));
+            };
+            s.contains(needle.as_str())
+        }
+        other => {
+            return Err(RuntimeError::new(format!(
+                "contains() expects a List, Tuple, Dict, Set, Array or Str, not {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(Value::Bool(found))
+}
+
+/// `list(x)` — convert a tuple, set, array, queue or stack to a
+/// list; a dict gives its keys (like `keys`). A string is an error:
+/// use `split` or `lines` to turn text into a list.
+fn list_of(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let values = match &args[0] {
+        Value::List(list) => list.borrow().clone(),
+        Value::Tuple(items) => items.as_ref().clone(),
+        Value::Set(set) => set.borrow().iter().map(|key| key.to_value()).collect(),
+        Value::Array(array) => array.borrow().items.clone(),
+        Value::Queue(queue) => queue.borrow().iter().cloned().collect(),
+        Value::Stack(stack) => stack.borrow().clone(),
+        Value::Dict(dict) => dict
+            .borrow()
+            .keys()
+            .into_iter()
+            .map(|key| key.to_value())
+            .collect(),
+        other => {
+            return Err(RuntimeError::new(format!(
+                "list() cannot convert {} to List",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(Value::List(Rc::new(RefCell::new(values))))
 }

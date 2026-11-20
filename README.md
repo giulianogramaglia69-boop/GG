@@ -26,6 +26,12 @@ Builtin functions (`len`, `type`, `input`...) are available in
 every program. **Phase 5 — REPL: done.** The interactive shell
 (`gg` with no arguments, or `gg repl`) evaluates line by line, keeps
 state across lines, and lets blocks span several lines until `end`.
+**Phase 6 — lists + file handling: done.** Lists and whole-file
+helpers (`read_file`/`write_file`/`append_file`/`file_exists`).
+**Phase 7 — collections: done.** Tuples, dicts, sets, arrays, queues
+and stacks, with new builtins (`array`, `queue`, `stack`, `enqueue`,
+`dequeue`, `peek`, `keys`, `contains`, `list`) and `len`/`push`/`pop`
+extended to the new types.
 
 ## The REPL
 
@@ -114,6 +120,79 @@ print xs[-1]
 print len(xs)
 ```
 
+- **Collections (Phase 7):** five more containers besides lists.
+  - **Tuples** — `(1, "a", true)`, `()` empty, `(1,)` with one
+    element: the trailing comma is what makes it a tuple, `(1)` is
+    still just grouping. Tuples are **immutable**: `t[0] = 99` is a
+    runtime error. Indexing works like lists, negative indexes
+    included; `type` is `"tuple"`.
+  - **Dicts** — `{"nome": "Giuliano", "eta": 14}`, `{}` empty.
+    Keys are Int, Float, Str or Bool only (a list, dict, set or
+    tuple as a key is a runtime error); `1` and `1.0` are different
+    keys. Reading a missing key is an error (`key not found`);
+    assignment inserts a new key and updates keep the original
+    position (`keys(d)` gives the keys in insertion order). Dicts
+    compare by content, order ignored. `type` is `"dict"`.
+  - **Sets** — `{1, 2, 3}`. Braces decide by content: entries with
+    `:` make a dict, otherwise a set; `{}` is the empty **dict**
+    (Python convention). Duplicates are ignored silently
+    (`{1, 1, 2}` is `{1, 2}`). Elements must be hashable (Int,
+    Float, Str, Bool). Sets have no indexes. `type` is `"set"`.
+  - **Arrays** — like lists, but **fixed size** and **all elements
+    of the same type**: `array([1, 2, 3])`. Built from a list only;
+    an empty list is an error (`cannot infer array type`) and mixed
+    types are an error. `a[0] = 99` works only when the new value
+    has the same type as the others; there is no `push`/`pop` on
+    arrays. `type` is `"array"`. Arrays are the first step toward
+    numeric arrays in the spirit of NumPy.
+  - **Queues** — `queue()` or `queue([1, 2])`, FIFO:
+    `enqueue(q, x)` adds at the back, `dequeue(q)` removes and
+    returns the front (`dequeue()` on an empty queue is an error).
+    `type` is `"queue"`.
+  - **Stacks** — `stack()` or `stack([1, 2])`, LIFO: the existing
+    `push`/`pop` work on stacks too. `type` is `"stack"`.
+  - **Common operations:** `len` works on every collection (for a
+    dict it is the number of keys); `str` prints every collection
+    the way `print` shows it; `peek` returns the top of a stack,
+    the front of a queue or the last element of a list without
+    removing it; `contains(coll, x)` tests membership (for a dict:
+    the key exists; for a string: substring); `list(x)` converts a
+    tuple, set, array, queue or stack — or a dict (its keys) — into
+    a list (`list("ciao")` is an error: use `split` or `lines` for
+    text). Equality is by content for all of them (a dict against
+    another dict ignores order; a set against another set too).
+    Display nests up to 16 levels, then prints `...`.
+
+Example — count the words in a file with a dict and `split`:
+
+```gg
+let text = read_file("notes.txt")
+let words = split(text, " ")
+let counts = {}
+for i = 0 to len(words) - 1 then
+    let w = words[i]
+    if contains(counts, w) then
+        counts[w] = counts[w] + 1
+    else
+        counts[w] = 1
+    end
+end
+print counts
+```
+
+```
+$ cat notes.txt
+pane pane latte pane
+$ gg run wordcount.gg
+{"pane": 3, "latte": 1}
+```
+
+**Lists vs arrays:** a list is the flexible container — any mix of
+types, grows and shrinks with `push`/`pop`, shared by aliasing. An
+array is the strict one — one element type, fixed size, no
+`push`/`pop`; the type check on every assignment is what makes it
+safe as a building block for numeric code later.
+
 - **Errors** are plain-English runtime errors (`undefined variable
   'x'`, `cannot add Int and Str`, `division by zero`,
   `cannot call Int`, `expected 1 argument(s) but got 2`,
@@ -155,26 +234,27 @@ end
 
 ## Builtins
 
-Eighteen builtin functions are predefined in the global environment of
+Twenty-seven builtin functions are predefined in the global environment of
 every program. They are first-class values: they can be assigned to
 variables (`let f = len`), passed as arguments and returned from
 functions. `type()` returns `"fn"` for user functions and builtins
 alike, and `print` shows them as `<fn>`. `type()` returns `"list"`
-for lists.
+for lists, `"tuple"`, `"dict"`, `"set"`, `"array"`, `"queue"` and
+`"stack"` for the Phase 7 collections.
 
 | Function | Description | Example |
 | --- | --- | --- |
-| `len(x)` | Length of a string, in characters (not bytes: `len("è")` is 1), or number of elements in a list | `len("ciao")` → `4`, `len([1, 2])` → `2` |
-| `type(x)` | Type name as a string | `type(1)` → `"int"`, `type([1])` → `"list"`, `type(len)` → `"fn"` |
-| `str(x)` | Convert to a string (same as `print` shows) | `str(42)` → `"42"`, `str([1, "x"])` → `"[1, \"x\"]"` |
+| `len(x)` | Length of a string, in characters (not bytes: `len("è")` is 1), or number of elements in a list, tuple, dict (keys), set, array, queue or stack | `len("ciao")` → `4`, `len([1, 2])` → `2`, `len({"a": 1})` → `1` |
+| `type(x)` | Type name as a string | `type(1)` → `"int"`, `type([1])` → `"list"`, `type((1,))` → `"tuple"`, `type({})` → `"dict"`, `type(array([1]))` → `"array"`, `type(len)` → `"fn"` |
+| `str(x)` | Convert to a string (same as `print` shows) | `str(42)` → `"42"`, `str([1, "x"])` → `"[1, \"x\"]"`, `str({"a": 1})` → `"{\"a\": 1}"` |
 | `int(x)` | Float truncated toward zero, string parsed, `true`→`1`, `false`→`0` | `int(3.9)` → `3`, `int("42")` → `42` |
 | `float(x)` | Int converted, string parsed, `true`→`1.0`, `false`→`0.0` | `float(3)` → `3.0` |
 | `input(prompt)` | Print the prompt (no newline), read one line, return it without the newline; `""` at end of input | `input("Name: ")` |
 | `abs(x)` | Absolute value of a number | `abs(-5)` → `5` |
 | `min(a, b)` | The smaller of two numbers (mixed int/float gives a float) | `min(2, 5)` → `2` |
 | `max(a, b)` | The larger of two numbers | `max(2, 5)` → `5` |
-| `push(list, value)` | Append `value` to the list (mutates it) and return `nil` | `push(xs, 3)` |
-| `pop(list)` | Remove and return the last element; an error on an empty list | `pop(xs)` → `3` |
+| `push(list, value)` | Append `value` to a list or a stack (mutates it) and return `nil`; an error on arrays, queues, tuples, dicts or sets | `push(xs, 3)`, `push(s, 3)` |
+| `pop(list)` | Remove and return the last element of a list or the top of a stack; an error on an empty list or stack | `pop(xs)` → `3` |
 | `range(n)` | `[0, 1, ..., n-1]` | `range(3)` → `[0, 1, 2]` |
 | `range(a, b)` | `[a, ..., b-1]`; empty when `a >= b`; at most 1000000 elements | `range(2, 5)` → `[2, 3, 4]` |
 | `split(s, sep)` | Split the string on the separator (an empty separator is an error) | `split("a,b", ",")` → `["a", "b"]` |
@@ -183,6 +263,17 @@ for lists.
 | `write_file(path, text)` | Create or overwrite the file, return `nil` | `write_file("notes.txt", "ciao")` |
 | `append_file(path, text)` | Append to the file (creating it if needed), return `nil` | `append_file("notes.txt", " mondo")` |
 | `file_exists(path)` | `true` when the path exists | `file_exists("notes.txt")` → `true` |
+| `array(list)` | An array from a list: all elements must have the same type (Int, Float, Str or Bool); an empty list is an error | `array([1, 2])` → `array([1, 2])` |
+| `queue()` | An empty queue (FIFO) | `queue()` → `queue([])` |
+| `queue(list)` | A queue from a list, in order | `queue([1, 2])` → `queue([1, 2])` |
+| `enqueue(q, x)` | Add `x` at the back of the queue, return `nil` | `enqueue(q, 3)` |
+| `dequeue(q)` | Remove and return the front element; an error on an empty queue | `dequeue(q)` → `1` |
+| `stack()` | An empty stack (LIFO) | `stack()` → `stack([])` |
+| `stack(list)` | A stack from a list, in order (the last element is the top) | `stack([1, 2])` → `stack([1, 2])` |
+| `peek(x)` | The top of a stack, the front of a queue or the last element of a list, without removing it; an error on empty | `peek(stack([1, 2]))` → `2` |
+| `keys(d)` | The keys of a dict as a list, in insertion order | `keys({"b": 1, "a": 2})` → `["b", "a"]` |
+| `contains(coll, x)` | Membership: in a list, tuple, array or set; a key in a dict; a substring in a string | `contains([1, 2], 2)` → `true`, `contains("ciao", "ia")` → `true` |
+| `list(x)` | Convert a tuple, set, array, queue or stack — or a dict (its keys) — into a list; an error on strings and other types | `list((1, 2))` → `[1, 2]`, `list({"a": 1})` → `["a"]` |
 
 Wrong arity is a runtime error naming the builtin
 (`len() expects 1 argument(s) but got 0`); a wrong argument type
@@ -276,8 +367,11 @@ unary     := ("-" | "not") unary | postfix
 postfix   := primary ("[" expr "]")*
 primary   := number | string | "true" | "false"
            | "[" [expr ("," expr)*] "]"
+           | "(" [expr ("," expr)*] ")"   ; one comma or more → tuple, else grouping
+           | "{" [dict | set] "}"         ; "k: v" entries → dict, plain values → set, "{}" → empty dict
            | ident ["(" [expr ("," expr)*] ")"]
-           | "(" expr ")"
+dict      := expr ":" expr ("," expr ":" expr)* [","]
+set       := expr ("," expr)* [","]
 index     := postfix "[" expr "]"
 ```
 
@@ -306,7 +400,7 @@ print sum_to(10)
 | Numbers | integers `42`, floats `3.14` (`.5` and `5.` are errors) |
 | Strings | `"..."` with escapes `\"` `\\` `\n` `\t` |
 | Operators | `+ - * / % == != < <= > >= =` (`!` alone is not an operator) |
-| Punctuation | `( ) , [ ]` |
+| Punctuation | `( ) , [ ] { } :` (braces are dict/set literals, not blocks) |
 | Separators | newline, `;` |
 | Comments | `#` to end of line |
 
@@ -338,10 +432,10 @@ exit with code 1.
 3. **Interpreter** ✅ — `gg-interp` (variables, `print`, `if`/`while`/`for`, operators, functions, closures)
 4. **Builtins + standard library** ✅ — builtin functions (`len`, `type`, `str`, `int`, `float`, `input`, `abs`, `min`, `max`)
 5. **REPL** ✅ — interactive shell (`gg` / `gg repl`): persistent state, multi-line blocks, expression echo, error recovery
-6. **Lists + file handling** ✅ — lists (`[1, 2, 3]`, indexing, `push`/`pop`/`range`/`split`/`lines`) and whole-file helpers (`read_file`/`write_file`/`append_file`/`file_exists`).
 6. **Lists + file handling** ✅ — lists (`[1, 2, 3]`, indexing, aliasing, `push`/`pop`/`range`/`split`/`lines`) and whole-file helpers (`read_file`/`write_file`/`append_file`/`file_exists`)
-7. **OOP** — classes, methods, inheritance
-8. **Modules + virtual environments** — `import`, packages, per-project envs (like `venv`)
+7. **Collections** ✅ — tuples `(1, "a")`, dicts `{"k": v}`, sets `{1, 2}`, arrays `array([1, 2])`, queues `queue()`/`enqueue`/`dequeue`, stacks `stack()`/`push`/`pop`, plus `peek`/`keys`/`contains`/`list`
+8. **OOP** — classes, methods, inheritance
+9. **Modules + virtual environments** — `import`, packages, per-project envs (like `venv`)
 
 Long term, after lists exist: data libraries in the spirit of NumPy/Pandas, and a web framework in the spirit of Django — each is a large project of its own, not a single phase.
 
