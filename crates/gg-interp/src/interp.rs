@@ -18,10 +18,11 @@ use std::rc::Rc;
 
 use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 
-use crate::array::{self, ArrayOp, flat_index, subarray};
+use crate::array::{self, ArrayOp, CompareOp, flat_index, subarray};
 use crate::builtin;
 use crate::env::Environment;
 use crate::error::RuntimeError;
+use crate::slice::{AxisSelector, IndexArg, SliceSpec};
 use crate::value::{
     BoundMethod, ClassDef, DictData, Function, InstanceData, ModuleData, Value, elem_type_of,
     lookup_method, values_equal,
@@ -414,12 +415,10 @@ impl Interpreter {
             }
             Expr::Index { target, indices } => {
                 let target = self.eval_expr(target, env, input, out)?;
-                let mut values = Vec::with_capacity(indices.len());
-                for index in indices {
-                    values.push(self.eval_expr(index, env, input, out)?);
-                }
-                index_value(&target, values)
+                let args = self.eval_indices(indices, env, input, out)?;
+                index_value(&target, args)
             }
+            Expr::Slice { .. } => Err(RuntimeError::new("a slice is only valid inside '[...]'")),
             Expr::SelfExpr => env.get("self"),
             Expr::Field { target, name } => {
                 let obj = self.eval_expr(target, env, input, out)?;
@@ -491,6 +490,49 @@ impl Interpreter {
                 self.call_value(&callee, values, input, out)
             }
         }
+    }
+
+    /// Evaluate the index expressions of an `Index` node: a plain
+    /// expression becomes a value, a slice becomes its evaluated
+    /// bounds (each must be an integer, or absent).
+    fn eval_indices(
+        &mut self,
+        indices: &[Expr],
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Vec<IndexArg>, RuntimeError> {
+        let mut args = Vec::with_capacity(indices.len());
+        for index in indices {
+            match index {
+                Expr::Slice { start, stop, step } => {
+                    let mut bounds = [None, None, None];
+                    for (i, bound) in [start, stop, step].iter().enumerate() {
+                        if let Some(expr) = bound {
+                            let value = self.eval_expr(expr, env, input, out)?;
+                            match value {
+                                Value::Int(n) => bounds[i] = Some(n),
+                                other => {
+                                    return Err(RuntimeError::new(format!(
+                                        "slice bounds must be integers, not {}",
+                                        other.type_name()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    args.push(IndexArg::Slice(SliceSpec {
+                        start: bounds[0],
+                        stop: bounds[1],
+                        step: bounds[2],
+                    }));
+                }
+                other => {
+                    args.push(IndexArg::Value(self.eval_expr(other, env, input, out)?));
+                }
+            }
+        }
+        Ok(args)
     }
 
     /// Call any callable value with already-evaluated arguments:
@@ -993,6 +1035,24 @@ impl Interpreter {
             _ => {
                 let left = self.eval_expr(left, env, input, out)?;
                 let right = self.eval_expr(right, env, input, out)?;
+                // Comparisons with an array are element-wise
+                // (Phase 12): they return a Bool array, never a
+                // single Bool. `==`/`!=` against a List or a Dict
+                // still falls back to whole-value equality.
+                if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
+                    let op = match op {
+                        BinaryOp::Eq => Some(CompareOp::Eq),
+                        BinaryOp::NotEq => Some(CompareOp::NotEq),
+                        BinaryOp::Lt => Some(CompareOp::Lt),
+                        BinaryOp::LtEq => Some(CompareOp::LtEq),
+                        BinaryOp::Gt => Some(CompareOp::Gt),
+                        BinaryOp::GtEq => Some(CompareOp::GtEq),
+                        _ => None,
+                    };
+                    if let Some(op) = op {
+                        return array::compare_arrays(op, &left, &right);
+                    }
+                }
                 match op {
                     BinaryOp::Eq => Ok(Value::Bool(values_equal(&left, &right))),
                     BinaryOp::NotEq => Ok(Value::Bool(!values_equal(&left, &right))),
@@ -1016,10 +1076,12 @@ impl Interpreter {
     }
 
     /// Assign through an index: the target must be an `Index`
-    /// expression (`xs[0]`, `m[0][1]`, `d["k"]`, `a[0, 1]`). The
-    /// container is evaluated first, then the final index, and the
-    /// element is replaced — or inserted, for dicts. An array takes
-    /// one index per dimension, or a single index when 1D.
+    /// expression (`xs[0]`, `m[0][1]`, `d["k"]`, `a[0, 1]`,
+    /// `xs[1:3]`). The container is evaluated first, then the
+    /// index arguments, and the element is replaced — or inserted,
+    /// for dicts. An array takes one index per dimension, or a
+    /// single index when 1D. A slice assigns a whole span at once
+    /// (lists and 1D arrays only, same length required).
     fn assign_index(
         &mut self,
         target: &Expr,
@@ -1032,19 +1094,45 @@ impl Interpreter {
             return Err(RuntimeError::new("invalid assignment target"));
         };
         let container = self.eval_expr(target, env, input, out)?;
-        let mut values = Vec::with_capacity(indices.len());
-        for index in indices {
-            values.push(self.eval_expr(index, env, input, out)?);
-        }
+        let args = self.eval_indices(indices, env, input, out)?;
         match container {
             Value::List(list) => {
-                let index = single_index(values, "list")?;
-                let pos = resolve_index(list.borrow().len(), index, "list")?;
-                list.borrow_mut()[pos] = value;
-                Ok(())
+                let arg = single_arg(args, "list")?;
+                match arg {
+                    IndexArg::Value(index) => {
+                        let pos = resolve_index(list.borrow().len(), index, "list")?;
+                        list.borrow_mut()[pos] = value;
+                        Ok(())
+                    }
+                    IndexArg::Slice(spec) => {
+                        let Value::List(new_items) = value else {
+                            return Err(RuntimeError::new(format!(
+                                "slice assignment needs a List, not {}",
+                                value.type_name()
+                            )));
+                        };
+                        let positions = crate::slice::slice_positions(list.borrow().len(), &spec)?;
+                        let new_items = new_items.borrow();
+                        if new_items.len() != positions.len() {
+                            return Err(RuntimeError::new(format!(
+                                "slice assignment: the slice has {} element(s) but the new list has {}",
+                                positions.len(),
+                                new_items.len()
+                            )));
+                        }
+                        let mut borrowed = list.borrow_mut();
+                        for (pos, item) in positions.iter().zip(new_items.iter()) {
+                            borrowed[*pos] = item.clone();
+                        }
+                        Ok(())
+                    }
+                }
             }
             Value::Dict(dict) => {
-                let index = single_index(values, "dict")?;
+                let arg = single_arg(args, "dict")?;
+                let IndexArg::Value(index) = arg else {
+                    return Err(RuntimeError::new("cannot slice a dict"));
+                };
                 let Some(key) = index.to_key() else {
                     return Err(RuntimeError::new(format!(
                         "dict key must be Int, Float, Str or Bool, not {}",
@@ -1055,15 +1143,71 @@ impl Interpreter {
                 Ok(())
             }
             Value::Array(array) => {
+                // A slice anywhere in the index means slice
+                // assignment: 1D arrays only, same length required.
+                if args.iter().any(|a| matches!(a, IndexArg::Slice(_))) {
+                    if args.len() != 1 || array.borrow().ndim() != 1 {
+                        return Err(RuntimeError::new(
+                            "slice assignment works on 1D arrays only",
+                        ));
+                    }
+                    let IndexArg::Slice(spec) = args.into_iter().next().unwrap() else {
+                        unreachable!()
+                    };
+                    let Value::Array(new_arr) = value else {
+                        return Err(RuntimeError::new(format!(
+                            "slice assignment on an array needs an Array, not {}",
+                            value.type_name()
+                        )));
+                    };
+                    let wanted = array.borrow().elem;
+                    let new_arr = new_arr.borrow();
+                    if new_arr.elem != wanted {
+                        return Err(RuntimeError::new(format!(
+                            "array element must be {}, not Array of {}",
+                            wanted.name(),
+                            new_arr.elem.name()
+                        )));
+                    }
+                    let positions = crate::slice::slice_positions(array.borrow().size(), &spec)?;
+                    if new_arr.items.len() != positions.len() {
+                        return Err(RuntimeError::new(format!(
+                            "slice assignment: the slice has {} element(s) but the new array has {}",
+                            positions.len(),
+                            new_arr.items.len()
+                        )));
+                    }
+                    let mut borrowed = array.borrow_mut();
+                    for (pos, item) in positions.iter().zip(new_arr.items.iter()) {
+                        borrowed.items[*pos] = item.clone();
+                    }
+                    return Ok(());
+                }
+                // A boolean mask cannot be assigned through.
+                if args.len() == 1
+                    && let IndexArg::Value(Value::Array(mask)) = &args[0]
+                    && mask.borrow().elem == crate::value::ElemType::Bool
+                {
+                    return Err(RuntimeError::new(
+                        "cannot assign through a boolean mask (not supported yet)",
+                    ));
+                }
+                let indices: Vec<Value> = args
+                    .into_iter()
+                    .map(|arg| match arg {
+                        IndexArg::Value(value) => value,
+                        IndexArg::Slice(_) => unreachable!(),
+                    })
+                    .collect();
                 let mut array = array.borrow_mut();
-                let pos = if values.len() == 1 && array.ndim() == 1 {
+                let pos = if indices.len() == 1 && array.ndim() == 1 {
                     resolve_index(
                         array.items.len(),
-                        values.into_iter().next().unwrap(),
+                        indices.into_iter().next().unwrap(),
                         "array",
                     )?
                 } else {
-                    flat_index(&array.shape, &values)?
+                    flat_index(&array.shape, &indices)?
                 };
                 let wanted = array.elem;
                 match elem_type_of(&value) {
@@ -1141,46 +1285,118 @@ fn resolve_index(len: usize, index: Value, kind: &str) -> Result<usize, RuntimeE
     Ok(pos as usize)
 }
 
-/// `xs[i]` / `t[i]` / `a[i]` / `d[k]` / `a[i, j]`: read one
-/// element. Lists, tuples and dicts take exactly one index (an
-/// integer, negative from the end; a hashable key for dicts, failing
-/// on a missing key). Arrays take one index per dimension — or a
-/// single index, which is a flat element for 1D arrays and a row
-/// (a 1D array) for 2D arrays.
-fn index_value(target: &Value, indices: Vec<Value>) -> Result<Value, RuntimeError> {
+/// `xs[i]` / `xs[1:3]` / `t[i]` / `t[1:3]` / `s[1:3]` / `a[i]` /
+/// `a[i, j]` / `a[0:2, 1:3]` / `a[:, 1]` / `a[mask]` / `d[k]`:
+/// read one element, or a slice (always a copy). Lists, tuples
+/// and dicts take exactly one argument; strings take a slice only
+/// (a single index on a string is an error). Arrays take one
+/// selector per axis — missing axes are full slices — or a single
+/// Bool array as a mask, which selects the true elements,
+/// flattened to 1D.
+fn index_value(target: &Value, args: Vec<IndexArg>) -> Result<Value, RuntimeError> {
     match target {
         Value::List(list) => {
-            let index = single_index(indices, "list")?;
-            let borrowed = list.borrow();
-            let pos = resolve_index(borrowed.len(), index, "list")?;
-            Ok(borrowed[pos].clone())
+            let arg = single_arg(args, "list")?;
+            match arg {
+                IndexArg::Value(index) => {
+                    let borrowed = list.borrow();
+                    let pos = resolve_index(borrowed.len(), index, "list")?;
+                    Ok(borrowed[pos].clone())
+                }
+                IndexArg::Slice(spec) => {
+                    let items = crate::slice::slice_values(&list.borrow(), &spec)?;
+                    Ok(Value::List(Rc::new(RefCell::new(items))))
+                }
+            }
         }
         Value::Tuple(items) => {
-            let index = single_index(indices, "tuple")?;
-            let pos = resolve_index(items.len(), index, "tuple")?;
-            Ok(items[pos].clone())
+            let arg = single_arg(args, "tuple")?;
+            match arg {
+                IndexArg::Value(index) => {
+                    let pos = resolve_index(items.len(), index, "tuple")?;
+                    Ok(items[pos].clone())
+                }
+                IndexArg::Slice(spec) => {
+                    let items = crate::slice::slice_values(items, &spec)?;
+                    Ok(Value::Tuple(Rc::new(items)))
+                }
+            }
+        }
+        Value::Str(s) => {
+            let arg = single_arg(args, "string")?;
+            match arg {
+                IndexArg::Value(_) => Err(RuntimeError::new(
+                    "cannot index a string with an integer (use a slice, e.g. s[1:3])",
+                )),
+                IndexArg::Slice(spec) => Ok(Value::Str(crate::slice::slice_str(s, &spec)?)),
+            }
         }
         Value::Array(array) => {
             let borrowed = array.borrow();
-            if indices.len() == 1 {
-                if borrowed.ndim() == 1 {
-                    let pos = resolve_index(
-                        borrowed.items.len(),
-                        indices.into_iter().next().unwrap(),
-                        "array",
-                    )?;
-                    Ok(borrowed.items[pos].clone())
+            // Boolean indexing: a single Bool array mask.
+            if args.len() == 1
+                && let IndexArg::Value(Value::Array(mask)) = &args[0]
+                && mask.borrow().elem == crate::value::ElemType::Bool
+            {
+                return crate::slice::mask_select(&borrowed, &mask.borrow());
+            }
+            // One selector per axis; missing axes are full slices.
+            if args.len() > borrowed.ndim() {
+                return Err(RuntimeError::new(format!(
+                    "array has {} dimensions but got {} indices",
+                    borrowed.ndim(),
+                    args.len()
+                )));
+            }
+            let mut selectors: Vec<AxisSelector> = args
+                .iter()
+                .map(|arg| match arg {
+                    IndexArg::Value(value) => AxisSelector::Index(value.clone()),
+                    IndexArg::Slice(spec) => AxisSelector::Slice(spec.clone()),
+                })
+                .collect();
+            while selectors.len() < borrowed.ndim() {
+                selectors.push(AxisSelector::Slice(SliceSpec::full()));
+            }
+            if selectors
+                .iter()
+                .all(|s| matches!(s, AxisSelector::Index(_)))
+            {
+                // All indexes: the Phase 11 behavior — one index
+                // is an element for 1D arrays and a row for 2D
+                // arrays (and a sub-array for 3D+), several are one
+                // element per dimension.
+                let indices: Vec<Value> = selectors
+                    .into_iter()
+                    .map(|s| match s {
+                        AxisSelector::Index(value) => value,
+                        AxisSelector::Slice(_) => unreachable!(),
+                    })
+                    .collect();
+                if indices.len() == 1 {
+                    if borrowed.ndim() == 1 {
+                        let pos = resolve_index(
+                            borrowed.items.len(),
+                            indices.into_iter().next().unwrap(),
+                            "array",
+                        )?;
+                        Ok(borrowed.items[pos].clone())
+                    } else {
+                        subarray(&borrowed, indices.into_iter().next().unwrap())
+                    }
                 } else {
-                    let row = subarray(&borrowed, indices.into_iter().next().unwrap())?;
-                    Ok(row)
+                    let pos = flat_index(&borrowed.shape, &indices)?;
+                    Ok(borrowed.items[pos].clone())
                 }
             } else {
-                let pos = flat_index(&borrowed.shape, &indices)?;
-                Ok(borrowed.items[pos].clone())
+                crate::slice::slice_array(&borrowed, &selectors)
             }
         }
         Value::Dict(dict) => {
-            let index = single_index(indices, "dict")?;
+            let arg = single_arg(args, "dict")?;
+            let IndexArg::Value(index) = arg else {
+                return Err(RuntimeError::new("cannot slice a dict"));
+            };
             let Some(key) = index.to_key() else {
                 return Err(RuntimeError::new(format!(
                     "dict key must be Int, Float, Str or Bool, not {}",
@@ -1199,16 +1415,16 @@ fn index_value(target: &Value, indices: Vec<Value>) -> Result<Value, RuntimeErro
     }
 }
 
-/// Exactly one index, or an error: lists, tuples and dicts take a
-/// single index.
-fn single_index(indices: Vec<Value>, kind: &str) -> Result<Value, RuntimeError> {
-    if indices.len() != 1 {
+/// Exactly one index argument, or an error: lists, tuples,
+/// strings and dicts take a single index.
+fn single_arg(args: Vec<IndexArg>, kind: &str) -> Result<IndexArg, RuntimeError> {
+    if args.len() != 1 {
         return Err(RuntimeError::new(format!(
             "{kind} takes one index, not {}",
-            indices.len()
+            args.len()
         )));
     }
-    Ok(indices.into_iter().next().unwrap())
+    Ok(args.into_iter().next().unwrap())
 }
 
 /// `+`: integer/float arithmetic, string concatenation, or

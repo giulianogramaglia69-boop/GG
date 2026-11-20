@@ -16,10 +16,10 @@ use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
-use crate::array::{self, check_shape_size, make_array, parse_shape};
+use crate::array::{self, check_shape_size, fmt_shape, make_array, parse_shape};
 use crate::env::Environment;
 use crate::error::RuntimeError;
-use crate::value::{ArrayData, Value, elem_type_of, values_equal};
+use crate::value::{ArrayData, ElemType, Value, elem_type_of, values_equal};
 
 /// A builtin function implementation: evaluated arguments, an input
 /// reader and an output writer.
@@ -295,6 +295,11 @@ pub fn all() -> Vec<Builtin> {
             name: "upper",
             arity: Arity::Exact(1),
             func: upper,
+        },
+        Builtin {
+            name: "where",
+            arity: Arity::Exact(3),
+            func: where_select,
         },
         Builtin {
             name: "write_file",
@@ -1054,6 +1059,18 @@ fn sum(
     if items.is_empty() {
         return Err(RuntimeError::new("sum() of empty list"));
     }
+    // A Bool array sums to the count of `true` values.
+    if let Value::Array(array) = &args[0]
+        && array.borrow().elem == ElemType::Bool
+    {
+        let count = array
+            .borrow()
+            .items
+            .iter()
+            .filter(|item| matches!(item, Value::Bool(true)))
+            .count();
+        return Ok(Value::Int(count as i64));
+    }
     let mut int_total: i64 = 0;
     let mut float_total: f64 = 0.0;
     let mut is_float = false;
@@ -1374,4 +1391,91 @@ fn reshape(
     let a = as_array("reshape", &args[0])?;
     let shape = parse_shape(&args[1], "reshape")?;
     array::reshape_array(&a.borrow(), shape)
+}
+
+/// `where(cond, a, b)` — element-by-element selection: where the
+/// Bool array `cond` is true take the element from `a`, otherwise
+/// from `b`. `a` and `b` are arrays of the same shape as `cond`,
+/// or scalars (broadcast). The result's element type promotes
+/// Int+Float to Float; Bool+Bool stays Bool, Str+Str stays Str.
+fn where_select(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let cond = as_array("where", &args[0])?;
+    let cond = cond.borrow();
+    if cond.elem != ElemType::Bool {
+        return Err(RuntimeError::new(format!(
+            "where() expects a Bool array as its condition, not Array of {}",
+            cond.elem.name()
+        )));
+    }
+    let shape = cond.shape.clone();
+    // Each of a/b: an array of the condition's shape (its items),
+    // or a scalar (broadcast). Returns the element type and the
+    // items, when it is an array.
+    let pick = |value: &Value| -> Result<(ElemType, Option<Vec<Value>>), RuntimeError> {
+        match value {
+            Value::Array(array) => {
+                let array = array.borrow();
+                if array.shape != shape {
+                    return Err(RuntimeError::new(format!(
+                        "where() argument shape {} does not match condition shape {}",
+                        fmt_shape(&array.shape),
+                        fmt_shape(&shape)
+                    )));
+                }
+                Ok((array.elem, Some(array.items.clone())))
+            }
+            Value::Int(_) => Ok((ElemType::Int, None)),
+            Value::Float(_) => Ok((ElemType::Float, None)),
+            Value::Str(_) => Ok((ElemType::Str, None)),
+            Value::Bool(_) => Ok((ElemType::Bool, None)),
+            other => Err(RuntimeError::new(format!(
+                "where() expects an Array or a scalar, not {}",
+                other.type_name()
+            ))),
+        }
+    };
+    let (elem_a, items_a) = pick(&args[1])?;
+    let (elem_b, items_b) = pick(&args[2])?;
+    let elem = promote_elem(elem_a, elem_b)?;
+    let items = cond
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, flag)| {
+            let value = match (matches!(flag, Value::Bool(true)), &items_a, &items_b) {
+                (true, Some(items), _) => items[i].clone(),
+                (true, None, _) => args[1].clone(),
+                (false, _, Some(items)) => items[i].clone(),
+                (false, _, None) => args[2].clone(),
+            };
+            // Keep the result homogeneous: an Int scalar picked
+            // into a Float result becomes a Float.
+            match (elem, value) {
+                (ElemType::Float, Value::Int(n)) => Value::Float(n as f64),
+                (_, value) => value,
+            }
+        })
+        .collect();
+    Ok(make_array(elem, shape, items))
+}
+
+/// The element type of a `where()` result: Int+Int stays Int,
+/// anything with a Float becomes Float, Bool+Bool stays Bool,
+/// Str+Str stays Str; anything else is an error.
+fn promote_elem(a: ElemType, b: ElemType) -> Result<ElemType, RuntimeError> {
+    match (a, b) {
+        (ElemType::Int, ElemType::Int) => Ok(ElemType::Int),
+        (ElemType::Float, _) | (_, ElemType::Float) => Ok(ElemType::Float),
+        (ElemType::Bool, ElemType::Bool) => Ok(ElemType::Bool),
+        (ElemType::Str, ElemType::Str) => Ok(ElemType::Str),
+        _ => Err(RuntimeError::new(format!(
+            "where() arguments have incompatible types: {} and {}",
+            a.name(),
+            b.name()
+        ))),
+    }
 }

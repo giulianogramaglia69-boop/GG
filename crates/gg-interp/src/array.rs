@@ -9,10 +9,11 @@
 //! builtins and the interpreter's arithmetic.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::rc::Rc;
 
 use crate::error::RuntimeError;
-use crate::value::{ArrayData, ElemType, Value};
+use crate::value::{ArrayData, ElemType, Value, values_equal};
 
 /// Max number of elements an array constructor may create, so a
 /// huge shape cannot exhaust memory by accident.
@@ -505,4 +506,109 @@ pub fn reshape_array(data: &ArrayData, shape: Vec<usize>) -> Result<Value, Runti
         )));
     }
     Ok(make_array(data.elem, shape, data.items.clone()))
+}
+
+/// A comparison operator for `compare_arrays` (Phase 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+/// Compare two scalar values with a comparison operator: `==` and
+/// `!=` use value equality (numbers compare across Int/Float);
+/// the ordering operators need numbers.
+fn compare_scalars(op: CompareOp, a: &Value, b: &Value) -> Result<bool, RuntimeError> {
+    match op {
+        CompareOp::Eq => Ok(values_equal(a, b)),
+        CompareOp::NotEq => Ok(!values_equal(a, b)),
+        _ => {
+            let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) else {
+                return Err(RuntimeError::new(format!(
+                    "cannot compare {} and {}",
+                    a.type_name(),
+                    b.type_name()
+                )));
+            };
+            let ord = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+            Ok(match op {
+                CompareOp::Lt => ord == Ordering::Less,
+                CompareOp::LtEq => ord != Ordering::Greater,
+                CompareOp::Gt => ord == Ordering::Greater,
+                CompareOp::GtEq => ord != Ordering::Less,
+                CompareOp::Eq | CompareOp::NotEq => unreachable!(),
+            })
+        }
+    }
+}
+
+/// `a == b`, `a < b`, ... element by element, when at least one
+/// side is an array: two arrays need the same shape, an array and
+/// a scalar broadcast the scalar over every element (from either
+/// side). The result is a Bool array with the array's shape. An
+/// array against anything else (a List, a Dict, ...) is not an
+/// element-wise comparison — it falls back to whole-value
+/// equality, so `array([1]) == [1]` is still false.
+pub fn compare_arrays(op: CompareOp, left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+    match (left, right) {
+        (Value::Array(a), Value::Array(b)) => {
+            let a = a.borrow();
+            let b = b.borrow();
+            if a.shape != b.shape {
+                return Err(RuntimeError::new(format!(
+                    "cannot compare arrays of shapes {} and {}",
+                    fmt_shape(&a.shape),
+                    fmt_shape(&b.shape)
+                )));
+            }
+            let items = a
+                .items
+                .iter()
+                .zip(b.items.iter())
+                .map(|(x, y)| compare_scalars(op, x, y).map(Value::Bool))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(make_array(ElemType::Bool, a.shape.clone(), items))
+        }
+        (Value::Array(a), scalar) if is_scalar(scalar) => {
+            let a = a.borrow();
+            let items = a
+                .items
+                .iter()
+                .map(|x| compare_scalars(op, x, scalar).map(Value::Bool))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(make_array(ElemType::Bool, a.shape.clone(), items))
+        }
+        (scalar, Value::Array(a)) if is_scalar(scalar) => {
+            let a = a.borrow();
+            let items = a
+                .items
+                .iter()
+                .map(|y| compare_scalars(op, scalar, y).map(Value::Bool))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(make_array(ElemType::Bool, a.shape.clone(), items))
+        }
+        _ => match op {
+            CompareOp::Eq => Ok(Value::Bool(values_equal(left, right))),
+            CompareOp::NotEq => Ok(Value::Bool(!values_equal(left, right))),
+            _ => Err(RuntimeError::new(format!(
+                "cannot compare {} and {}",
+                left.type_name(),
+                right.type_name()
+            ))),
+        },
+    }
+}
+
+/// A value that can be compared element-wise against an array:
+/// a scalar (Int, Float, Str or Bool). Anything else (a List, a
+/// Dict, ...) is not a scalar.
+fn is_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
+    )
 }

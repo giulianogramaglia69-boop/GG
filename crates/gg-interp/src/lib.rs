@@ -12,6 +12,7 @@ pub mod error;
 pub mod interp;
 pub mod native;
 pub mod repl;
+pub mod slice;
 pub mod stdlib;
 pub mod value;
 pub mod venv;
@@ -475,7 +476,8 @@ mod tests {
         );
         assert!(run_err("let xs = [1]\nprint xs[1.0]\n").contains("list index must be an integer"));
         assert!(run_err("print 5[0]\n").contains("cannot index Int"));
-        assert!(run_err("print \"abc\"[0]\n").contains("cannot index Str"));
+        // A string takes a slice, not a single index (Phase 12).
+        assert!(run_err("print \"abc\"[0]\n").contains("cannot index a string with an integer"));
     }
 
     #[test]
@@ -805,8 +807,16 @@ mod tests {
             run_ok("print str(array([1.5, 2.5]))\n"),
             "array([1.5, 2.5])\n"
         );
-        assert_eq!(run_ok("print array([1, 2]) == array([1, 2])\n"), "true\n");
-        assert_eq!(run_ok("print array([1]) == array([1.0])\n"), "false\n");
+        // Phase 12: `==` between arrays is element-wise now, so
+        // it returns a Bool array instead of a single Bool.
+        assert_eq!(
+            run_ok("print array([1, 2]) == array([1, 2])\n"),
+            "array([true, true])\n"
+        );
+        assert_eq!(
+            run_ok("print array([1]) == array([1.0])\n"),
+            "array([true])\n"
+        );
         assert_eq!(run_ok("print array([1]) == [1]\n"), "false\n");
         // Empty list: no type to infer.
         assert!(run_err("print array([])\n").contains("cannot infer array type from empty list"));
@@ -1027,9 +1037,14 @@ mod tests {
     fn transpose_and_reshape() {
         let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint transpose(m)\n";
         assert_eq!(run_ok(src), "array([[1, 3], [2, 4]])\n");
-        // A double transpose is the identity.
+        // A double transpose is the identity. Phase 12: `==`
+        // between arrays is element-wise, so the comparison is a
+        // Bool array, not a single Bool.
         let src = "let m = reshape(array([1, 2, 3, 4, 5, 6]), [2, 3])\nprint transpose(transpose(m))\nprint m == transpose(transpose(m))\n";
-        assert_eq!(run_ok(src), "array([[1, 2, 3], [4, 5, 6]])\ntrue\n");
+        assert_eq!(
+            run_ok(src),
+            "array([[1, 2, 3], [4, 5, 6]])\narray([[true, true, true], [true, true, true]])\n"
+        );
         // A 1D array transposes to itself.
         assert_eq!(
             run_ok("print transpose(array([1, 2, 3]))\n"),
@@ -1075,6 +1090,258 @@ mod tests {
         assert_eq!(run_ok("print min(2.5, 2)\n"), "2\n");
         assert!(run_err("print min(5)\n").contains("min() expects two numbers or one Array"));
         assert!(run_err("print sum(array([\"a\"]))\n").contains("sum() expects numbers, not Str"));
+    }
+
+    // ---- Phase 12: slicing and boolean indexing ----
+
+    #[test]
+    fn list_slicing() {
+        let src = "let xs = [1, 2, 3, 4, 5]\nprint xs[1:3]\nprint xs[:2]\nprint xs[2:]\nprint xs[::2]\nprint xs[::-1]\nprint xs[-3:-1]\nprint xs[10:20]\nprint xs[-100:100]\nprint xs[:]\n";
+        assert_eq!(
+            run_ok(src),
+            "[2, 3]\n[1, 2]\n[3, 4, 5]\n[1, 3, 5]\n[5, 4, 3, 2, 1]\n[3, 4]\n[]\n[1, 2, 3, 4, 5]\n[1, 2, 3, 4, 5]\n"
+        );
+        // A slice is a copy: mutating it leaves the original alone.
+        let src = "let xs = [1, 2, 3]\nlet ys = xs[0:2]\nys[0] = 99\nprint xs\nprint ys\n";
+        assert_eq!(run_ok(src), "[1, 2, 3]\n[99, 2]\n");
+        // A step of 0 is an error; a non-integer bound is an error.
+        assert!(run_err("print [1, 2, 3][::0]\n").contains("slice step must not be zero"));
+        assert!(
+            run_err("print [1, 2, 3][\"a\":2]\n")
+                .contains("slice bounds must be integers, not Str")
+        );
+    }
+
+    #[test]
+    fn string_slicing_is_by_character() {
+        assert_eq!(run_ok("print \"ciao\"[1:3]\n"), "ia\n");
+        assert_eq!(run_ok("print \"ciao\"[::-1]\n"), "oaic\n");
+        assert_eq!(run_ok("print \"ciao\"[:2]\n"), "ci\n");
+        // "è" is one character, not two bytes.
+        assert_eq!(run_ok("print \"aèb\"[1:2]\n"), "è\n");
+        assert_eq!(run_ok("print len(\"aèb\"[1:])\n"), "2\n");
+    }
+
+    #[test]
+    fn tuple_slicing() {
+        assert_eq!(run_ok("print (1, 2, 3, 4)[1:3]\n"), "(2, 3)\n");
+        assert_eq!(run_ok("print (1, 2, 3)[::-1]\n"), "(3, 2, 1)\n");
+        assert_eq!(run_ok("print (1, 2, 3)[:]\n"), "(1, 2, 3)\n");
+        assert_eq!(run_ok("print (1,)[0:1]\n"), "(1,)\n");
+    }
+
+    #[test]
+    fn array_slicing_1d() {
+        let src = "let a = array([10, 20, 30, 40, 50])\nprint a[1:4]\nprint a[:2]\nprint a[::2]\nprint a[::-1]\nprint a[-2:]\n";
+        assert_eq!(
+            run_ok(src),
+            "array([20, 30, 40])\narray([10, 20])\narray([10, 30, 50])\narray([50, 40, 30, 20, 10])\narray([40, 50])\n"
+        );
+        // A slice of an array is a copy with the same element type.
+        let src = "let a = array([1.5, 2.5, 3.5])\nprint a[0:2]\nprint type(a[0:2])\n";
+        assert_eq!(run_ok(src), "array([1.5, 2.5])\narray\n");
+        assert!(run_err("print array([1, 2, 3])[1:2:0]\n").contains("slice step must not be zero"));
+    }
+
+    #[test]
+    fn array_slicing_2d() {
+        let src = "let m = reshape(array([1, 2, 3, 4, 5, 6]), [2, 3])\nprint m[0:2, 1:3]\nprint m[:, 1]\nprint m[0, :]\nprint m[:, :]\nprint m[1, 0:2]\nprint m[::2, ::2]\n";
+        assert_eq!(
+            run_ok(src),
+            "array([[2, 3], [5, 6]])\narray([2, 5])\narray([1, 2, 3])\narray([[1, 2, 3], [4, 5, 6]])\narray([4, 5])\narray([[1, 3]])\n"
+        );
+        // A slice on the first axis only leaves the second whole.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m[1:2]\n";
+        assert_eq!(run_ok(src), "array([[3, 4]])\n");
+        // Reversing both axes.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m[::-1, ::-1]\n";
+        assert_eq!(run_ok(src), "array([[4, 3], [2, 1]])\n");
+    }
+
+    #[test]
+    fn slice_assignment() {
+        // Lists: the new list must have the same length as the slice.
+        let src = "let xs = [1, 2, 3, 4]\nxs[1:3] = [9, 9]\nprint xs\n";
+        assert_eq!(run_ok(src), "[1, 9, 9, 4]\n");
+        let src = "let xs = [1, 2, 3, 4]\nxs[::-1] = [4, 3, 2, 1]\nprint xs\n";
+        assert_eq!(run_ok(src), "[1, 2, 3, 4]\n");
+        assert!(
+            run_err("let xs = [1, 2, 3]\nxs[0:2] = [9]\n")
+                .contains("slice assignment: the slice has 2 element(s) but the new list has 1")
+        );
+        assert!(
+            run_err("let xs = [1, 2, 3]\nxs[0:2] = 9\n")
+                .contains("slice assignment needs a List, not Int")
+        );
+        // 1D arrays: same length, same element type.
+        let src = "let a = array([1, 2, 3, 4])\na[1:3] = array([9, 9])\nprint a\n";
+        assert_eq!(run_ok(src), "array([1, 9, 9, 4])\n");
+        assert!(
+            run_err("let a = array([1, 2, 3])\na[0:2] = array([9])\n")
+                .contains("slice assignment: the slice has 2 element(s) but the new array has 1")
+        );
+        assert!(
+            run_err("let a = array([1, 2, 3])\na[0:2] = array([9.5, 9.5])\n")
+                .contains("array element must be Int, not Array of Float")
+        );
+        assert!(
+            run_err("let a = array([1, 2, 3])\na[0:2] = [9, 9]\n")
+                .contains("slice assignment on an array needs an Array, not List")
+        );
+        // Slice assignment on a 2D array is not done in this phase.
+        assert!(
+            run_err("let m = zeros([2, 2])\nm[0:1, 0:1] = array([9])\n")
+                .contains("slice assignment works on 1D arrays only")
+        );
+        // Tuples stay immutable, even for slices.
+        assert!(
+            run_err("let t = (1, 2, 3)\nt[0:2] = (9, 9)\n")
+                .contains("cannot assign to tuple (tuples are immutable)")
+        );
+    }
+
+    #[test]
+    fn array_comparisons_are_elementwise() {
+        // Array against a scalar, all six operators.
+        let src = "let a = array([1, 2, 3])\nprint a == 2\nprint a != 2\nprint a < 2\nprint a <= 2\nprint a > 2\nprint a >= 2\n";
+        assert_eq!(
+            run_ok(src),
+            "array([false, true, false])\narray([true, false, true])\narray([true, false, false])\narray([true, true, false])\narray([false, false, true])\narray([false, true, true])\n"
+        );
+        // The scalar may come first.
+        assert_eq!(
+            run_ok("print 2 < array([1, 2, 3])\n"),
+            "array([false, false, true])\n"
+        );
+        assert_eq!(
+            run_ok("print 2 == array([1, 2, 3])\n"),
+            "array([false, true, false])\n"
+        );
+        // Array against array.
+        let src = "let a = array([1, 2])\nlet b = array([2, 2])\nprint a == b\nprint a < b\nprint a >= b\n";
+        assert_eq!(
+            run_ok(src),
+            "array([false, true])\narray([true, false])\narray([false, true])\n"
+        );
+        // 2D comparisons keep the shape.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m > 2\n";
+        assert_eq!(run_ok(src), "array([[false, false], [true, true]])\n");
+        // Mixed Int/Float compares across types.
+        assert_eq!(
+            run_ok("print array([1, 2]) < 1.5\n"),
+            "array([true, false])\n"
+        );
+        // Strings compare element-wise too (equality only).
+        assert_eq!(
+            run_ok("print array([\"a\", \"b\"]) == \"a\"\n"),
+            "array([true, false])\n"
+        );
+        // Errors: shape mismatch, ordering on non-numbers.
+        let src = "let a = array([1, 2])\nlet b = array([1, 2, 3])\nprint a == b\n";
+        assert!(run_err(src).contains("cannot compare arrays of shapes [2] and [3]"));
+        assert!(
+            run_err("print array([\"a\"]) < array([\"b\"])\n")
+                .contains("cannot compare Str and Str")
+        );
+        assert!(run_err("print array([\"a\"]) < \"b\"\n").contains("cannot compare Str and Str"));
+    }
+
+    #[test]
+    fn bool_arrays_and_sum() {
+        assert_eq!(
+            run_ok("print array([true, false, true])\n"),
+            "array([true, false, true])\n"
+        );
+        assert_eq!(run_ok("print type(array([true]))\n"), "array\n");
+        // sum() on a Bool array counts the trues.
+        assert_eq!(run_ok("print sum(array([true, false, true]))\n"), "2\n");
+        assert_eq!(run_ok("print sum(array([false, false]))\n"), "0\n");
+        // A comparison produces a Bool array; sum() counts its trues.
+        let src = "let a = array([1, 2, 3, 4])\nprint sum(a > 2)\n";
+        assert_eq!(run_ok(src), "2\n");
+        // Bool arrays support == and !=, but not ordering.
+        assert_eq!(
+            run_ok("print array([true, false]) == true\n"),
+            "array([true, false])\n"
+        );
+        assert!(
+            run_err("print array([true]) < array([false])\n")
+                .contains("cannot compare Bool and Bool")
+        );
+    }
+
+    #[test]
+    fn boolean_indexing() {
+        // A 1D mask flattens the selection to 1D.
+        let src = "let a = array([1, 2, 3, 4])\nprint a[a > 2]\n";
+        assert_eq!(run_ok(src), "array([3, 4])\n");
+        let src = "let a = array([1, 2, 3, 4])\nprint a[a == 2]\n";
+        assert_eq!(run_ok(src), "array([2])\n");
+        let src = "let a = array([1, 2, 3])\nprint a[array([true, false, true])]\n";
+        assert_eq!(run_ok(src), "array([1, 3])\n");
+        // A 2D mask selects in row-major order, flattened to 1D.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m[m > 2]\n";
+        assert_eq!(run_ok(src), "array([3, 4])\n");
+        // No match at all gives an empty array.
+        let src = "let a = array([1, 2])\nprint a[a > 10]\n";
+        assert_eq!(run_ok(src), "array([])\n");
+        // The mask keeps the element type.
+        let src = "let a = array([1.5, 2.5])\nprint a[a > 2.0]\n";
+        assert_eq!(run_ok(src), "array([2.5])\n");
+        // Errors: wrong mask shape, a mask on a list, a non-Bool
+        // array as an index.
+        let src = "let a = array([1, 2, 3])\nprint a[array([true, false])]\n";
+        assert!(run_err(src).contains("boolean mask shape [2] does not match array shape [3]"));
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m[array([true, false])]\n";
+        assert!(run_err(src).contains("boolean mask shape [2] does not match array shape [2, 2]"));
+        assert!(
+            run_err("let xs = [1, 2, 3]\nprint xs[array([true, false, true])]\n")
+                .contains("list index must be an integer")
+        );
+        assert!(
+            run_err("let a = array([1, 2])\nprint a[array([0, 1])]\n")
+                .contains("array index must be an integer")
+        );
+        // Assigning through a mask is not supported yet.
+        assert!(
+            run_err("let a = array([1, 2])\na[a > 1] = 0\n")
+                .contains("cannot assign through a boolean mask (not supported yet)")
+        );
+    }
+
+    #[test]
+    fn where_builtin() {
+        // Arrays on both sides.
+        let src = "let c = array([true, false, true])\nlet a = array([1, 2, 3])\nlet b = array([10, 20, 30])\nprint where(c, a, b)\n";
+        assert_eq!(run_ok(src), "array([1, 20, 3])\n");
+        // Scalars broadcast.
+        let src = "let c = array([true, false])\nprint where(c, 1, 0)\n";
+        assert_eq!(run_ok(src), "array([1, 0])\n");
+        let src = "let a = array([1, 2, 3])\nprint where(a > 1, a, 0)\n";
+        assert_eq!(run_ok(src), "array([0, 2, 3])\n");
+        // A scalar and an array mix; Int+Float promotes to Float.
+        let src = "let c = array([true, false])\nprint where(c, 1.5, array([1, 2]))\n";
+        assert_eq!(run_ok(src), "array([1.5, 2])\n");
+        // 2D keeps its shape.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint where(m > 2, m, 0)\n";
+        assert_eq!(run_ok(src), "array([[0, 0], [3, 4]])\n");
+        // Bool and Str results work too.
+        let src = "let c = array([true, false])\nprint where(c, array([true, true]), false)\n";
+        assert_eq!(run_ok(src), "array([true, false])\n");
+        // Errors: non-Bool condition, shape mismatch, bad types.
+        assert!(
+            run_err("print where(array([1]), 1, 0)\n")
+                .contains("where() expects a Bool array as its condition, not Array of Int")
+        );
+        assert!(
+            run_err("print where(array([true]), array([1, 2]), 0)\n")
+                .contains("where() argument shape [2] does not match condition shape [1]")
+        );
+        assert!(
+            run_err("print where(array([true]), 1, \"x\")\n")
+                .contains("where() arguments have incompatible types: Int and Str")
+        );
+        assert!(run_err("print where(1, 2, 3)\n").contains("where() expects an Array, not Int"));
     }
 
     #[test]

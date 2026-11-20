@@ -138,6 +138,15 @@ pub enum Expr {
         target: Box<Expr>,
         indices: Vec<Expr>,
     },
+    /// A slice: `start:stop:step` inside brackets (`a[1:4]`,
+    /// `a[:3]`, `a[::2]`). Each bound is optional (`None` means
+    /// "the default for that end"). Only valid as an index item —
+    /// evaluating one on its own is a runtime error.
+    Slice {
+        start: Option<Box<Expr>>,
+        stop: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+    },
     /// The `self` keyword: the instance a method was called on.
     SelfExpr,
     /// Field access: `p.nome`, `self.eta`. On an instance it reads
@@ -323,6 +332,19 @@ impl Expr {
                     index.fmt_prec(f, 0)?;
                 }
                 write!(f, "]")?;
+            }
+            Expr::Slice { start, stop, step } => {
+                if let Some(start) = start {
+                    start.fmt_prec(f, 0)?;
+                }
+                write!(f, ":")?;
+                if let Some(stop) = stop {
+                    stop.fmt_prec(f, 0)?;
+                }
+                if let Some(step) = step {
+                    write!(f, ":")?;
+                    step.fmt_prec(f, 0)?;
+                }
             }
             Expr::SelfExpr => write!(f, "self")?,
             Expr::Field { target, name } => {

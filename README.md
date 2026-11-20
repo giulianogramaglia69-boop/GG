@@ -51,6 +51,12 @@ flat row-major storage plus a shape; new constructors (`zeros`,
 (array with array, array with scalar from either side), `dot`,
 `matmul`, `transpose`, `reshape`, and `sum`/`min`/`max` over
 whole arrays (see the N-dimensional arrays section below).
+**Phase 12 — slicing and boolean indexing: done.** Slices
+`start:stop:step` on lists, strings, tuples and arrays (Python
+rules, always a copy); element-wise comparisons returning Bool
+arrays; boolean indexing `a[mask]`; `where(cond, a, b)`; slice
+assignment on lists and 1D arrays (see the Slicing section
+below).
 
 ## The REPL
 
@@ -401,7 +407,7 @@ instance and `"class"` for a class (Phase 8).
 | `contains(coll, x)` | Membership: in a list, tuple, array or set; a key in a dict; a substring in a string | `contains([1, 2], 2)` → `true`, `contains("ciao", "ia")` → `true` |
 | `list(x)` | Convert a tuple, set, array, queue or stack — or a dict (its keys) — into a list; an error on strings and other types | `list((1, 2))` → `[1, 2]`, `list({"a": 1})` → `["a"]` |
 | `is_a(x, Classe)` | `true` when `x` is an instance of `Classe` or of any class inheriting from it; the second argument must be a class | `is_a(s, Persona)` → `true`, `is_a(5, Persona)` → `false` |
-| `sum(list)` | The sum of a list of numbers, or of all the elements of an array; all integers give an integer, any float gives a float; an error on an empty list or a non-number | `sum([1, 2, 3])` → `6`, `sum([1.5, 2])` → `3.5`, `sum(reshape(array([1, 2, 3, 4]), [2, 2]))` → `10` |
+| `sum(list)` | The sum of a list of numbers, or of all the elements of an array; all integers give an integer, any float gives a float; on a Bool array it counts the `true` values; an error on an empty list or a non-number | `sum([1, 2, 3])` → `6`, `sum([1.5, 2])` → `3.5`, `sum(reshape(array([1, 2, 3, 4]), [2, 2]))` → `10`, `sum(array([true, false]))` → `1` |
 | `join(sep, list)` | The complement of `split`: join the strings of the list with the separator between them | `join(", ", ["a", "b"])` → `"a, b"` |
 | `upper(s)` | The string in upper case (Unicode-aware) | `upper("ciao")` → `"CIAO"` |
 | `lower(s)` | The string in lower case (Unicode-aware) | `lower("CIAO")` → `"ciao"` |
@@ -409,6 +415,7 @@ instance and `"class"` for a class (Phase 8).
 | `replace(s, old, new)` | The string with every occurrence of `old` replaced by `new` (an empty `old` is an error) | `replace("aaa", "a", "b")` → `"bbb"` |
 | `starts_with(s, prefix)` | `true` when the string starts with the prefix | `starts_with("ciao", "ci")` → `true` |
 | `ends_with(s, suffix)` | `true` when the string ends with the suffix | `ends_with("ciao", "ao")` → `true` |
+| `where(cond, a, b)` | Element-by-element selection: where the Bool array `cond` is true take the element from `a`, otherwise from `b`; `a` and `b` are arrays of the same shape as `cond`, or scalars (broadcast); Int+Float promotes to Float | `where(array([true, false]), array([1, 2]), 0)` → `array([1, 0])` |
 
 Wrong arity is a runtime error naming the builtin
 (`len() expects 1 argument(s) but got 0`); a wrong argument type
@@ -687,9 +694,10 @@ scalar arithmetic, and `/` is always float division. Unary minus
 negates every element (`-a`). Shape mismatch, non-numeric
 arrays (an array of strings plus an array of strings is an
 error, not a concatenation) and division by zero are runtime
-errors. Comparisons between arrays are **not** done in this
-phase — there are no arrays of booleans yet; `==` still works
-(shape and elements must match).
+errors. **Phase 12 changed `==`/`!=` between arrays** (see the
+Slicing section below): comparisons are now element-wise and
+return a Bool array; the old whole-array `==` (one Bool for the
+whole array) is gone.
 
 **Matrix operations:**
 
@@ -729,6 +737,99 @@ Rotazione di 90 gradi del punto (1, 0):
 array([0, 1])
 ```
 
+## Slicing and boolean indexing
+
+Phase 12 adds Python-style slices and boolean indexing. A slice
+`start:stop:step` has three optional bounds: `stop` is excluded,
+out-of-range bounds are clamped (never an error), a step of 0 is
+a runtime error, and a negative step walks backwards. Slicing
+always returns a **copy**, never a view.
+
+**Slicing, by type:**
+
+| Expression | Description | Example |
+| --- | --- | --- |
+| `xs[1:3]`, `xs[:2]`, `xs[2:]`, `xs[::2]`, `xs[::-1]` | A slice of a list (new list) | `[1, 2, 3, 4, 5][1:3]` → `[2, 3]` |
+| `s[1:3]` | A slice of a string, by character (not by byte, like `len`) | `"ciao"[1:3]` → `"ia"`, `"aèb"[1:2]` → `"è"` |
+| `t[1:3]` | A slice of a tuple (new tuple) | `(1, 2, 3, 4)[1:3]` → `(2, 3)` |
+| `a[1:4]` | A slice of a 1D array (new 1D array) | `array([10, 20, 30, 40])[1:3]` → `array([20, 30])` |
+| `a[0:2, 1:3]` | A sub-array of a 2D array | `m[0:2, 1:3]` → `array([[2, 3], [5, 6]])` on a 2x3 `m` |
+| `a[:, 1]` | A whole column, as a 1D array | `m[:, 1]` → `array([2, 5])` |
+| `a[0, :]` | A whole row, as a 1D array | `m[0, :]` → `array([1, 2, 3])` |
+| `a[i, j]` and `a[i]` | Unchanged from Phase 11: one element, or a row on 2D arrays | `m[1, 0]` → `4` |
+
+On arrays, each axis takes either an index or a slice; axes
+without a selector are whole (`a[0:2]` on a 2D array keeps every
+column). Indexed axes drop out of the shape, sliced axes keep
+their selected length, in axis order. A single index on a string
+is still an error — strings take a slice only.
+
+**Slice assignment** (lists and 1D arrays only, same length
+required):
+
+```gg
+let xs = [1, 2, 3, 4]
+xs[1:3] = [9, 9]       # xs is now [1, 9, 9, 4]
+let a = array([1, 2, 3, 4])
+a[1:3] = array([9, 9]) # a is now array([1, 9, 9, 4])
+```
+
+A different length is a runtime error. Slice assignment on 2D
+arrays is not done yet, and neither is assignment through a
+mask (`a[a > 2] = 0` is an error).
+
+**Comparisons on arrays → Bool arrays:** `== != < <= > >=`
+work element by element, between two arrays of the same shape
+or between an array and a scalar (broadcast from either side,
+`2 < a` works too). Arrays can now hold Bool elements
+(`array([true, false])`), and `sum` on a Bool array counts the
+`true` values. Shape mismatch is a runtime error. An array
+against a List or a Dict is not an element-wise comparison — it
+falls back to whole-value equality, so `array([1]) == [1]` is
+still `false`. Ordering (`<`, `<=`, `>`, `>=`) needs numbers;
+`==`/`!=` work on any element type. `and`/`or` are **not**
+extended to arrays — they stay scalar with short-circuit.
+
+**Boolean indexing:** `a[mask]` keeps the elements where the
+mask (a Bool array with the same shape as `a`) is true,
+flattened to a 1D array in row-major order. It works on arrays
+only — for lists, filter with a loop, as in Phase 6.
+
+**`where(cond, a, b)`** (see the Builtins table): element-by-element
+selection — where `cond` is true take from `a`, otherwise from
+`b`. `a` and `b` are arrays of `cond`'s shape, or scalars.
+
+Full example: `examples/slicing_demo.gg` — filter values above
+a threshold with a mask and extract a sub-matrix:
+
+```gg
+let a = reshape(array([1, 2, 3, 4, 5, 6, 7, 8, 9]), [3, 3])
+print "Valori sopra 5:"
+print a[a > 5]
+print "Sotto-matrice:"
+print a[0:2, 1:3]
+print "Prima riga:"
+print a[0, :]
+print "Ultima colonna:"
+print a[:, 2]
+print "Sopra 5, altrimenti zero:"
+print where(a > 5, a, 0)
+```
+
+```sh
+$ gg run examples/slicing_demo.gg
+Valori sopra 5:
+array([6, 7, 8, 9])
+Sotto-matrice:
+array([[2, 3], [5, 6]])
+Prima riga:
+array([1, 2, 3])
+Ultima colonna:
+array([3, 6, 9])
+Sopra 5, altrimenti zero:
+array([[0, 0, 0], [0, 0, 6], [7, 8, 9]])
+```
+
 ## Grammar
 
 ```text
@@ -756,7 +857,8 @@ comparison:= term (("<" | "<=" | ">" | ">=") term)*
 term      := factor (("+" | "-") factor)*
 factor    := unary (("*" | "/" | "%") unary)*
 unary     := ("-" | "not") unary | postfix
-postfix   := primary ("[" expr ("," expr)* "]" | "." ident ["(" [expr ("," expr)*] ")"])*
+postfix   := primary ("[" index_item ("," index_item)* "]" | "." ident ["(" [expr ("," expr)*] ")"])*
+index_item:= expr | [expr] ":" [expr] [":" [expr]] ; a slice — each bound optional
 primary   := number | string | "true" | "false" | "self"
            | "super" "." ident ["(" [expr ("," expr)*] ")"]
            | "[" [expr ("," expr)*] "]"
@@ -765,7 +867,7 @@ primary   := number | string | "true" | "false" | "self"
            | ident ["(" [expr ("," expr)*] ")"]
 dict      := expr ":" expr ("," expr ":" expr)* [","]
 set       := expr ("," expr)* [","]
-index     := postfix "[" expr ("," expr)* "]"
+index     := postfix "[" index_item ("," index_item)* "]"
 field     := postfix "." ident
            ; ".5" lexes as Dot + Int(5) and the parser rejects it;
            ; "5." is still a lex error (malformed number)
@@ -858,9 +960,14 @@ exit with code 1.
     multi-indexing `a[i, j]`, element-wise arithmetic
     (array/array, array/scalar both sides), `dot`, `matmul`,
     `transpose`, `reshape`, `sum`/`min`/`max` over whole arrays
+12. **Slicing and boolean indexing** ✅ — slices
+    `start:stop:step` on lists, strings, tuples and arrays
+    (Python rules, always a copy); element-wise comparisons
+    returning Bool arrays; boolean indexing `a[mask]`;
+    `where(cond, a, b)`; slice assignment on lists and 1D arrays
+    (same length required)
 
-Next: slicing and boolean indexing, then a `linalg` module
-(`solve`/`det`/`inv`).
+Next: a `linalg` module (`solve`/`det`/`inv`).
 
 Long term: more data libraries in the spirit of Pandas, and a
 web framework in the spirit of Django — each is a large project

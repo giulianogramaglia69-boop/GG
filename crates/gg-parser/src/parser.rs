@@ -544,10 +544,10 @@ impl<'a> Parser<'a> {
         loop {
             if self.check(&TokenKind::LBracket) {
                 self.advance(); // [
-                let mut indices = vec![self.parse_expr()?];
+                let mut indices = vec![self.parse_index_item()?];
                 while self.check(&TokenKind::Comma) {
                     self.advance(); // ,
-                    indices.push(self.parse_expr()?);
+                    indices.push(self.parse_index_item()?);
                 }
                 self.expect(&TokenKind::RBracket, "']' after index")?;
                 expr = Expr::Index {
@@ -584,6 +584,58 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(expr)
+    }
+
+    /// One item inside `[...]`: a plain index expression, or a
+    /// slice `start:stop:step` where each bound is optional
+    /// (`a[1:4]`, `a[:3]`, `a[2:]`, `a[::2]`, `a[::-1]`, `a[:]`).
+    /// A `:` after the first expression (or at the start) makes it
+    /// a slice; otherwise it is a plain index.
+    fn parse_index_item(&mut self) -> Result<Expr, ParserError> {
+        if self.check(&TokenKind::Colon) {
+            return self.parse_slice(None);
+        }
+        let first = self.parse_expr()?;
+        if self.check(&TokenKind::Colon) {
+            return self.parse_slice(Some(first));
+        }
+        Ok(first)
+    }
+
+    /// The `:` and the bounds after it: `start` was already parsed
+    /// (or is `None` when the slice starts with `:`). A bound is
+    /// missing when the next token is `:`, `,` or `]`.
+    fn parse_slice(&mut self, start: Option<Expr>) -> Result<Expr, ParserError> {
+        self.expect(&TokenKind::Colon, "':' in slice")?;
+        let stop = if self.at_slice_bound_end() {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let step = if self.check(&TokenKind::Colon) {
+            self.advance(); // :
+            if self.at_slice_bound_end() {
+                None
+            } else {
+                Some(self.parse_expr()?)
+            }
+        } else {
+            None
+        };
+        Ok(Expr::Slice {
+            start: start.map(Box::new),
+            stop: stop.map(Box::new),
+            step: step.map(Box::new),
+        })
+    }
+
+    /// True when a slice bound ends here: the next token closes the
+    /// bound (`:` starts the step, `,` the next index, `]` the
+    /// brackets).
+    fn at_slice_bound_end(&self) -> bool {
+        self.check(&TokenKind::Colon)
+            || self.check(&TokenKind::Comma)
+            || self.check(&TokenKind::RBracket)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParserError> {
@@ -1281,6 +1333,64 @@ mod tests {
                         },
                     ],
                 },
+            }]
+        );
+    }
+
+    #[test]
+    fn slice_parsing_and_display() {
+        // A slice is one index item with optional bounds.
+        assert_eq!(
+            parse_ok("print xs[1:4]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(ident("xs")),
+                    indices: vec![Expr::Slice {
+                        start: Some(Box::new(int(1))),
+                        stop: Some(Box::new(int(4))),
+                        step: None,
+                    }],
+                },
+            }]
+        );
+        // Missing bounds print back empty; the step prints only
+        // when present (round-trip through Display + re-parse).
+        for source in [
+            "print xs[1:4]",
+            "print xs[:3]",
+            "print xs[2:]",
+            "print xs[::2]",
+            "print xs[::-1]",
+            "print xs[:]",
+            "print xs[1:4:2]",
+            "print xs[-3:-1]",
+            "print a[0:2, 1:3]",
+            "print a[:, 1]",
+            "print a[0, :]",
+            "print a[1:4, 0]",
+        ] {
+            let prog = parse_ok(source);
+            assert_eq!(prog.to_string(), source);
+            assert_eq!(parse_ok(&prog.to_string()), prog);
+        }
+        // Slice bounds are expressions, not just literals.
+        assert_eq!(
+            parse_ok("print xs[n + 1:len(xs)]").to_string(),
+            "print xs[n + 1:len(xs)]"
+        );
+        // A slice assignment parses like any index assignment.
+        assert_eq!(
+            parse_ok("xs[1:3] = [9, 9]").stmts,
+            vec![Stmt::IndexAssign {
+                target: Expr::Index {
+                    target: Box::new(ident("xs")),
+                    indices: vec![Expr::Slice {
+                        start: Some(Box::new(int(1))),
+                        stop: Some(Box::new(int(3))),
+                        step: None,
+                    }],
+                },
+                value: Expr::List(vec![int(9), int(9)]),
             }]
         );
     }
