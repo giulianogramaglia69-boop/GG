@@ -43,7 +43,14 @@ done.** Eight new builtins (`sum`, `join`, `upper`, `lower`,
 `trim`, `replace`, `starts_with`, `ends_with`), a native
 `math` module, a native `random` module (SplitMix64, pure Rust)
 and a `stats` module written in pure GG and embedded in the
-binary (see the Standard library section below).
+binary (see the Standard library section below). **Phase 11 —
+N-dimensional numeric arrays: done.** Arrays are now N-d with a
+flat row-major storage plus a shape; new constructors (`zeros`,
+`ones`, `arange`, `linspace`), shape helpers (`shape`, `ndim`,
+`size`), multi-indexing `a[i, j]`, element-wise arithmetic
+(array with array, array with scalar from either side), `dot`,
+`matmul`, `transpose`, `reshape`, and `sum`/`min`/`max` over
+whole arrays (see the N-dimensional arrays section below).
 
 ## The REPL
 
@@ -341,7 +348,7 @@ end
 
 ## Builtins
 
-Thirty-six builtin functions are predefined in the global environment of
+Forty-seven builtin functions are predefined in the global environment of
 every program. They are first-class values: they can be assigned to
 variables (`let f = len`), passed as arguments and returned from
 functions. `type()` returns `"fn"` for user functions and builtins
@@ -359,8 +366,8 @@ instance and `"class"` for a class (Phase 8).
 | `float(x)` | Int converted, string parsed, `true`→`1.0`, `false`→`0.0` | `float(3)` → `3.0` |
 | `input(prompt)` | Print the prompt (no newline), read one line, return it without the newline; `""` at end of input | `input("Name: ")` |
 | `abs(x)` | Absolute value of a number | `abs(-5)` → `5` |
-| `min(a, b)` | The smaller of two numbers (mixed int/float gives a float) | `min(2, 5)` → `2` |
-| `max(a, b)` | The larger of two numbers | `max(2, 5)` → `5` |
+| `min(a, b)` | The smaller of two numbers (mixed int/float gives a float); with one array argument, the smallest element of the array | `min(2, 5)` → `2`, `min(array([3, 1]))` → `1` |
+| `max(a, b)` | The larger of two numbers; with one array argument, the largest element of the array | `max(2, 5)` → `5`, `max(array([3, 1]))` → `3` |
 | `push(list, value)` | Append `value` to a list or a stack (mutates it) and return `nil`; an error on arrays, queues, tuples, dicts or sets | `push(xs, 3)`, `push(s, 3)` |
 | `pop(list)` | Remove and return the last element of a list or the top of a stack; an error on an empty list or stack | `pop(xs)` → `3` |
 | `range(n)` | `[0, 1, ..., n-1]` | `range(3)` → `[0, 1, 2]` |
@@ -371,7 +378,18 @@ instance and `"class"` for a class (Phase 8).
 | `write_file(path, text)` | Create or overwrite the file, return `nil` | `write_file("notes.txt", "ciao")` |
 | `append_file(path, text)` | Append to the file (creating it if needed), return `nil` | `append_file("notes.txt", " mondo")` |
 | `file_exists(path)` | `true` when the path exists | `file_exists("notes.txt")` → `true` |
-| `array(list)` | An array from a list: all elements must have the same type (Int, Float, Str or Bool); an empty list is an error | `array([1, 2])` → `array([1, 2])` |
+| `array(list)` | An array from a list: all elements must have the same type (Int, Float, Str or Bool); an empty list is an error. The array is 1D, with shape `[n]` | `array([1, 2])` → `array([1, 2])` |
+| `zeros(n)` / `zeros([r, c])` | An Int array of zeros with the given shape (an Int means the 1D shape `[n]`); dimensions must be positive | `zeros(3)` → `array([0, 0, 0])`, `zeros([2, 2])` → `array([[0, 0], [0, 0]])` |
+| `ones(n)` / `ones([r, c])` | An Int array of ones with the given shape | `ones([2, 2])` → `array([[1, 1], [1, 1]])` |
+| `arange(n)` / `arange(a, b)` / `arange(a, b, step)` | `[0, ..., n-1]`, `[a, ..., b-1]`, or stepping by `step` (negative steps count down); a step of 0 is an error; at most 1000000 elements | `arange(4)` → `array([0, 1, 2, 3])`, `arange(0, 10, 3)` → `array([0, 3, 6, 9])` |
+| `linspace(a, b, n)` | `n` Float points evenly spaced from `a` to `b`, both ends included; `n` must be at least 1 | `linspace(0, 1, 3)` → `array([0, 0.5, 1])` |
+| `shape(a)` | The shape of an array as a list of Ints | `shape(zeros([2, 3]))` → `[2, 3]` |
+| `ndim(a)` | The number of dimensions of an array | `ndim(zeros([2, 3]))` → `2` |
+| `size(a)` | The total number of elements of an array | `size(zeros([2, 3]))` → `6` |
+| `dot(a, b)` | The scalar product of two 1D vectors of the same length | `dot(array([1, 2, 3]), array([4, 5, 6]))` → `32` |
+| `matmul(a, b)` | The matrix product: 2D x 2D, 1D x 2D (row vector times matrix) and 2D x 1D (matrix times column vector); two 1D vectors are an error (use `dot()`) | `matmul(reshape(array([1, 2, 3, 4]), [2, 2]), reshape(array([5, 6, 7, 8]), [2, 2]))` → `array([[19, 22], [43, 50]])` |
+| `transpose(a)` | Swap the two axes of a 2D array; a 1D array is returned unchanged | `transpose(reshape(array([1, 2, 3, 4]), [2, 2]))` → `array([[1, 3], [2, 4]])` |
+| `reshape(a, shape)` | The same items with a new shape (an Int means the 1D shape `[n]`); the total number of elements must stay the same | `reshape(array([1, 2, 3, 4]), [2, 2])` → `array([[1, 2], [3, 4]])` |
 | `queue()` | An empty queue (FIFO) | `queue()` → `queue([])` |
 | `queue(list)` | A queue from a list, in order | `queue([1, 2])` → `queue([1, 2])` |
 | `enqueue(q, x)` | Add `x` at the back of the queue, return `nil` | `enqueue(q, 3)` |
@@ -383,7 +401,7 @@ instance and `"class"` for a class (Phase 8).
 | `contains(coll, x)` | Membership: in a list, tuple, array or set; a key in a dict; a substring in a string | `contains([1, 2], 2)` → `true`, `contains("ciao", "ia")` → `true` |
 | `list(x)` | Convert a tuple, set, array, queue or stack — or a dict (its keys) — into a list; an error on strings and other types | `list((1, 2))` → `[1, 2]`, `list({"a": 1})` → `["a"]` |
 | `is_a(x, Classe)` | `true` when `x` is an instance of `Classe` or of any class inheriting from it; the second argument must be a class | `is_a(s, Persona)` → `true`, `is_a(5, Persona)` → `false` |
-| `sum(list)` | The sum of a list of numbers; all integers give an integer, any float gives a float; an error on an empty list or a non-number | `sum([1, 2, 3])` → `6`, `sum([1.5, 2])` → `3.5` |
+| `sum(list)` | The sum of a list of numbers, or of all the elements of an array; all integers give an integer, any float gives a float; an error on an empty list or a non-number | `sum([1, 2, 3])` → `6`, `sum([1.5, 2])` → `3.5`, `sum(reshape(array([1, 2, 3, 4]), [2, 2]))` → `10` |
 | `join(sep, list)` | The complement of `split`: join the strings of the list with the separator between them | `join(", ", ["a", "b"])` → `"a, b"` |
 | `upper(s)` | The string in upper case (Unicode-aware) | `upper("ciao")` → `"CIAO"` |
 | `lower(s)` | The string in lower case (Unicode-aware) | `lower("CIAO")` → `"ciao"` |
@@ -632,6 +650,85 @@ pi greco: 3.141592653589793
 
 (The die roll differs on every run.)
 
+## N-dimensional arrays
+
+Phase 11 makes the `array` type from Phase 7 N-dimensional.
+Internally an array is its flat items in row-major order plus a
+shape (one size per dimension): a 1D array of 3 elements has
+shape `[3]`, a 2x2 matrix has shape `[2, 2]`. The 1D arrays of
+Phase 7 are shape `[n]` and keep working exactly as before.
+`len(a)` is still the total number of elements, `type(a)` is
+still `"array"`, and `str(a)` prints 1D arrays as before and 2D
+arrays nested, NumPy style: `array([[1, 2], [3, 4]])`.
+
+**Shape and indexing:**
+
+| Expression | Description | Example |
+| --- | --- | --- |
+| `a[i]` | One element of a 1D array (negative from the end) | `array([10, 20])[1]` → `20`, `array([10, 20])[-1]` → `20` |
+| `a[i, j]` | One element of a 2D array, one index per dimension (negative per axis) | `m[1, 0]` → `3` on `array([[1, 2], [3, 4]])` |
+| `a[i]` on a 2D array | Its i-th row, as a 1D array (so `a[0][1]` is the same as `a[0, 1]`) | `m[0]` → `array([1, 2])` |
+| `a[i, j] = v` | Assign one element (one index per dimension; a single index only for 1D arrays — a whole row cannot be assigned) | `m[0, 1] = 7` |
+| `shape(a)` / `ndim(a)` / `size(a)` | The shape as a list, the number of dimensions, the total number of elements | `shape(m)` → `[2, 2]`, `ndim(m)` → `2`, `size(m)` → `4` |
+
+**Constructors:** `zeros(n)` / `zeros([r, c])`, `ones(n)` /
+`ones([r, c])`, `arange(n)` / `arange(a, b)` /
+`arange(a, b, step)`, `linspace(a, b, n)` (see the Builtins
+table). A shape takes an Int (1D) or a List of Ints; dimensions
+must be positive integers, and constructors refuse arrays above
+1000000 elements. A 2D array is built with `reshape`: there is
+no nested-list literal for arrays — `array([[1, 2]])` is an
+error, because `array()` takes a flat list of scalars.
+
+**Element-wise arithmetic:** `+ - * /` between two arrays of
+the same shape, or between an array and a scalar (broadcast from
+either side: `a + 1` and `1 + a`). Int/float promotion follows
+scalar arithmetic, and `/` is always float division. Unary minus
+negates every element (`-a`). Shape mismatch, non-numeric
+arrays (an array of strings plus an array of strings is an
+error, not a concatenation) and division by zero are runtime
+errors. Comparisons between arrays are **not** done in this
+phase — there are no arrays of booleans yet; `==` still works
+(shape and elements must match).
+
+**Matrix operations:**
+
+| Function | Description |
+| --- | --- |
+| `dot(a, b)` | Scalar product of two 1D vectors of the same length |
+| `matmul(a, b)` | Matrix product: 2D x 2D, 1D x 2D (row vector times matrix) and 2D x 1D (matrix times column vector); two 1D vectors are an error — use `dot()` |
+| `transpose(a)` | Swap the two axes of a 2D array; a 1D array is returned unchanged |
+| `reshape(a, shape)` | The same items with a new shape; the total number of elements must stay the same |
+
+`sum(a)`, `min(a)` and `max(a)` work on whole arrays (all
+elements); `min(a, b)` / `max(a, b)` on two numbers are
+unchanged.
+
+Full example: `examples/matmul_demo.gg` — matrix multiplication
+and a 90-degree rotation of a 2D point:
+
+```gg
+let a = reshape(array([1, 2, 3, 4]), [2, 2])
+let b = reshape(array([5, 6, 7, 8]), [2, 2])
+print "A @ B:"
+print matmul(a, b)
+print "dot di [1, 2, 3] e [4, 5, 6]:"
+print dot(array([1, 2, 3]), array([4, 5, 6]))
+print "Rotazione di 90 gradi del punto (1, 0):"
+let r = reshape(array([0, -1, 1, 0]), [2, 2])
+print matmul(r, array([1, 0]))
+```
+
+```sh
+$ gg run examples/matmul_demo.gg
+A @ B:
+array([[19, 22], [43, 50]])
+dot di [1, 2, 3] e [4, 5, 6]:
+32
+Rotazione di 90 gradi del punto (1, 0):
+array([0, 1])
+```
+
 ## Grammar
 
 ```text
@@ -659,7 +756,7 @@ comparison:= term (("<" | "<=" | ">" | ">=") term)*
 term      := factor (("+" | "-") factor)*
 factor    := unary (("*" | "/" | "%") unary)*
 unary     := ("-" | "not") unary | postfix
-postfix   := primary ("[" expr "]" | "." ident ["(" [expr ("," expr)*] ")"])*
+postfix   := primary ("[" expr ("," expr)* "]" | "." ident ["(" [expr ("," expr)*] ")"])*
 primary   := number | string | "true" | "false" | "self"
            | "super" "." ident ["(" [expr ("," expr)*] ")"]
            | "[" [expr ("," expr)*] "]"
@@ -668,7 +765,7 @@ primary   := number | string | "true" | "false" | "self"
            | ident ["(" [expr ("," expr)*] ")"]
 dict      := expr ":" expr ("," expr ":" expr)* [","]
 set       := expr ("," expr)* [","]
-index     := postfix "[" expr "]"
+index     := postfix "[" expr ("," expr)* "]"
 field     := postfix "." ident
            ; ".5" lexes as Dot + Int(5) and the parser rejects it;
            ; "5." is still a lex error (malformed number)
@@ -755,11 +852,19 @@ exit with code 1.
     Rust) modules; `stats` in pure GG, embedded in the binary;
     import resolution: user files → embedded stdlib → native
     modules
+11. **N-dimensional numeric arrays** ✅ — flat row-major
+    storage + shape; constructors (`zeros`, `ones`, `arange`,
+    `linspace`), shape helpers (`shape`, `ndim`, `size`),
+    multi-indexing `a[i, j]`, element-wise arithmetic
+    (array/array, array/scalar both sides), `dot`, `matmul`,
+    `transpose`, `reshape`, `sum`/`min`/`max` over whole arrays
 
-Long term: numeric arrays in the spirit of NumPy (on top of the
-`array` type from Phase 7), more data libraries in the spirit of
-Pandas, and a web framework in the spirit of Django — each is a
-large project of its own, not a single phase.
+Next: slicing and boolean indexing, then a `linalg` module
+(`solve`/`det`/`inv`).
+
+Long term: more data libraries in the spirit of Pandas, and a
+web framework in the spirit of Django — each is a large project
+of its own, not a single phase.
 
 ## License
 

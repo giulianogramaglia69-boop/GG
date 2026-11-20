@@ -269,11 +269,37 @@ pub fn elem_type_of(value: &Value) -> Option<ElemType> {
     }
 }
 
-/// The contents of an array: its element type plus the items.
+/// The contents of an array: its element type, its shape (one
+/// size per dimension) and the items, flat in row-major order.
+/// A 1D array of 3 elements has shape `[3]`; a 2x2 matrix has
+/// shape `[2, 2]` and its 4 items in row-major order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayData {
     pub elem: ElemType,
+    pub shape: Vec<usize>,
     pub items: Vec<Value>,
+}
+
+impl ArrayData {
+    /// Total number of elements (the product of the shape).
+    pub fn size(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Number of dimensions.
+    pub fn ndim(&self) -> usize {
+        self.shape.len()
+    }
+
+    /// Row-major strides: the number of flat items to skip when an
+    /// index on one axis grows by one.
+    pub fn strides(&self) -> Vec<usize> {
+        let mut strides = vec![1; self.shape.len()];
+        for i in (0..self.shape.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * self.shape[i + 1];
+        }
+        strides
+    }
 }
 
 impl Value {
@@ -401,14 +427,9 @@ impl Value {
                 if depth >= MAX_DEPTH {
                     return write!(f, "...");
                 }
-                write!(f, "array([")?;
-                for (i, element) in array.borrow().items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    element.fmt_nested(f, depth + 1)?;
-                }
-                write!(f, "])")
+                write!(f, "array(")?;
+                fmt_array(f, &array.borrow(), depth)?;
+                write!(f, ")")
             }
             Value::Queue(queue) => {
                 if depth >= MAX_DEPTH {
@@ -468,6 +489,39 @@ impl Value {
             other => other.fmt_depth(f, depth),
         }
     }
+}
+
+/// Print an array in NumPy style: 1D `array([1, 2, 3])`, 2D
+/// `array([[1, 2], [3, 4]])`. One bracket level per dimension,
+/// innermost rows holding the flat items in row-major order.
+fn fmt_array(f: &mut fmt::Formatter<'_>, data: &ArrayData, depth: usize) -> fmt::Result {
+    if data.shape.is_empty() {
+        return write!(f, "[]");
+    }
+    fmt_array_dim(f, data, 0, 0, depth)
+}
+
+fn fmt_array_dim(
+    f: &mut fmt::Formatter<'_>,
+    data: &ArrayData,
+    dim: usize,
+    offset: usize,
+    depth: usize,
+) -> fmt::Result {
+    write!(f, "[")?;
+    let size = data.shape[dim];
+    let stride = data.strides()[dim];
+    for i in 0..size {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        if dim + 1 == data.shape.len() {
+            data.items[offset + i * stride].fmt_nested(f, depth + 1)?;
+        } else {
+            fmt_array_dim(f, data, dim + 1, offset + i * stride, depth + 1)?;
+        }
+    }
+    write!(f, "]")
 }
 
 /// Escape a string for printing inside double quotes (only used
@@ -563,6 +617,7 @@ fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
             let x = x.borrow();
             let y = y.borrow();
             x.elem == y.elem
+                && x.shape == y.shape
                 && x.items.len() == y.items.len()
                 && x.items
                     .iter()

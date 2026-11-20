@@ -1,0 +1,16 @@
+# Matrix multiplication and a 90-degree rotation of a 2D point.
+let a = reshape(array([1, 2, 3, 4]), [2, 2])
+let b = reshape(array([5, 6, 7, 8]), [2, 2])
+print "A:"
+print a
+print "B:"
+print b
+print "A @ B:"
+print matmul(a, b)
+print "dot di [1, 2, 3] e [4, 5, 6]:"
+print dot(array([1, 2, 3]), array([4, 5, 6]))
+print "Rotazione di 90 gradi del punto (1, 0):"
+let r = reshape(array([0, -1, 1, 0]), [2, 2])
+print matmul(r, array([1, 0]))
+print "Media degli elementi di A:"
+print sum(a) / size(a)

@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 
+use crate::array::{self, ArrayOp, flat_index, subarray};
 use crate::builtin;
 use crate::env::Environment;
 use crate::error::RuntimeError;
@@ -411,10 +412,13 @@ impl Interpreter {
                 }
                 Ok(Value::Set(Rc::new(RefCell::new(items))))
             }
-            Expr::Index { target, index } => {
+            Expr::Index { target, indices } => {
                 let target = self.eval_expr(target, env, input, out)?;
-                let index = self.eval_expr(index, env, input, out)?;
-                index_value(&target, index)
+                let mut values = Vec::with_capacity(indices.len());
+                for index in indices {
+                    values.push(self.eval_expr(index, env, input, out)?);
+                }
+                index_value(&target, values)
             }
             Expr::SelfExpr => env.get("self"),
             Expr::Field { target, name } => {
@@ -469,6 +473,7 @@ impl Interpreter {
                             .map(Value::Int)
                             .ok_or_else(|| RuntimeError::new("integer overflow")),
                         Value::Float(x) => Ok(Value::Float(-x)),
+                        Value::Array(array) => array::negate_array(&array.borrow()),
                         other => Err(RuntimeError::new(format!(
                             "cannot negate {}",
                             other.type_name()
@@ -1011,9 +1016,10 @@ impl Interpreter {
     }
 
     /// Assign through an index: the target must be an `Index`
-    /// expression (`xs[0]`, `m[0][1]`, `d["k"]`). The container is
-    /// evaluated first, then the final index, and the element is
-    /// replaced — or inserted, for dicts.
+    /// expression (`xs[0]`, `m[0][1]`, `d["k"]`, `a[0, 1]`). The
+    /// container is evaluated first, then the final index, and the
+    /// element is replaced — or inserted, for dicts. An array takes
+    /// one index per dimension, or a single index when 1D.
     fn assign_index(
         &mut self,
         target: &Expr,
@@ -1022,18 +1028,23 @@ impl Interpreter {
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<(), RuntimeError> {
-        let Expr::Index { target, index } = target else {
+        let Expr::Index { target, indices } = target else {
             return Err(RuntimeError::new("invalid assignment target"));
         };
         let container = self.eval_expr(target, env, input, out)?;
-        let index = self.eval_expr(index, env, input, out)?;
+        let mut values = Vec::with_capacity(indices.len());
+        for index in indices {
+            values.push(self.eval_expr(index, env, input, out)?);
+        }
         match container {
             Value::List(list) => {
+                let index = single_index(values, "list")?;
                 let pos = resolve_index(list.borrow().len(), index, "list")?;
                 list.borrow_mut()[pos] = value;
                 Ok(())
             }
             Value::Dict(dict) => {
+                let index = single_index(values, "dict")?;
                 let Some(key) = index.to_key() else {
                     return Err(RuntimeError::new(format!(
                         "dict key must be Int, Float, Str or Bool, not {}",
@@ -1045,7 +1056,15 @@ impl Interpreter {
             }
             Value::Array(array) => {
                 let mut array = array.borrow_mut();
-                let pos = resolve_index(array.items.len(), index, "array")?;
+                let pos = if values.len() == 1 && array.ndim() == 1 {
+                    resolve_index(
+                        array.items.len(),
+                        values.into_iter().next().unwrap(),
+                        "array",
+                    )?
+                } else {
+                    flat_index(&array.shape, &values)?
+                };
                 let wanted = array.elem;
                 match elem_type_of(&value) {
                     Some(elem) if elem == wanted => {
@@ -1122,26 +1141,46 @@ fn resolve_index(len: usize, index: Value, kind: &str) -> Result<usize, RuntimeE
     Ok(pos as usize)
 }
 
-/// `xs[i]` / `t[i]` / `a[i]` / `d[k]`: read one element. Lists,
-/// tuples and arrays take an integer index (negative from the end);
-/// dicts take a hashable key and fail on a missing key.
-fn index_value(target: &Value, index: Value) -> Result<Value, RuntimeError> {
+/// `xs[i]` / `t[i]` / `a[i]` / `d[k]` / `a[i, j]`: read one
+/// element. Lists, tuples and dicts take exactly one index (an
+/// integer, negative from the end; a hashable key for dicts, failing
+/// on a missing key). Arrays take one index per dimension — or a
+/// single index, which is a flat element for 1D arrays and a row
+/// (a 1D array) for 2D arrays.
+fn index_value(target: &Value, indices: Vec<Value>) -> Result<Value, RuntimeError> {
     match target {
         Value::List(list) => {
+            let index = single_index(indices, "list")?;
             let borrowed = list.borrow();
             let pos = resolve_index(borrowed.len(), index, "list")?;
             Ok(borrowed[pos].clone())
         }
         Value::Tuple(items) => {
+            let index = single_index(indices, "tuple")?;
             let pos = resolve_index(items.len(), index, "tuple")?;
             Ok(items[pos].clone())
         }
         Value::Array(array) => {
             let borrowed = array.borrow();
-            let pos = resolve_index(borrowed.items.len(), index, "array")?;
-            Ok(borrowed.items[pos].clone())
+            if indices.len() == 1 {
+                if borrowed.ndim() == 1 {
+                    let pos = resolve_index(
+                        borrowed.items.len(),
+                        indices.into_iter().next().unwrap(),
+                        "array",
+                    )?;
+                    Ok(borrowed.items[pos].clone())
+                } else {
+                    let row = subarray(&borrowed, indices.into_iter().next().unwrap())?;
+                    Ok(row)
+                }
+            } else {
+                let pos = flat_index(&borrowed.shape, &indices)?;
+                Ok(borrowed.items[pos].clone())
+            }
         }
         Value::Dict(dict) => {
+            let index = single_index(indices, "dict")?;
             let Some(key) = index.to_key() else {
                 return Err(RuntimeError::new(format!(
                     "dict key must be Int, Float, Str or Bool, not {}",
@@ -1160,8 +1199,25 @@ fn index_value(target: &Value, index: Value) -> Result<Value, RuntimeError> {
     }
 }
 
-/// `+`: integer/float arithmetic, or string concatenation.
+/// Exactly one index, or an error: lists, tuples and dicts take a
+/// single index.
+fn single_index(indices: Vec<Value>, kind: &str) -> Result<Value, RuntimeError> {
+    if indices.len() != 1 {
+        return Err(RuntimeError::new(format!(
+            "{kind} takes one index, not {}",
+            indices.len()
+        )));
+    }
+    Ok(indices.into_iter().next().unwrap())
+}
+
+/// `+`: integer/float arithmetic, string concatenation, or
+/// element-wise array arithmetic (array + array, array + scalar,
+/// scalar + array).
 fn add_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+    if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
+        return array::elementwise(ArrayOp::Add, left, right);
+    }
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => a
             .checked_add(*b)
@@ -1180,7 +1236,9 @@ fn add_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
 }
 
 /// `-` and `*` on numbers (int+int stays int, anything float becomes
-/// float). Integer overflow is an error, not a panic.
+/// float). Integer overflow is an error, not a panic. Arrays work
+/// element by element (array op array, array op scalar, scalar op
+/// array).
 fn numeric_op(
     left: &Value,
     right: &Value,
@@ -1188,6 +1246,14 @@ fn numeric_op(
     int_op: impl Fn(i64, i64) -> Option<i64>,
     float_op: impl Fn(f64, f64) -> f64,
 ) -> Result<Value, RuntimeError> {
+    if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
+        let op = if verb == "subtract" {
+            ArrayOp::Sub
+        } else {
+            ArrayOp::Mul
+        };
+        return array::elementwise(op, left, right);
+    }
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => int_op(*a, *b)
             .map(Value::Int)
@@ -1203,8 +1269,13 @@ fn numeric_op(
     }
 }
 
-/// `/`: always float division, even between integers.
+/// `/`: always float division, even between integers. Arrays work
+/// element by element (array / array, array / scalar, scalar /
+/// array).
 fn divide_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+    if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
+        return array::elementwise(ArrayOp::Div, left, right);
+    }
     let (a, b) = match (left, right) {
         (Value::Int(a), Value::Int(b)) => (*a as f64, *b as f64),
         (Value::Float(a), Value::Float(b)) => (*a, *b),

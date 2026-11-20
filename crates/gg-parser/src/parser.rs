@@ -544,11 +544,15 @@ impl<'a> Parser<'a> {
         loop {
             if self.check(&TokenKind::LBracket) {
                 self.advance(); // [
-                let index = self.parse_expr()?;
+                let mut indices = vec![self.parse_expr()?];
+                while self.check(&TokenKind::Comma) {
+                    self.advance(); // ,
+                    indices.push(self.parse_expr()?);
+                }
                 self.expect(&TokenKind::RBracket, "']' after index")?;
                 expr = Expr::Index {
                     target: Box::new(expr),
-                    index: Box::new(index),
+                    indices,
                 };
             } else if self.check(&TokenKind::Dot) {
                 self.advance(); // .
@@ -1193,7 +1197,7 @@ mod tests {
             vec![Stmt::Print {
                 expr: Expr::Index {
                     target: Box::new(ident("xs")),
-                    index: Box::new(int(0)),
+                    indices: vec![int(0)],
                 },
             }]
         );
@@ -1203,10 +1207,10 @@ mod tests {
             vec![Stmt::Print {
                 expr: Expr::Index {
                     target: Box::new(ident("xs")),
-                    index: Box::new(Expr::Unary {
+                    indices: vec![Expr::Unary {
                         op: UnaryOp::Neg,
                         expr: Box::new(int(1)),
-                    }),
+                    }],
                 },
             }]
         );
@@ -1217,9 +1221,9 @@ mod tests {
                 expr: Expr::Index {
                     target: Box::new(Expr::Index {
                         target: Box::new(ident("xs")),
-                        index: Box::new(int(0)),
+                        indices: vec![int(0)],
                     }),
-                    index: Box::new(int(1)),
+                    indices: vec![int(1)],
                 },
             }]
         );
@@ -1231,7 +1235,7 @@ mod tests {
                         name: "f".to_string(),
                         args: vec![],
                     }),
-                    index: Box::new(int(0)),
+                    indices: vec![int(0)],
                 },
             }]
         );
@@ -1243,10 +1247,40 @@ mod tests {
                     Add,
                     Expr::Index {
                         target: Box::new(ident("xs")),
-                        index: Box::new(int(0)),
+                        indices: vec![int(0)],
                     },
                     int(1),
                 ),
+            }]
+        );
+        // Multi-index: a[0, 1] is one Index with two indices, and
+        // it prints back the same way (round-trip).
+        assert_eq!(
+            parse_ok("print a[0, 1]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(ident("a")),
+                    indices: vec![int(0), int(1)],
+                },
+            }]
+        );
+        assert_eq!(parse_ok("print a[0, 1]").to_string(), "print a[0, 1]");
+        assert_eq!(
+            parse_ok("print a[-1, -2]").stmts,
+            vec![Stmt::Print {
+                expr: Expr::Index {
+                    target: Box::new(ident("a")),
+                    indices: vec![
+                        Expr::Unary {
+                            op: UnaryOp::Neg,
+                            expr: Box::new(int(1)),
+                        },
+                        Expr::Unary {
+                            op: UnaryOp::Neg,
+                            expr: Box::new(int(2)),
+                        },
+                    ],
+                },
             }]
         );
     }
@@ -1258,7 +1292,7 @@ mod tests {
             vec![Stmt::IndexAssign {
                 target: Expr::Index {
                     target: Box::new(ident("xs")),
-                    index: Box::new(int(0)),
+                    indices: vec![int(0)],
                 },
                 value: int(99),
             }]
@@ -1270,9 +1304,9 @@ mod tests {
                 target: Expr::Index {
                     target: Box::new(Expr::Index {
                         target: Box::new(ident("m")),
-                        index: Box::new(int(0)),
+                        indices: vec![int(0)],
                     }),
-                    index: Box::new(int(1)),
+                    indices: vec![int(1)],
                 },
                 value: bin(Add, int(1), int(2)),
             }]
@@ -1300,7 +1334,7 @@ mod tests {
                     Eq,
                     Expr::Index {
                         target: Box::new(ident("xs")),
-                        index: Box::new(int(0)),
+                        indices: vec![int(0)],
                     },
                     int(5),
                 ),

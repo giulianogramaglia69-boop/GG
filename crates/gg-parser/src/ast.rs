@@ -131,11 +131,12 @@ pub enum Expr {
     /// A set literal: `{1, 2, 3}`. `{}` is the empty dict, not an
     /// empty set (Python convention).
     Set(Vec<Expr>),
-    /// Indexing: `xs[0]`, `f()[0]`, `xs[0][1]`. Binds as tightly as
-    /// a call (it is a postfix operator, see the parser).
+    /// Indexing: `xs[0]`, `f()[0]`, `xs[0][1]`, and multi-index
+    /// `a[i, j]` (one index per dimension of an array). Binds as
+    /// tightly as a call (it is a postfix operator, see the parser).
     Index {
         target: Box<Expr>,
-        index: Box<Expr>,
+        indices: Vec<Expr>,
     },
     /// The `self` keyword: the instance a method was called on.
     SelfExpr,
@@ -312,10 +313,15 @@ impl Expr {
                 }
                 write!(f, "}}")?;
             }
-            Expr::Index { target, index } => {
+            Expr::Index { target, indices } => {
                 target.fmt_prec(f, 8)?;
                 write!(f, "[")?;
-                index.fmt_prec(f, 0)?;
+                for (i, index) in indices.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    index.fmt_prec(f, 0)?;
+                }
                 write!(f, "]")?;
             }
             Expr::SelfExpr => write!(f, "self")?,

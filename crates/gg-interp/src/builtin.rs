@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
+use crate::array::{self, check_shape_size, make_array, parse_shape};
 use crate::env::Environment;
 use crate::error::RuntimeError;
 use crate::value::{ArrayData, Value, elem_type_of, values_equal};
@@ -81,6 +82,11 @@ pub fn all() -> Vec<Builtin> {
             func: append_file,
         },
         Builtin {
+            name: "arange",
+            arity: Arity::Range(1, 3),
+            func: arange,
+        },
+        Builtin {
             name: "array",
             arity: Arity::Exact(1),
             func: array,
@@ -94,6 +100,11 @@ pub fn all() -> Vec<Builtin> {
             name: "dequeue",
             arity: Arity::Exact(1),
             func: dequeue,
+        },
+        Builtin {
+            name: "dot",
+            arity: Arity::Exact(2),
+            func: dot,
         },
         Builtin {
             name: "enqueue",
@@ -151,6 +162,11 @@ pub fn all() -> Vec<Builtin> {
             func: lines,
         },
         Builtin {
+            name: "linspace",
+            arity: Arity::Exact(3),
+            func: linspace,
+        },
+        Builtin {
             name: "list",
             arity: Arity::Exact(1),
             func: list_of,
@@ -161,14 +177,29 @@ pub fn all() -> Vec<Builtin> {
             func: lower,
         },
         Builtin {
-            name: "max",
+            name: "matmul",
             arity: Arity::Exact(2),
+            func: matmul,
+        },
+        Builtin {
+            name: "max",
+            arity: Arity::Range(1, 2),
             func: max,
         },
         Builtin {
             name: "min",
-            arity: Arity::Exact(2),
+            arity: Arity::Range(1, 2),
             func: min,
+        },
+        Builtin {
+            name: "ndim",
+            arity: Arity::Exact(1),
+            func: ndim,
+        },
+        Builtin {
+            name: "ones",
+            arity: Arity::Exact(1),
+            func: ones,
         },
         Builtin {
             name: "peek",
@@ -206,6 +237,21 @@ pub fn all() -> Vec<Builtin> {
             func: replace,
         },
         Builtin {
+            name: "reshape",
+            arity: Arity::Exact(2),
+            func: reshape,
+        },
+        Builtin {
+            name: "shape",
+            arity: Arity::Exact(1),
+            func: shape_of,
+        },
+        Builtin {
+            name: "size",
+            arity: Arity::Exact(1),
+            func: size_of,
+        },
+        Builtin {
             name: "split",
             arity: Arity::Exact(2),
             func: split,
@@ -231,6 +277,11 @@ pub fn all() -> Vec<Builtin> {
             func: sum,
         },
         Builtin {
+            name: "transpose",
+            arity: Arity::Exact(1),
+            func: transpose,
+        },
+        Builtin {
             name: "trim",
             arity: Arity::Exact(1),
             func: trim,
@@ -249,6 +300,11 @@ pub fn all() -> Vec<Builtin> {
             name: "write_file",
             arity: Arity::Exact(2),
             func: write_file,
+        },
+        Builtin {
+            name: "zeros",
+            arity: Arity::Exact(1),
+            func: zeros,
         },
     ]
 }
@@ -421,8 +477,40 @@ fn abs(
 }
 
 /// `min(a, b)` / `max(a, b)` — the smaller/larger of two numbers.
-/// Mixed int/float gives a float result.
+/// Mixed int/float gives a float result. With a single array
+/// argument, `min(a)` / `max(a)` is the smallest/largest element
+/// of the whole array.
 fn min_max(name: &str, args: &[Value], want_min: bool) -> Result<Value, RuntimeError> {
+    if args.len() == 1 {
+        let Value::Array(array) = &args[0] else {
+            return Err(RuntimeError::new(format!(
+                "{name}() expects two numbers or one Array"
+            )));
+        };
+        let borrowed = array.borrow();
+        let mut best: Option<Value> = None;
+        for item in borrowed.items.iter() {
+            let Some(x) = as_f64(item) else {
+                return Err(RuntimeError::new(format!(
+                    "{name}() expects numbers in the array, not {}",
+                    item.type_name()
+                )));
+            };
+            best = Some(match best {
+                None => item.clone(),
+                Some(current) => {
+                    let current_x = as_f64(&current).unwrap_or(f64::NAN);
+                    let take = if want_min {
+                        x < current_x
+                    } else {
+                        x > current_x
+                    };
+                    if take { item.clone() } else { current }
+                }
+            });
+        }
+        return best.ok_or_else(|| RuntimeError::new(format!("{name}() of empty array")));
+    }
     match (&args[0], &args[1]) {
         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(if want_min {
             (*a).min(*b)
@@ -688,9 +776,31 @@ fn file_exists(
 
 // ---- Phase 7: collections ----
 
+/// The argument as an array, or a clear error naming the builtin.
+fn as_array<'a>(name: &str, value: &'a Value) -> Result<&'a Rc<RefCell<ArrayData>>, RuntimeError> {
+    match value {
+        Value::Array(array) => Ok(array),
+        _ => Err(RuntimeError::new(format!(
+            "{name}() expects an Array, not {}",
+            value.type_name()
+        ))),
+    }
+}
+
+/// The argument as a number (f64), or a clear error naming the
+/// builtin.
+fn as_f64_named(name: &str, value: &Value) -> Result<f64, RuntimeError> {
+    as_f64(value).ok_or_else(|| {
+        RuntimeError::new(format!(
+            "{name}() expects numbers, not {}",
+            value.type_name()
+        ))
+    })
+}
+
 /// `array([1, 2, 3])` — a fixed-size array with the element type of
 /// the list's first element. An empty list has no type to infer and
-/// mixed types are an error.
+/// mixed types are an error. The array is 1D, with shape `[n]`.
 fn array(
     args: &[Value],
     _input: &mut dyn BufRead,
@@ -716,6 +826,7 @@ fn array(
     }
     Ok(Value::Array(Rc::new(RefCell::new(ArrayData {
         elem,
+        shape: vec![borrowed.len()],
         items: borrowed.clone(),
     }))))
 }
@@ -924,20 +1035,29 @@ fn is_a(
 /// `sum(list)` — the sum of a list of numbers. All integers give
 /// an integer (an overflow is an error); any float makes the
 /// result a float. An empty list or a non-number is an error.
+/// Also works on an array: the sum of all its elements.
 fn sum(
     args: &[Value],
     _input: &mut dyn BufRead,
     _out: &mut dyn Write,
 ) -> Result<Value, RuntimeError> {
-    let list = as_list("sum", &args[0])?;
-    let borrowed = list.borrow();
-    if borrowed.is_empty() {
+    let items: Vec<Value> = match &args[0] {
+        Value::List(list) => list.borrow().clone(),
+        Value::Array(array) => array.borrow().items.clone(),
+        other => {
+            return Err(RuntimeError::new(format!(
+                "sum() expects a List or an Array, not {}",
+                other.type_name()
+            )));
+        }
+    };
+    if items.is_empty() {
         return Err(RuntimeError::new("sum() of empty list"));
     }
     let mut int_total: i64 = 0;
     let mut float_total: f64 = 0.0;
     let mut is_float = false;
-    for item in borrowed.iter() {
+    for item in items.iter() {
         match item {
             Value::Int(n) => {
                 int_total = int_total
@@ -1054,4 +1174,204 @@ fn ends_with(
     let s = as_str("ends_with", &args[0])?;
     let suffix = as_str("ends_with", &args[1])?;
     Ok(Value::Bool(s.ends_with(suffix)))
+}
+
+// ---- Phase 11: N-dimensional numeric arrays ----
+
+/// `zeros(n)` / `zeros([r, c])` — an Int array of zeros with the
+/// given shape (an Int means the 1D shape `[n]`).
+fn zeros(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let shape = parse_shape(&args[0], "zeros")?;
+    check_shape_size(&shape, "zeros")?;
+    let total: usize = shape.iter().product();
+    Ok(make_array(
+        crate::value::ElemType::Int,
+        shape,
+        vec![Value::Int(0); total],
+    ))
+}
+
+/// `ones(n)` / `ones([r, c])` — an Int array of ones with the
+/// given shape.
+fn ones(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let shape = parse_shape(&args[0], "ones")?;
+    check_shape_size(&shape, "ones")?;
+    let total: usize = shape.iter().product();
+    Ok(make_array(
+        crate::value::ElemType::Int,
+        shape,
+        vec![Value::Int(1); total],
+    ))
+}
+
+/// `arange(n)` is `[0, 1, ..., n-1]`; `arange(a, b)` is
+/// `[a, ..., b-1]`; `arange(a, b, step)` steps by `step`
+/// (negative steps count down). A step of 0 is an error, and the
+/// result is capped like `range` (max 1000000 elements).
+fn arange(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let (start, end, step) = match args.len() {
+        1 => (0, as_int("arange", &args[0])?, 1),
+        2 => (as_int("arange", &args[0])?, as_int("arange", &args[1])?, 1),
+        _ => (
+            as_int("arange", &args[0])?,
+            as_int("arange", &args[1])?,
+            as_int("arange", &args[2])?,
+        ),
+    };
+    if step == 0 {
+        return Err(RuntimeError::new("arange() step must not be zero"));
+    }
+    // Element count in i128 so no overflow is possible.
+    let count: i128 = if step > 0 {
+        if end <= start {
+            0
+        } else {
+            (end as i128 - start as i128 + step as i128 - 1) / step as i128
+        }
+    } else if end >= start {
+        0
+    } else {
+        (start as i128 - end as i128 - step as i128 - 1) / (-step) as i128
+    };
+    if count > MAX_RANGE_LEN {
+        return Err(RuntimeError::new(
+            "arange() is too large (max 1000000 elements)",
+        ));
+    }
+    let mut values = Vec::with_capacity(count as usize);
+    for k in 0..count {
+        let value = start as i128 + k * step as i128;
+        values.push(Value::Int(value as i64));
+    }
+    let len = values.len();
+    Ok(make_array(crate::value::ElemType::Int, vec![len], values))
+}
+
+/// `linspace(a, b, n)` — `n` Float points evenly spaced from `a`
+/// to `b`, both ends included. `n` must be at least 1.
+fn linspace(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let a = as_f64_named("linspace", &args[0])?;
+    let b = as_f64_named("linspace", &args[1])?;
+    let n = as_int("linspace", &args[2])?;
+    if n <= 0 {
+        return Err(RuntimeError::new("linspace() needs at least 1 point"));
+    }
+    if n as i128 > MAX_RANGE_LEN {
+        return Err(RuntimeError::new(
+            "linspace() is too large (max 1000000 elements)",
+        ));
+    }
+    let mut values = Vec::with_capacity(n as usize);
+    if n == 1 {
+        values.push(Value::Float(a));
+    } else {
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64;
+            values.push(Value::Float(a + t * (b - a)));
+        }
+    }
+    Ok(make_array(
+        crate::value::ElemType::Float,
+        vec![n as usize],
+        values,
+    ))
+}
+
+/// `shape(a)` — the shape of an array as a list of Ints.
+fn shape_of(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let array = as_array("shape", &args[0])?;
+    let dims: Vec<Value> = array
+        .borrow()
+        .shape
+        .iter()
+        .map(|d| Value::Int(*d as i64))
+        .collect();
+    Ok(Value::List(Rc::new(RefCell::new(dims))))
+}
+
+/// `ndim(a)` — the number of dimensions of an array.
+fn ndim(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let array = as_array("ndim", &args[0])?;
+    Ok(Value::Int(array.borrow().ndim() as i64))
+}
+
+/// `size(a)` — the total number of elements of an array.
+fn size_of(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let array = as_array("size", &args[0])?;
+    Ok(Value::Int(array.borrow().size() as i64))
+}
+
+/// `dot(a, b)` — the scalar product of two 1D vectors.
+fn dot(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let a = as_array("dot", &args[0])?;
+    let b = as_array("dot", &args[1])?;
+    array::dot(&a.borrow(), &b.borrow())
+}
+
+/// `matmul(a, b)` — the matrix product: 2D x 2D, 1D x 2D and
+/// 2D x 1D. Two 1D vectors are an error (use `dot()`).
+fn matmul(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let a = as_array("matmul", &args[0])?;
+    let b = as_array("matmul", &args[1])?;
+    array::matmul(&a.borrow(), &b.borrow())
+}
+
+/// `transpose(a)` — swap the two axes of a 2D array; a 1D array
+/// is returned unchanged.
+fn transpose(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let a = as_array("transpose", &args[0])?;
+    array::transpose_array(&a.borrow())
+}
+
+/// `reshape(a, shape)` — the same items with a new shape (an Int
+/// means the 1D shape `[n]`); the total number of elements must
+/// stay the same.
+fn reshape(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let a = as_array("reshape", &args[0])?;
+    let shape = parse_shape(&args[1], "reshape")?;
+    array::reshape_array(&a.borrow(), shape)
 }

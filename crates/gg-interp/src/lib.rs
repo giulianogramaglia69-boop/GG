@@ -5,6 +5,7 @@
 //! the one-call pipeline (lex + parse + interpret) used by the `gg`
 //! binary and by the tests.
 
+pub mod array;
 pub mod builtin;
 pub mod env;
 pub mod error;
@@ -410,7 +411,8 @@ mod tests {
         assert_eq!(run_ok("print min(2.5, 2)\n"), "2\n");
         assert_eq!(run_ok("print max(2, 2.5)\n"), "2.5\n");
         assert!(run_err("print min(\"a\", 1)\n").contains("min() expects numbers"));
-        assert!(run_err("print max(1)\n").contains("max() expects 2 argument(s) but got 1"));
+        // One argument is the array form: a single number is an error.
+        assert!(run_err("print max(1)\n").contains("max() expects two numbers or one Array"));
     }
 
     #[test]
@@ -852,6 +854,227 @@ mod tests {
         assert!(
             run_err("let a = array([1])\npop(a)\n").contains("pop() expects a List or a Stack")
         );
+    }
+
+    // ---- Phase 11: N-dimensional numeric arrays ----
+
+    #[test]
+    fn nd_arrays_shape_ndim_size() {
+        // 2D display is nested, NumPy style.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m\n";
+        assert_eq!(run_ok(src), "array([[1, 2], [3, 4]])\n");
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint shape(m)\nprint ndim(m)\nprint size(m)\nprint len(m)\nprint type(m)\n";
+        assert_eq!(run_ok(src), "[2, 2]\n2\n4\n4\narray\n");
+        // 1D arrays keep their old shape and display.
+        let src =
+            "let a = array([1, 2, 3])\nprint shape(a)\nprint ndim(a)\nprint size(a)\nprint a\n";
+        assert_eq!(run_ok(src), "[3]\n1\n3\narray([1, 2, 3])\n");
+        // zeros and ones take an Int (1D) or a List shape.
+        assert_eq!(run_ok("print zeros(3)\n"), "array([0, 0, 0])\n");
+        assert_eq!(
+            run_ok("print zeros([2, 3])\n"),
+            "array([[0, 0, 0], [0, 0, 0]])\n"
+        );
+        assert_eq!(run_ok("print ones([2, 2])\n"), "array([[1, 1], [1, 1]])\n");
+        assert_eq!(run_ok("print shape(zeros([2, 3, 4]))\n"), "[2, 3, 4]\n");
+        assert_eq!(run_ok("print ndim(ones([2, 3, 4]))\n"), "3\n");
+        assert_eq!(run_ok("print size(ones([2, 3, 4]))\n"), "24\n");
+        // Bad shapes are errors.
+        assert!(run_err("print zeros(0)\n").contains("zeros() shape must be positive, not 0"));
+        assert!(
+            run_err("print zeros([2, -1])\n")
+                .contains("zeros() shape dimensions must be positive, not -1")
+        );
+        assert!(
+            run_err("print zeros([2, 1.5])\n")
+                .contains("zeros() shape dimensions must be integers, not Float")
+        );
+        assert!(run_err("print zeros([])\n").contains("zeros() shape must not be empty"));
+        assert!(
+            run_err("print zeros(\"x\")\n")
+                .contains("zeros() expects an Int or a List of Ints for the shape, not Str")
+        );
+        assert!(run_err("print shape([1])\n").contains("shape() expects an Array, not List"));
+    }
+
+    #[test]
+    fn two_dimensional_indexing() {
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m[0, 0]\nprint m[0, 1]\nprint m[1, 0]\nprint m[1, 1]\nprint m[-1, -1]\nprint m[-2, -2]\n";
+        assert_eq!(run_ok(src), "1\n2\n3\n4\n4\n1\n");
+        // One index on a 2D array is its row; chained indexing
+        // reaches the element.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m[0]\nprint m[1][0]\nprint m[0][-1]\n";
+        assert_eq!(run_ok(src), "array([1, 2])\n3\n2\n");
+        // Multi-index assignment.
+        let src = "let m = zeros([2, 2])\nm[0, 1] = 7\nm[1, 0] = 8\nprint m\n";
+        assert_eq!(run_ok(src), "array([[0, 7], [8, 0]])\n");
+        // Errors: out of range on either axis, wrong index count.
+        let src = "let m = zeros([2, 2])\nprint m[2, 0]\n";
+        assert!(run_err(src).contains("array index out of range"));
+        let src = "let m = zeros([2, 2])\nprint m[0, 2]\n";
+        assert!(run_err(src).contains("array index out of range"));
+        let src = "let m = zeros([2, 2])\nprint m[0, 1, 0]\n";
+        assert!(run_err(src).contains("array has 2 dimensions but got 3 indices"));
+        let src = "let m = zeros([2, 2])\nprint m[\"x\", 0]\n";
+        assert!(run_err(src).contains("array index must be an integer"));
+        let src = "let m = zeros([2, 2])\nm[0] = 5\n";
+        assert!(run_err(src).contains("array has 2 dimensions but got 1 indices"));
+        // A list still takes exactly one index.
+        assert!(run_err("print [1, 2][0, 1]\n").contains("list takes one index, not 2"));
+    }
+
+    #[test]
+    fn array_constructors_arange_and_linspace() {
+        assert_eq!(run_ok("print arange(4)\n"), "array([0, 1, 2, 3])\n");
+        assert_eq!(run_ok("print arange(2, 5)\n"), "array([2, 3, 4])\n");
+        assert_eq!(run_ok("print arange(0, 10, 3)\n"), "array([0, 3, 6, 9])\n");
+        assert_eq!(run_ok("print arange(5, 0, -2)\n"), "array([5, 3, 1])\n");
+        assert_eq!(run_ok("print arange(3, 3)\n"), "array([])\n");
+        assert_eq!(run_ok("print linspace(0, 1, 3)\n"), "array([0, 0.5, 1])\n");
+        assert_eq!(
+            run_ok("print linspace(0, 10, 5)\n"),
+            "array([0, 2.5, 5, 7.5, 10])\n"
+        );
+        assert_eq!(run_ok("print linspace(5, 5, 1)\n"), "array([5])\n");
+        assert_eq!(run_ok("print shape(arange(5))\n"), "[5]\n");
+        assert!(run_err("print arange(1, 5, 0)\n").contains("arange() step must not be zero"));
+        assert!(run_err("print linspace(0, 1, 0)\n").contains("linspace() needs at least 1 point"));
+        assert!(run_err("print linspace(0, 1, \"x\")\n").contains("linspace() expects an Int"));
+    }
+
+    #[test]
+    fn array_elementwise_arithmetic() {
+        // Array with array.
+        let src = "let a = array([1, 2, 3])\nlet b = array([10, 20, 30])\nprint a + b\nprint b - a\nprint a * b\nprint b / a\n";
+        assert_eq!(
+            run_ok(src),
+            "array([11, 22, 33])\narray([9, 18, 27])\narray([10, 40, 90])\narray([10, 10, 10])\n"
+        );
+        // Array with scalar, from both sides.
+        let src = "let a = array([1, 2, 3])\nprint a + 10\nprint 10 + a\nprint a * 2\nprint 2 * a\nprint a - 1\nprint 10 - a\nprint a / 2\n";
+        assert_eq!(
+            run_ok(src),
+            "array([11, 12, 13])\narray([11, 12, 13])\narray([2, 4, 6])\narray([2, 4, 6])\narray([0, 1, 2])\narray([9, 8, 7])\narray([0.5, 1, 1.5])\n"
+        );
+        // Int/float promotion, division always float.
+        let src = "let a = array([1, 2])\nprint a + 0.5\nprint a * 1.5\nprint type(a + 1)\nprint type(a + 0.5)\n";
+        assert_eq!(
+            run_ok(src),
+            "array([1.5, 2.5])\narray([1.5, 3])\narray\narray\n"
+        );
+        // 2D arithmetic works the same way.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint m + m\nprint m * 10\n";
+        assert_eq!(
+            run_ok(src),
+            "array([[2, 4], [6, 8]])\narray([[10, 20], [30, 40]])\n"
+        );
+        // Unary minus.
+        assert_eq!(run_ok("print -array([1, -2])\n"), "array([-1, 2])\n");
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint -m\n";
+        assert_eq!(run_ok(src), "array([[-1, -2], [-3, -4]])\n");
+        // Errors: shape mismatch, non-numeric arrays, bad scalar.
+        let src = "let a = array([1, 2])\nlet b = array([1, 2, 3])\nprint a + b\n";
+        assert!(run_err(src).contains("array shapes [2] and [3] do not match"));
+        let src = "let a = array([\"x\"])\nprint a + a\n";
+        assert!(run_err(src).contains("array operations require numbers, not array of Str"));
+        let src = "let a = array([1])\nprint a + \"x\"\n";
+        assert!(run_err(src).contains("cannot add Array and Str"));
+        let src = "let a = array([1])\nprint a / 0\n";
+        assert!(run_err(src).contains("division by zero"));
+    }
+
+    #[test]
+    fn dot_and_matmul() {
+        assert_eq!(
+            run_ok("print dot(array([1, 2, 3]), array([4, 5, 6]))\n"),
+            "32\n"
+        );
+        assert_eq!(
+            run_ok("print dot(array([1.5, 2.5]), array([2, 3]))\n"),
+            "10.5\n"
+        );
+        // The worked example: [[1,2],[3,4]] @ [[5,6],[7,8]].
+        let src = "let a = reshape(array([1, 2, 3, 4]), [2, 2])\nlet b = reshape(array([5, 6, 7, 8]), [2, 2])\nprint matmul(a, b)\n";
+        assert_eq!(run_ok(src), "array([[19, 22], [43, 50]])\n");
+        // Vector times matrix and matrix times vector.
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint matmul(array([1, 0]), m)\nprint matmul(m, array([1, 0]))\n";
+        assert_eq!(run_ok(src), "array([1, 2])\narray([1, 3])\n");
+        // Rotation by 90 degrees: (1, 0) becomes (0, 1).
+        let src = "let r = reshape(array([0, -1, 1, 0]), [2, 2])\nprint matmul(r, array([1, 0]))\n";
+        assert_eq!(run_ok(src), "array([0, 1])\n");
+        // Errors.
+        assert!(
+            run_err("print dot(array([1, 2]), array([1, 2, 3]))\n")
+                .contains("dot: vectors of length 2 and 3 do not match")
+        );
+        assert!(
+            run_err("print dot(zeros([2, 2]), zeros([2, 2]))\n")
+                .contains("dot() expects two 1D arrays (vectors)")
+        );
+        assert!(
+            run_err("print matmul(array([1, 2]), array([3, 4]))\n")
+                .contains("matmul() of two vectors: use dot() instead")
+        );
+        let src = "let a = reshape(array([1, 2, 3, 4, 5, 6]), [2, 3])\nlet b = reshape(array([1, 2, 3, 4]), [2, 2])\nprint matmul(a, b)\n";
+        assert!(run_err(src).contains("matmul: shapes [2, 3] and [2, 2] are incompatible"));
+        assert!(
+            run_err("print matmul(array([\"a\"]), array([\"b\"]))\n")
+                .contains("array operations require numbers, not array of Str")
+        );
+    }
+
+    #[test]
+    fn transpose_and_reshape() {
+        let src = "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nprint transpose(m)\n";
+        assert_eq!(run_ok(src), "array([[1, 3], [2, 4]])\n");
+        // A double transpose is the identity.
+        let src = "let m = reshape(array([1, 2, 3, 4, 5, 6]), [2, 3])\nprint transpose(transpose(m))\nprint m == transpose(transpose(m))\n";
+        assert_eq!(run_ok(src), "array([[1, 2, 3], [4, 5, 6]])\ntrue\n");
+        // A 1D array transposes to itself.
+        assert_eq!(
+            run_ok("print transpose(array([1, 2, 3]))\n"),
+            "array([1, 2, 3])\n"
+        );
+        assert_eq!(
+            run_ok("print reshape(array([1, 2, 3, 4]), [4, 1])\n"),
+            "array([[1], [2], [3], [4]])\n"
+        );
+        assert_eq!(
+            run_ok("print reshape(array([1, 2, 3, 4]), 4)\n"),
+            "array([1, 2, 3, 4])\n"
+        );
+        // Reshape keeps the element type and the items.
+        assert_eq!(
+            run_ok("print reshape(array([1.5, 2.5]), [1, 2])\n"),
+            "array([[1.5, 2.5]])\n"
+        );
+        assert!(
+            run_err("print reshape(array([1, 2, 3]), [2, 2])\n")
+                .contains("reshape: cannot reshape array of size 3 into shape [2, 2]")
+        );
+        assert!(
+            run_err("print reshape(array([1]), [0, 1])\n")
+                .contains("reshape() shape dimensions must be positive, not 0")
+        );
+        assert!(
+            run_err("print transpose(zeros([2, 2, 2]))\n")
+                .contains("transpose() supports 1D and 2D arrays only")
+        );
+    }
+
+    #[test]
+    fn sum_min_max_on_arrays() {
+        let src = "let m = reshape(array([3, 1, 4, 2]), [2, 2])\nprint sum(m)\nprint min(m)\nprint max(m)\n";
+        assert_eq!(run_ok(src), "10\n1\n4\n");
+        assert_eq!(run_ok("print sum(array([1.5, 2.5]))\n"), "4\n");
+        assert_eq!(run_ok("print min(array([1.5, 2.5]))\n"), "1.5\n");
+        assert_eq!(run_ok("print max(array([1.5, 2.5]))\n"), "2.5\n");
+        // The two-argument forms still work.
+        assert_eq!(run_ok("print min(3, 7)\n"), "3\n");
+        assert_eq!(run_ok("print max(3, 7)\n"), "7\n");
+        assert_eq!(run_ok("print min(2.5, 2)\n"), "2\n");
+        assert!(run_err("print min(5)\n").contains("min() expects two numbers or one Array"));
+        assert!(run_err("print sum(array([\"a\"]))\n").contains("sum() expects numbers, not Str"));
     }
 
     #[test]
