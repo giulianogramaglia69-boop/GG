@@ -19,11 +19,27 @@ use std::rc::Rc;
 use crate::array::{self, check_shape_size, fmt_shape, make_array, parse_shape};
 use crate::env::Environment;
 use crate::error::RuntimeError;
+use crate::interp::Interpreter;
 use crate::value::{ArrayData, ElemType, Value, elem_type_of, values_equal};
 
 /// A builtin function implementation: evaluated arguments, an input
 /// reader and an output writer.
 pub type BuiltinFn = fn(&[Value], &mut dyn BufRead, &mut dyn Write) -> Result<Value, RuntimeError>;
+
+/// A builtin function implementation that also gets the interpreter,
+/// so it can call back into GG code (a frame function, a layout
+/// callback). Only the `gui` module uses this: every other builtin
+/// is `Plain`.
+pub type InterpFn =
+    fn(&mut Interpreter, &[Value], &mut dyn BufRead, &mut dyn Write) -> Result<Value, RuntimeError>;
+
+/// What is behind a builtin: a plain Rust function, or one that
+/// needs the interpreter to call GG code back.
+#[derive(Debug, Clone, Copy)]
+pub enum BuiltinFunc {
+    Plain(BuiltinFn),
+    WithInterp(InterpFn),
+}
 
 /// How many arguments a builtin takes: an exact count, or a range
 /// (e.g. `range` takes 1 or 2).
@@ -56,7 +72,7 @@ impl Arity {
 pub struct Builtin {
     pub name: &'static str,
     pub arity: Arity,
-    pub func: BuiltinFn,
+    pub func: BuiltinFunc,
 }
 
 // Comparing function pointers is meaningless (their addresses are
@@ -74,242 +90,242 @@ pub fn all() -> Vec<Builtin> {
         Builtin {
             name: "abs",
             arity: Arity::Exact(1),
-            func: abs,
+            func: BuiltinFunc::Plain(abs),
         },
         Builtin {
             name: "append_file",
             arity: Arity::Exact(2),
-            func: append_file,
+            func: BuiltinFunc::Plain(append_file),
         },
         Builtin {
             name: "arange",
             arity: Arity::Range(1, 3),
-            func: arange,
+            func: BuiltinFunc::Plain(arange),
         },
         Builtin {
             name: "array",
             arity: Arity::Exact(1),
-            func: array,
+            func: BuiltinFunc::Plain(array),
         },
         Builtin {
             name: "contains",
             arity: Arity::Exact(2),
-            func: contains,
+            func: BuiltinFunc::Plain(contains),
         },
         Builtin {
             name: "dequeue",
             arity: Arity::Exact(1),
-            func: dequeue,
+            func: BuiltinFunc::Plain(dequeue),
         },
         Builtin {
             name: "dot",
             arity: Arity::Exact(2),
-            func: dot,
+            func: BuiltinFunc::Plain(dot),
         },
         Builtin {
             name: "enqueue",
             arity: Arity::Exact(2),
-            func: enqueue,
+            func: BuiltinFunc::Plain(enqueue),
         },
         Builtin {
             name: "ends_with",
             arity: Arity::Exact(2),
-            func: ends_with,
+            func: BuiltinFunc::Plain(ends_with),
         },
         Builtin {
             name: "file_exists",
             arity: Arity::Exact(1),
-            func: file_exists,
+            func: BuiltinFunc::Plain(file_exists),
         },
         Builtin {
             name: "float",
             arity: Arity::Exact(1),
-            func: float,
+            func: BuiltinFunc::Plain(float),
         },
         Builtin {
             name: "input",
             arity: Arity::Exact(1),
-            func: input,
+            func: BuiltinFunc::Plain(input),
         },
         Builtin {
             name: "int",
             arity: Arity::Exact(1),
-            func: int,
+            func: BuiltinFunc::Plain(int),
         },
         Builtin {
             name: "is_a",
             arity: Arity::Exact(2),
-            func: is_a,
+            func: BuiltinFunc::Plain(is_a),
         },
         Builtin {
             name: "join",
             arity: Arity::Exact(2),
-            func: join,
+            func: BuiltinFunc::Plain(join),
         },
         Builtin {
             name: "keys",
             arity: Arity::Exact(1),
-            func: keys,
+            func: BuiltinFunc::Plain(keys),
         },
         Builtin {
             name: "len",
             arity: Arity::Exact(1),
-            func: len,
+            func: BuiltinFunc::Plain(len),
         },
         Builtin {
             name: "lines",
             arity: Arity::Exact(1),
-            func: lines,
+            func: BuiltinFunc::Plain(lines),
         },
         Builtin {
             name: "linspace",
             arity: Arity::Exact(3),
-            func: linspace,
+            func: BuiltinFunc::Plain(linspace),
         },
         Builtin {
             name: "list",
             arity: Arity::Exact(1),
-            func: list_of,
+            func: BuiltinFunc::Plain(list_of),
         },
         Builtin {
             name: "lower",
             arity: Arity::Exact(1),
-            func: lower,
+            func: BuiltinFunc::Plain(lower),
         },
         Builtin {
             name: "matmul",
             arity: Arity::Exact(2),
-            func: matmul,
+            func: BuiltinFunc::Plain(matmul),
         },
         Builtin {
             name: "max",
             arity: Arity::Range(1, 2),
-            func: max,
+            func: BuiltinFunc::Plain(max),
         },
         Builtin {
             name: "min",
             arity: Arity::Range(1, 2),
-            func: min,
+            func: BuiltinFunc::Plain(min),
         },
         Builtin {
             name: "ndim",
             arity: Arity::Exact(1),
-            func: ndim,
+            func: BuiltinFunc::Plain(ndim),
         },
         Builtin {
             name: "ones",
             arity: Arity::Exact(1),
-            func: ones,
+            func: BuiltinFunc::Plain(ones),
         },
         Builtin {
             name: "peek",
             arity: Arity::Exact(1),
-            func: peek,
+            func: BuiltinFunc::Plain(peek),
         },
         Builtin {
             name: "pop",
             arity: Arity::Exact(1),
-            func: pop,
+            func: BuiltinFunc::Plain(pop),
         },
         Builtin {
             name: "push",
             arity: Arity::Exact(2),
-            func: push,
+            func: BuiltinFunc::Plain(push),
         },
         Builtin {
             name: "queue",
             arity: Arity::Range(0, 1),
-            func: queue_of,
+            func: BuiltinFunc::Plain(queue_of),
         },
         Builtin {
             name: "range",
             arity: Arity::Range(1, 2),
-            func: range,
+            func: BuiltinFunc::Plain(range),
         },
         Builtin {
             name: "read_file",
             arity: Arity::Exact(1),
-            func: read_file,
+            func: BuiltinFunc::Plain(read_file),
         },
         Builtin {
             name: "replace",
             arity: Arity::Exact(3),
-            func: replace,
+            func: BuiltinFunc::Plain(replace),
         },
         Builtin {
             name: "reshape",
             arity: Arity::Exact(2),
-            func: reshape,
+            func: BuiltinFunc::Plain(reshape),
         },
         Builtin {
             name: "shape",
             arity: Arity::Exact(1),
-            func: shape_of,
+            func: BuiltinFunc::Plain(shape_of),
         },
         Builtin {
             name: "size",
             arity: Arity::Exact(1),
-            func: size_of,
+            func: BuiltinFunc::Plain(size_of),
         },
         Builtin {
             name: "split",
             arity: Arity::Exact(2),
-            func: split,
+            func: BuiltinFunc::Plain(split),
         },
         Builtin {
             name: "stack",
             arity: Arity::Range(0, 1),
-            func: stack_of,
+            func: BuiltinFunc::Plain(stack_of),
         },
         Builtin {
             name: "starts_with",
             arity: Arity::Exact(2),
-            func: starts_with,
+            func: BuiltinFunc::Plain(starts_with),
         },
         Builtin {
             name: "str",
             arity: Arity::Exact(1),
-            func: str_of,
+            func: BuiltinFunc::Plain(str_of),
         },
         Builtin {
             name: "sum",
             arity: Arity::Exact(1),
-            func: sum,
+            func: BuiltinFunc::Plain(sum),
         },
         Builtin {
             name: "transpose",
             arity: Arity::Exact(1),
-            func: transpose,
+            func: BuiltinFunc::Plain(transpose),
         },
         Builtin {
             name: "trim",
             arity: Arity::Exact(1),
-            func: trim,
+            func: BuiltinFunc::Plain(trim),
         },
         Builtin {
             name: "type",
             arity: Arity::Exact(1),
-            func: type_of,
+            func: BuiltinFunc::Plain(type_of),
         },
         Builtin {
             name: "upper",
             arity: Arity::Exact(1),
-            func: upper,
+            func: BuiltinFunc::Plain(upper),
         },
         Builtin {
             name: "where",
             arity: Arity::Exact(3),
-            func: where_select,
+            func: BuiltinFunc::Plain(where_select),
         },
         Builtin {
             name: "write_file",
             arity: Arity::Exact(2),
-            func: write_file,
+            func: BuiltinFunc::Plain(write_file),
         },
         Builtin {
             name: "zeros",
             arity: Arity::Exact(1),
-            func: zeros,
+            func: BuiltinFunc::Plain(zeros),
         },
     ]
 }

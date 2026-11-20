@@ -1,0 +1,32 @@
+import gui
+
+let count = 0
+let frame = 0
+let name = "Giuliano"
+let size = 5
+let loud = false
+
+fn riga()
+    gui.label("Nome:")
+    name = gui.text_input("nome", name)
+end
+
+fn draw()
+    frame = frame + 1
+    gui.heading("Contatore GG")
+    gui.label("Conteggio: " + str(count))
+    if gui.button("Incrementa") then
+        count = count + 1
+    end
+    gui.separator()
+    gui.horizontal(riga)
+    size = gui.slider("size", size, 1, 10)
+    gui.label("Size: " + str(size))
+    loud = gui.checkbox("loud", "Forte", loud)
+    if frame >= 60 then
+        return false
+    end
+end
+
+gui.run("Demo GG", draw)
+print "finestra chiusa dopo " + str(frame) + " frame, conteggio " + str(count)

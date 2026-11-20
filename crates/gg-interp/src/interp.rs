@@ -19,7 +19,7 @@ use std::rc::Rc;
 use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 
 use crate::array::{self, ArrayOp, CompareOp, flat_index, subarray};
-use crate::builtin;
+use crate::builtin::{self, BuiltinFunc};
 use crate::env::Environment;
 use crate::error::RuntimeError;
 use crate::slice::{AxisSelector, IndexArg, SliceSpec};
@@ -51,6 +51,11 @@ enum Flow {
 /// the embedded stdlib modules (by name: they have no file), and
 /// `native_cache` holds the native modules (`math`, `random`),
 /// built once and shared by every import.
+///
+/// `gui_running` is true while a `gui.run()` window is open: a
+/// frame function calling `gui.run()` again is an error (eframe
+/// cannot nest event loops), and the flag is cleared when the
+/// window closes, success or failure.
 pub struct Interpreter {
     globals: Rc<Environment>,
     super_stack: Vec<Rc<ClassDef>>,
@@ -60,6 +65,8 @@ pub struct Interpreter {
     embedded_cache: HashMap<String, Value>,
     loading_embedded: Vec<String>,
     native_cache: HashMap<String, Value>,
+    #[cfg(feature = "gui")]
+    pub(crate) gui_running: bool,
 }
 
 impl Default for Interpreter {
@@ -81,6 +88,8 @@ impl Interpreter {
             embedded_cache: HashMap::new(),
             loading_embedded: Vec::new(),
             native_cache: HashMap::new(),
+            #[cfg(feature = "gui")]
+            gui_running: false,
         }
     }
 
@@ -538,7 +547,10 @@ impl Interpreter {
     /// Call any callable value with already-evaluated arguments:
     /// a user function, a builtin, a bound method, or a class
     /// (which creates an instance).
-    fn call_value(
+    /// Call any callable value (a GG function, a builtin, a bound
+    /// method, a class): the single entry point the GUI module uses
+    /// to run frame functions and layout callbacks.
+    pub(crate) fn call_value(
         &mut self,
         callee: &Value,
         args: Vec<Value>,
@@ -571,7 +583,13 @@ impl Interpreter {
                 if builtin.name == "str" && matches!(args.first(), Some(Value::Instance(_))) {
                     return Ok(Value::Str(self.display(&args[0], input, out)?));
                 }
-                (builtin.func)(&args, input, out)
+                // Plain builtins are Rust functions; `WithInterp`
+                // builtins (the `gui` module) get the interpreter
+                // so they can call GG code back.
+                match &builtin.func {
+                    BuiltinFunc::Plain(func) => func(&args, input, out),
+                    BuiltinFunc::WithInterp(func) => func(self, &args, input, out),
+                }
             }
             Value::BoundMethod(bound) => self.call_method(bound, args, input, out),
             Value::Class(class) => self.construct(class, args, input, out),

@@ -6,6 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 description = "Tree-walking interpreter for the GG programming language"
 
+[features]
+# The `gui` native module (egui + eframe) is on by default: `gg run`
+# on a GUI script just works. Turn it off for a headless library
+# build (`cargo test -p gg-interp --no-default-features`) — then
+# `import gui` fails with the usual "module not found" error.
+# Note: `cargo test --workspace --no-default-features` does NOT
+# turn it off — the `gg` binary depends on gg-interp with its
+# default features, and Cargo unifies features across the
+# workspace, so the binary always enables `gui`.
+default = ["gui"]
+gui = ["dep:eframe"]
+
 [dependencies]
 gg-lexer = { path = "../gg-lexer" }
 gg-parser = { path = "../gg-parser" }
+eframe = { version = "0.37", optional = true }

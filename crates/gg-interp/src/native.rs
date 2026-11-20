@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::builtin::{Arity, Builtin, BuiltinFn};
+use crate::builtin::{Arity, Builtin, BuiltinFn, BuiltinFunc};
 use crate::env::Environment;
 use crate::error::RuntimeError;
 use crate::value::{ModuleData, Value};
@@ -35,6 +35,11 @@ pub fn build(name: &str) -> Option<Value> {
             }
         }
         "random" => define_functions(&env, RANDOM_FUNCTIONS),
+        // The GUI module lives in `gui.rs`: it needs the
+        // interpreter to call frame functions back, so its
+        // functions are `WithInterp` builtins, not plain ones.
+        #[cfg(feature = "gui")]
+        "gui" => return Some(crate::gui::build()),
         _ => return None,
     }
     Some(Value::Module(Rc::new(ModuleData {
@@ -54,7 +59,7 @@ fn define_functions(env: &Environment, functions: &[NativeFn]) {
             Value::Builtin(Rc::new(Builtin {
                 name,
                 arity: *arity,
-                func: *func,
+                func: BuiltinFunc::Plain(*func),
             })),
         );
     }

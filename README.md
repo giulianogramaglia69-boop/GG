@@ -56,6 +56,13 @@ whole arrays (see the N-dimensional arrays section below).
 rules, always a copy); element-wise comparisons returning Bool
 arrays; boolean indexing `a[mask]`; `where(cond, a, b)`; slice
 assignment on lists and 1D arrays (see the Slicing section
+below). **Phase 13 — graphical interfaces: done.** A native
+`gui` module (egui + eframe, behind the `gui` Cargo feature,
+on by default): `gui.run(titolo, fn)` opens a window and calls
+the GG frame function once per frame until it returns `false`;
+widgets (`heading`, `label`, `separator`, `button`,
+`text_input`, `slider`, `checkbox`, `horizontal`) are called
+inside the frame function (see the Graphical interfaces section
 below).
 
 ## The REPL
@@ -830,6 +837,123 @@ Sopra 5, altrimenti zero:
 array([[0, 0, 0], [0, 0, 6], [7, 8, 9]])
 ```
 
+## Graphical interfaces (`gui`)
+
+Phase 13 adds windows: a native `gui` module built on egui 0.37
++ eframe 0.37 (immediate mode). The module lives behind the
+`gui` Cargo feature, which is on by default — a headless library
+build is `cargo test -p gg-interp --no-default-features`, and
+then `import gui` fails with the usual "module not found" error.
+(The `gg` binary always enables the feature, so
+`--workspace --no-default-features` does not turn it off:
+Cargo unifies features across the workspace.)
+
+How it works: `gui.run(titolo, fn)` opens a window and enters
+the event loop, calling the GG function `fn` (no arguments)
+once per frame. The function builds the UI by calling widget
+functions in order — there is no widget tree to keep in sync
+with GG state, the script just redraws everything every frame.
+When the frame function returns `false`, the window closes and
+`gui.run` returns `nil`; closing the window with the X button
+does the same. A runtime error inside the frame function also
+closes the window, and `gui.run` reports the error. Variables
+defined outside the frame function stay visible and mutable
+inside it: the frame function is an ordinary GG closure.
+
+**The `gui` API:**
+
+| Function | Description |
+| --- | --- |
+| `gui.run(titolo, fn)` | Open a window titled `titolo`, run the loop, return `nil` when it closes |
+| `gui.heading(testo)` | A large bold label |
+| `gui.label(testo)` | A plain label |
+| `gui.separator()` | A horizontal line |
+| `gui.button(testo)` | A button; returns `true` only in the frame where it is clicked |
+| `gui.text_input(id, valore)` | A single-line text field; returns the text after this frame (reassign it to the variable) |
+| `gui.slider(id, valore, min, max)` | A numeric slider; returns the value after this frame (a Float) |
+| `gui.checkbox(id, testo, valore)` | A checkbox with a label; returns the state after this frame |
+| `gui.horizontal(fn)` | Run the GG function `fn` laying out the widgets it creates horizontally instead of vertically |
+
+`text_input`, `slider` and `checkbox` take a stable string `id`:
+egui keeps the cursor, the edit state and the drag state under
+that id, so the widget keeps its state across frames even when
+the layout changes. Two widgets with the same `id` share state —
+give each one its own id.
+
+**Example** — a counter app (`examples/gui_demo.gg`); it closes
+by itself after about 60 frames:
+
+```gg
+import gui
+
+let count = 0
+let frame = 0
+let name = "Giuliano"
+let size = 5
+let loud = false
+
+fn riga()
+    gui.label("Nome:")
+    name = gui.text_input("nome", name)
+end
+
+fn draw()
+    frame = frame + 1
+    gui.heading("Contatore GG")
+    gui.label("Conteggio: " + str(count))
+    if gui.button("Incrementa") then
+        count = count + 1
+    end
+    gui.separator()
+    gui.horizontal(riga)
+    size = gui.slider("size", size, 1, 10)
+    gui.label("Size: " + str(size))
+    loud = gui.checkbox("loud", "Forte", loud)
+    if frame >= 60 then
+        return false
+    end
+end
+
+gui.run("Demo GG", draw)
+print "finestra chiusa dopo " + str(frame) + " frame, conteggio " + str(count)
+```
+
+Output (headless, under Xvfb):
+
+```
+finestra chiusa dopo 61 frame, conteggio 0
+```
+
+(The frame function returns `false` at frame 60; eframe runs
+one more frame before the window actually closes.)
+
+**How it is wired in:** `gui` is a native module like `math`
+and `random` (a user file named `gui.gg` wins over it, like any
+native module), but `gui.run` and `gui.horizontal` need the
+interpreter to call GG functions back, and plain builtins do
+not receive it. So builtins come in two kinds now:
+`BuiltinFunc::Plain` (the old `BuiltinFn`) and
+`BuiltinFunc::WithInterp` (a function that also takes
+`&mut Interpreter`); the interpreter dispatches on the kind in
+`call_value`. The current `egui::Ui` travels in a thread-local,
+installed by a guard while the frame function runs — widgets
+called outside a frame function are a clear runtime error, not
+a panic. `GuiApp` holds the interpreter as a raw pointer while
+eframe owns the app for the whole event loop (eframe cannot
+borrow it and hand it back); GG is single-threaded, the
+pointers are only dereferenced while `run_native` runs, and a
+nested `gui.run` is an error. The frame loop repaints
+continuously (no frame-rate control in v0.1 — keep frame
+functions light).
+
+**Honest limits (v0.1):** a display is required — on a machine
+with no display `gui.run` fails with a clear error (on Linux it
+checks `DISPLAY`/`WAYLAND_DISPLAY` first); on this VM the live
+test runs under Xvfb with the lavapipe software Vulkan driver,
+and the first real interactive test is on a laptop. One window
+only, no menus, no canvas/images, no themes, no multiple
+windows, and no frame-rate control yet.
+
 ## Grammar
 
 ```text
@@ -966,6 +1090,13 @@ exit with code 1.
     returning Bool arrays; boolean indexing `a[mask]`;
     `where(cond, a, b)`; slice assignment on lists and 1D arrays
     (same length required)
+13. **Graphical interfaces** ✅ — native `gui` module
+    (egui 0.37 + eframe 0.37, `gui` Cargo feature, on by
+    default): `gui.run(titolo, fn)` opens a window and calls
+    the GG frame function every frame until it returns `false`;
+    widgets `heading`/`label`/`separator`/`button`/`text_input`/
+    `slider`/`checkbox`/`horizontal`, called inside the frame
+    function in order, vertical layout by default
 
 Next: a `linalg` module (`solve`/`det`/`inv`).
 

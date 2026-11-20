@@ -9,6 +9,8 @@ pub mod array;
 pub mod builtin;
 pub mod env;
 pub mod error;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod interp;
 pub mod native;
 pub mod repl;
@@ -2234,5 +2236,44 @@ mod tests {
         let src = "import stats\nprint stats.mean([1, 2, 3])\n";
         assert_eq!(run_with(src, Some(dir.clone()), vec![]), "42\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- gui (Phase 13): error paths only — opening a real
+    // window is verified by hand under Xvfb, never in `cargo test`.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_module_type_and_widgets_outside_a_frame() {
+        assert_eq!(run_ok("import gui\nprint type(gui)\n"), "module\n");
+        // A widget outside `gui.run` is a runtime error, not a panic.
+        assert!(run_err("import gui\ngui.button(\"x\")\n").contains("inside a frame function"));
+        assert!(run_err("import gui\ngui.heading(\"x\")\n").contains("inside a frame function"));
+        assert!(run_err("import gui\ngui.label(\"x\")\n").contains("inside a frame function"));
+        assert!(run_err("import gui\ngui.separator()\n").contains("inside a frame function"));
+        assert!(
+            run_err("import gui\ngui.text_input(\"id\", \"v\")\n")
+                .contains("inside a frame function")
+        );
+        assert!(
+            run_err("import gui\ngui.slider(\"id\", 1, 0, 2)\n")
+                .contains("inside a frame function")
+        );
+        assert!(
+            run_err("import gui\ngui.checkbox(\"id\", \"t\", true)\n")
+                .contains("inside a frame function")
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_run_and_horizontal_validate_arguments() {
+        // `gui.run` with a non-string title.
+        assert!(run_err("import gui\ngui.run(1, 2)\n").contains("gui.run()"));
+        // `gui.run` with a second argument that is not callable.
+        assert!(run_err("import gui\ngui.run(\"T\", 42)\n").contains("expects a function"));
+        // `gui.horizontal` outside a frame.
+        assert!(
+            run_err("import gui\nfn f()\nend\ngui.horizontal(f)\n")
+                .contains("inside a frame function")
+        );
     }
 }
