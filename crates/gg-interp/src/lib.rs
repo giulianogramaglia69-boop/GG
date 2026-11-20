@@ -9,7 +9,9 @@ pub mod builtin;
 pub mod env;
 pub mod error;
 pub mod interp;
+pub mod native;
 pub mod repl;
+pub mod stdlib;
 pub mod value;
 pub mod venv;
 
@@ -1522,6 +1524,225 @@ mod tests {
             run_with(src, Some(dir.clone()), vec![]),
             "Fido\nbau\ntrue\ntrue\nCane\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 10: standard library ----
+
+    #[test]
+    fn new_string_builtins() {
+        assert_eq!(run_ok("print sum([1, 2, 3])\n"), "6\n");
+        assert_eq!(run_ok("print sum([1.5, 2])\n"), "3.5\n");
+        assert_eq!(run_ok("print type(sum([1, 2]))\n"), "int\n");
+        assert_eq!(run_ok("print type(sum([1.5]))\n"), "float\n");
+        assert!(run_err("print sum([])\n").contains("sum() of empty list"));
+        assert!(run_err("print sum([1, \"a\"])\n").contains("sum() expects numbers"));
+        assert!(run_err("print sum(5)\n").contains("sum() expects a List"));
+        assert_eq!(run_ok("print join(\", \", [\"a\", \"b\"])\n"), "a, b\n");
+        assert_eq!(run_ok("print join(\"-\", [])\n"), "\n");
+        assert_eq!(run_ok("print join(\"\", [\"a\", \"b\"])\n"), "ab\n");
+        // join is the inverse of split.
+        assert_eq!(
+            run_ok("print join(\",\", split(\"a,b,c\", \",\"))\n"),
+            "a,b,c\n"
+        );
+        assert!(run_err("print join(\",\", [1, 2])\n").contains("join() expects a List of Str"));
+        assert!(run_err("print join(5, [\"a\"])\n").contains("join() expects a Str"));
+        assert_eq!(run_ok("print upper(\"ciao\")\n"), "CIAO\n");
+        assert_eq!(run_ok("print upper(\"è\")\n"), "È\n");
+        assert_eq!(run_ok("print lower(\"CIAO\")\n"), "ciao\n");
+        assert_eq!(run_ok("print lower(\"È\")\n"), "è\n");
+        assert_eq!(run_ok("print trim(\"  x  \")\n"), "x\n");
+        assert_eq!(run_ok("print trim(\"\\n\\tx\\n\")\n"), "x\n");
+        assert_eq!(run_ok("print trim(\"xx\")\n"), "xx\n");
+        assert_eq!(run_ok("print replace(\"aaa\", \"a\", \"b\")\n"), "bbb\n");
+        assert_eq!(run_ok("print replace(\"ciao\", \"z\", \"q\")\n"), "ciao\n");
+        assert!(
+            run_err("print replace(\"a\", \"\", \"b\")\n")
+                .contains("replace() old string must not be empty")
+        );
+        assert_eq!(run_ok("print starts_with(\"ciao\", \"ci\")\n"), "true\n");
+        assert_eq!(run_ok("print starts_with(\"ciao\", \"ao\")\n"), "false\n");
+        assert_eq!(run_ok("print ends_with(\"ciao\", \"ao\")\n"), "true\n");
+        assert_eq!(run_ok("print ends_with(\"ciao\", \"ci\")\n"), "false\n");
+        assert_eq!(run_ok("print starts_with(\"\", \"\")\n"), "true\n");
+        assert!(run_err("print upper(5)\n").contains("upper() expects a Str"));
+        assert!(run_err("print lower(5)\n").contains("lower() expects a Str"));
+        assert!(run_err("print trim(5)\n").contains("trim() expects a Str"));
+        assert!(run_err("print starts_with(\"a\", 1)\n").contains("starts_with() expects a Str"));
+        assert!(run_err("print ends_with(1, \"a\")\n").contains("ends_with() expects a Str"));
+    }
+
+    #[test]
+    fn math_module_exact_values() {
+        assert_eq!(run_ok("import math\nprint math.sqrt(16)\n"), "4\n");
+        assert_eq!(run_ok("import math\nprint math.sqrt(2.25)\n"), "1.5\n");
+        assert_eq!(run_ok("import math\nprint math.floor(3.7)\n"), "3\n");
+        assert_eq!(run_ok("import math\nprint math.floor(-3.2)\n"), "-4\n");
+        assert_eq!(run_ok("import math\nprint math.ceil(3.2)\n"), "4\n");
+        assert_eq!(run_ok("import math\nprint math.ceil(-3.7)\n"), "-3\n");
+        // Halves round away from zero.
+        assert_eq!(run_ok("import math\nprint math.round(2.5)\n"), "3\n");
+        assert_eq!(run_ok("import math\nprint math.round(-2.5)\n"), "-3\n");
+        assert_eq!(run_ok("import math\nprint math.round(2.4)\n"), "2\n");
+        assert_eq!(run_ok("import math\nprint math.round(2.6)\n"), "3\n");
+        // floor/ceil/round return Int.
+        assert_eq!(
+            run_ok("import math\nprint type(math.floor(3.7))\n"),
+            "int\n"
+        );
+        assert_eq!(
+            run_ok("import math\nprint type(math.round(2.5))\n"),
+            "int\n"
+        );
+        // pow: two ints give an exact int.
+        assert_eq!(run_ok("import math\nprint math.pow(2, 10)\n"), "1024\n");
+        assert_eq!(
+            run_ok("import math\nprint type(math.pow(2, 10))\n"),
+            "int\n"
+        );
+        assert_eq!(run_ok("import math\nprint math.pow(2, -1)\n"), "0.5\n");
+        assert_eq!(run_ok("import math\nprint math.pow(9, 0.5)\n"), "3\n");
+        assert_eq!(run_ok("import math\nprint math.sin(0)\n"), "0\n");
+        assert_eq!(run_ok("import math\nprint math.cos(0)\n"), "1\n");
+        assert_eq!(run_ok("import math\nprint math.tan(0)\n"), "0\n");
+        assert_eq!(run_ok("import math\nprint math.log(1)\n"), "0\n");
+        assert_eq!(run_ok("import math\nprint math.exp(0)\n"), "1\n");
+        // Constants and type.
+        assert_eq!(
+            run_ok("import math\nprint math.PI\n"),
+            "3.141592653589793\n"
+        );
+        assert_eq!(run_ok("import math\nprint math.E\n"), "2.718281828459045\n");
+        assert_eq!(run_ok("import math\nprint type(math)\n"), "module\n");
+        assert_eq!(run_ok("import math\nprint math\n"), "<module math>\n");
+        // math.PI is between 3.14 and 3.15.
+        assert_eq!(
+            run_ok("import math\nprint math.PI > 3.14 and math.PI < 3.15\n"),
+            "true\n"
+        );
+        // Errors.
+        assert!(
+            run_err("import math\nprint math.sqrt(-1)\n")
+                .contains("math.sqrt() of a negative number")
+        );
+        assert!(
+            run_err("import math\nprint math.log(0)\n")
+                .contains("math.log() of a non-positive number")
+        );
+        assert!(
+            run_err("import math\nprint math.sqrt(\"a\")\n")
+                .contains("math.sqrt() expects a number")
+        );
+        assert!(run_err("import math\nprint math.pow(2, 63)\n").contains("integer overflow"));
+        assert!(run_err("import math\nprint math.nope\n").contains("has no attribute 'nope'"));
+        // Two imports return the same module value.
+        assert_eq!(
+            run_ok("import math\nimport math as m2\nprint math == m2\n"),
+            "true\n"
+        );
+    }
+
+    #[test]
+    fn random_module_stays_in_range() {
+        // 200 draws, every one inside the interval (both ends
+        // included: the program prints OUT only on a violation).
+        let src = "import random\nfor i = 1 to 200 then\n    let r = random.randint(1, 6)\n    if r < 1 or r > 6 then\n        print \"OUT\"\n    end\nend\nprint \"ok\"\n";
+        assert_eq!(run_ok(src), "ok\n");
+        // A single-value interval always gives that value.
+        assert_eq!(run_ok("import random\nprint random.randint(5, 5)\n"), "5\n");
+        // Negative intervals work too.
+        let src = "import random\nfor i = 1 to 100 then\n    let r = random.randint(-3, -1)\n    if r < -3 or r > -1 then\n        print \"OUT\"\n    end\nend\nprint \"ok\"\n";
+        assert_eq!(run_ok(src), "ok\n");
+        assert!(
+            run_err("import random\nprint random.randint(5, 1)\n")
+                .contains("random.randint() expects a <= b")
+        );
+        // random() is a float in [0, 1).
+        let src = "import random\nfor i = 1 to 100 then\n    let r = random.random()\n    if r < 0 or r >= 1 then\n        print \"OUT\"\n    end\nend\nprint type(random.random())\nprint \"ok\"\n";
+        assert_eq!(run_ok(src), "float\nok\n");
+        // choice returns an element of the list.
+        let src = "import random\nfor i = 1 to 100 then\n    let c = random.choice([10, 20, 30])\n    if c != 10 and c != 20 and c != 30 then\n        print \"OUT\"\n    end\nend\nprint \"ok\"\n";
+        assert_eq!(run_ok(src), "ok\n");
+        assert!(
+            run_err("import random\nprint random.choice([])\n")
+                .contains("random.choice() on empty list")
+        );
+        assert!(
+            run_err("import random\nprint random.choice(5)\n")
+                .contains("random.choice() expects a List")
+        );
+        // shuffle keeps the same elements and returns nil.
+        let src = "import random\nlet xs = [1, 2, 3, 4, 5]\nprint random.shuffle(xs)\nprint len(xs)\nprint contains(xs, 1)\nprint contains(xs, 2)\nprint contains(xs, 3)\nprint contains(xs, 4)\nprint contains(xs, 5)\n";
+        assert_eq!(run_ok(src), "nil\n5\ntrue\ntrue\ntrue\ntrue\ntrue\n");
+        assert!(
+            run_err("import random\nprint random.shuffle(5)\n")
+                .contains("random.shuffle() expects a List")
+        );
+        assert_eq!(run_ok("import random\nprint type(random)\n"), "module\n");
+    }
+
+    #[test]
+    fn stats_module_on_known_data() {
+        assert_eq!(
+            run_ok("import stats\nprint stats.mean([1, 2, 3, 4])\n"),
+            "2.5\n"
+        );
+        assert_eq!(run_ok("import stats\nprint stats.mean([5])\n"), "5\n");
+        assert_eq!(
+            run_ok("import stats\nprint stats.median([1, 3, 2])\n"),
+            "2\n"
+        );
+        assert_eq!(
+            run_ok("import stats\nprint stats.median([1, 2, 3, 4])\n"),
+            "2.5\n"
+        );
+        assert_eq!(run_ok("import stats\nprint stats.median([9])\n"), "9\n");
+        // Median sorts: the input order does not matter, and the
+        // input list is not modified.
+        let src = "import stats\nlet xs = [5, 1, 4]\nprint stats.median(xs)\nprint xs\n";
+        assert_eq!(run_ok(src), "4\n[5, 1, 4]\n");
+        // Population variance of [1,2,3,4,5] is 2, stdev is sqrt(2).
+        assert_eq!(
+            run_ok("import stats\nprint stats.variance([1, 2, 3, 4, 5])\n"),
+            "2\n"
+        );
+        assert_eq!(
+            run_ok("import stats\nprint stats.stdev([1, 2, 3, 4, 5])\n"),
+            "1.4142135623730951\n"
+        );
+        assert_eq!(
+            run_ok("import stats\nprint stats.variance([7, 7, 7])\n"),
+            "0\n"
+        );
+        assert_eq!(run_ok("import stats\nprint type(stats)\n"), "module\n");
+        // Empty lists are errors (mean indexes the empty list
+        // before it could divide by zero).
+        assert!(run_err("import stats\nprint stats.mean([])\n").contains("out of range"));
+        assert!(run_err("import stats\nprint stats.median([])\n").contains("out of range"));
+        // stats imports the native math module internally.
+        assert_eq!(
+            run_ok("import stats\nprint stats.stdev([2, 4, 4, 4, 5, 5, 7, 9])\n"),
+            "2\n"
+        );
+    }
+
+    #[test]
+    fn user_file_overrides_native_math() {
+        let dir = temp_dir("import-override-math");
+        write_module(
+            &dir,
+            "math",
+            "let PI = 99\nfn sqrt(x)\n    return -1\nend\n",
+        );
+        let src = "import math\nprint math.PI\nprint math.sqrt(16)\n";
+        assert_eq!(run_with(src, Some(dir.clone()), vec![]), "99\n-1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        // And a user file overrides the embedded stats too.
+        let dir = temp_dir("import-override-stats");
+        write_module(&dir, "stats", "fn mean(xs)\n    return 42\nend\n");
+        let src = "import stats\nprint stats.mean([1, 2, 3])\n";
+        assert_eq!(run_with(src, Some(dir.clone()), vec![]), "42\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

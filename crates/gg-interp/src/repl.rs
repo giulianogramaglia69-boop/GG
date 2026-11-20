@@ -279,6 +279,14 @@ mod tests {
     }
 
     #[test]
+    fn stdlib_modules_work_in_the_repl() {
+        assert_eq!(
+            session("import math\nmath.sqrt(16)\nimport stats\nstats.mean([1, 2, 3, 4])\nexit\n"),
+            format!("{WELCOME}gg> gg> 4\ngg> gg> 2.5\ngg> ")
+        );
+    }
+
+    #[test]
     fn import_from_a_venv_lib_in_the_repl() {
         let dir = std::env::temp_dir().join(format!("gg-test-repl-venv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

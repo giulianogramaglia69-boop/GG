@@ -1,0 +1,12 @@
+# Demo della libreria standard (Fase 10): math, random e stats.
+import math
+import random
+import stats
+
+let voti = [7, 8, 6, 9, 8, 7, 10, 6]
+print "media: " + str(stats.mean(voti))
+print "mediana: " + str(stats.median(voti))
+print "deviazione standard: " + str(stats.stdev(voti))
+print "dado: " + str(random.randint(1, 6))
+print "radice di 2: " + str(math.sqrt(2))
+print "pi greco: " + str(math.PI)

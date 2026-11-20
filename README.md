@@ -38,7 +38,12 @@ extended to instances (see the OOP section below). **Phase 9 —
 modules + virtual environments: done.** Modules are files loaded
 with `import` (`Value::Module`, `type(m)` is `"module"`); a venv
 holds project modules in `lib/` and is created with `gg venv`
-(see the Modules section below).
+(see the Modules section below). **Phase 10 — standard library:
+done.** Eight new builtins (`sum`, `join`, `upper`, `lower`,
+`trim`, `replace`, `starts_with`, `ends_with`), a native
+`math` module, a native `random` module (SplitMix64, pure Rust)
+and a `stats` module written in pure GG and embedded in the
+binary (see the Standard library section below).
 
 ## The REPL
 
@@ -336,7 +341,7 @@ end
 
 ## Builtins
 
-Twenty-eight builtin functions are predefined in the global environment of
+Thirty-six builtin functions are predefined in the global environment of
 every program. They are first-class values: they can be assigned to
 variables (`let f = len`), passed as arguments and returned from
 functions. `type()` returns `"fn"` for user functions and builtins
@@ -378,6 +383,14 @@ instance and `"class"` for a class (Phase 8).
 | `contains(coll, x)` | Membership: in a list, tuple, array or set; a key in a dict; a substring in a string | `contains([1, 2], 2)` → `true`, `contains("ciao", "ia")` → `true` |
 | `list(x)` | Convert a tuple, set, array, queue or stack — or a dict (its keys) — into a list; an error on strings and other types | `list((1, 2))` → `[1, 2]`, `list({"a": 1})` → `["a"]` |
 | `is_a(x, Classe)` | `true` when `x` is an instance of `Classe` or of any class inheriting from it; the second argument must be a class | `is_a(s, Persona)` → `true`, `is_a(5, Persona)` → `false` |
+| `sum(list)` | The sum of a list of numbers; all integers give an integer, any float gives a float; an error on an empty list or a non-number | `sum([1, 2, 3])` → `6`, `sum([1.5, 2])` → `3.5` |
+| `join(sep, list)` | The complement of `split`: join the strings of the list with the separator between them | `join(", ", ["a", "b"])` → `"a, b"` |
+| `upper(s)` | The string in upper case (Unicode-aware) | `upper("ciao")` → `"CIAO"` |
+| `lower(s)` | The string in lower case (Unicode-aware) | `lower("CIAO")` → `"ciao"` |
+| `trim(s)` | The string without leading and trailing whitespace | `trim("  x  ")` → `"x"` |
+| `replace(s, old, new)` | The string with every occurrence of `old` replaced by `new` (an empty `old` is an error) | `replace("aaa", "a", "b")` → `"bbb"` |
+| `starts_with(s, prefix)` | `true` when the string starts with the prefix | `starts_with("ciao", "ci")` → `true` |
+| `ends_with(s, suffix)` | `true` when the string ends with the suffix | `ends_with("ciao", "ao")` → `true` |
 
 Wrong arity is a runtime error naming the builtin
 (`len() expects 1 argument(s) but got 0`); a wrong argument type
@@ -472,17 +485,21 @@ builtin such as `len` is *not* an attribute (`module 'm' has no
 attribute 'len'`), and a missing attribute is a runtime error
 (`module 'm' has no attribute 'y'`).
 
-**Search order.** `import nome` looks for `nome.gg` in this
-order: (1) the directory of the file doing the import, (2) the
-`lib/` directories of the active venvs, in flag order, (3) the
-current working directory. A module that is not found is a
-runtime error listing every path that was tried (`module 'nope'
-not found (searched: ...)`). Nested imports resolve against the
-directory of the module that imports, not the main script: if
-`sub/mod.gg` does `import helper`, GG looks for `sub/helper.gg`
-(the interpreter tracks the current file through the import
-chain). In the REPL there is no script, so the base is the
-working directory.
+**Search order.** `import nome` looks for the module in three
+levels, in this order: (1) a `.gg` file — the directory of the
+file doing the import, then the `lib/` directories of the active
+venvs, in flag order, then the current working directory; (2) an
+embedded stdlib module written in GG (`stats`); (3) a native
+module written in Rust (`math`, `random`). The first match wins:
+a user file with the same name overrides a stdlib or a native
+module (`math.gg` next to your script shadows the native
+`math`). A module that is not found is a runtime error listing
+every path that was tried (`module 'nope' not found (searched:
+...)`). Nested imports resolve against the directory of the
+module that imports, not the main script: if `sub/mod.gg` does
+`import helper`, GG looks for `sub/helper.gg` (the interpreter
+tracks the current file through the import chain). In the REPL
+there is no script, so the base is the working directory.
 
 **Cache and cycles.** Each module runs **once** per process: a
 second `import` of the same file returns the same value, and a
@@ -517,11 +534,6 @@ directory that does not exist is an error. `GG_VENV` pointing
 nowhere is silently ignored (the search just finds nothing
 there).
 
-There is **no standard library** in this phase: a venv holds the
-user's own modules. A minimal stdlib (for example a `math`
-module) is future work, as are the data libraries (NumPy/Pandas
-style) listed in the roadmap.
-
 Full example: `examples/modules_demo/` — `main.gg` imports
 `greeter.gg` (next to it) and `shapes` (a class module in
 `demo-venv/lib/`):
@@ -535,6 +547,90 @@ area: 12.56
 module
 <module greeter>
 ```
+
+## Standard library
+
+Phase 10 adds a minimal standard library in three layers, in
+the import resolution order above: user `.gg` files first, then
+embedded GG modules, then native Rust modules. Specialized
+domains live in modules, not as top-level builtins: math
+functions are `math.sqrt`, never a bare `sqrt`.
+
+**Top-level builtins** (also listed in the Builtins table):
+`sum`, `join`, `upper`, `lower`, `trim`, `replace`,
+`starts_with`, `ends_with`.
+
+**`math`** — native, in Rust:
+
+| Function / constant | Description | Example |
+| --- | --- | --- |
+| `math.sqrt(x)` | Square root; an error on a negative number | `math.sqrt(16)` → `4` |
+| `math.floor(x)` | Greatest integer <= x, as an Int | `math.floor(3.7)` → `3` |
+| `math.ceil(x)` | Smallest integer >= x, as an Int | `math.ceil(3.2)` → `4` |
+| `math.round(x)` | Nearest integer, as an Int; halves round away from zero | `math.round(2.5)` → `3`, `math.round(-2.5)` → `-3` |
+| `math.pow(a, b)` | a to the power of b; two integers give an exact integer (overflow is an error), anything else a float | `math.pow(2, 10)` → `1024` |
+| `math.sin(x)` / `math.cos(x)` / `math.tan(x)` | Trigonometric functions, in radians | `math.sin(0)` → `0` |
+| `math.log(x)` | Natural logarithm; an error on x <= 0 | `math.log(1)` → `0` |
+| `math.exp(x)` | e to the power of x | `math.exp(0)` → `1` |
+| `math.PI` / `math.E` | The constants π and e | `math.PI` → `3.141592653589793` |
+
+**`random`** — native, in Rust. The generator is SplitMix64,
+implemented in pure Rust with no external crate: fast and good
+enough for games and sampling, **not** cryptographic, seeded
+from the wall clock plus the process id, so every run gets a
+different sequence.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `random.randint(a, b)` | A random integer between a and b, both ends included; an error when a > b | `random.randint(1, 6)` → `4` |
+| `random.random()` | A random float in [0, 1) | `random.random()` → `0.37...` |
+| `random.choice(list)` | A random element of the list; an error on an empty list | `random.choice([10, 20])` → `20` |
+| `random.shuffle(list)` | Shuffle the list in place (Fisher-Yates), return `nil` | `random.shuffle(xs)` |
+
+**`stats`** — written in pure GG (`stdlib/stats.gg` in the
+repo), embedded in the binary with `include_str!`, so it works
+with no file on disk. The files in `stdlib/` are the source of
+truth; a test checks the embedded copy matches them. It imports
+`math` itself for the square root.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `stats.mean(xs)` | The arithmetic mean | `stats.mean([1, 2, 3, 4])` → `2.5` |
+| `stats.median(xs)` | The median (the list is sorted on a copy; the input is not modified) | `stats.median([1, 2, 3, 4])` → `2.5` |
+| `stats.variance(xs)` | Population variance (divided by N, not N - 1) | `stats.variance([1, 2, 3, 4, 5])` → `2` |
+| `stats.stdev(xs)` | Population standard deviation | `stats.stdev([1, 2, 3, 4, 5])` → `1.4142135623730951` |
+
+An empty list is an error for every `stats` function. `type(math)`
+is `"module"`, like for file modules.
+
+Full example: `examples/stdlib_demo.gg` — grades, a die roll
+and π:
+
+```gg
+import math
+import random
+import stats
+
+let voti = [7, 8, 6, 9, 8, 7, 10, 6]
+print "media: " + str(stats.mean(voti))
+print "mediana: " + str(stats.median(voti))
+print "deviazione standard: " + str(stats.stdev(voti))
+print "dado: " + str(random.randint(1, 6))
+print "radice di 2: " + str(math.sqrt(2))
+print "pi greco: " + str(math.PI)
+```
+
+```sh
+$ gg run examples/stdlib_demo.gg
+media: 7.625
+mediana: 7.5
+deviazione standard: 1.3169567191065923
+dado: 4
+radice di 2: 1.4142135623730951
+pi greco: 3.141592653589793
+```
+
+(The die roll differs on every run.)
 
 ## Grammar
 
@@ -653,11 +749,17 @@ exit with code 1.
    cache, circular-import detection, nested imports relative to
    the importing module, `gg venv`, `gg run --venv <dir>`,
    `GG_VENV`, REPL imports
+10. **Standard library** ✅ — new builtins (`sum`, `join`,
+    `upper`, `lower`, `trim`, `replace`, `starts_with`,
+    `ends_with`); native `math` and `random` (SplitMix64, pure
+    Rust) modules; `stats` in pure GG, embedded in the binary;
+    import resolution: user files → embedded stdlib → native
+    modules
 
-Long term, after lists exist: a minimal standard library (a
-`math` module first) and data libraries in the spirit of
-NumPy/Pandas, and a web framework in the spirit of Django — each
-is a large project of its own, not a single phase.
+Long term: numeric arrays in the spirit of NumPy (on top of the
+`array` type from Phase 7), more data libraries in the spirit of
+Pandas, and a web framework in the spirit of Django — each is a
+large project of its own, not a single phase.
 
 ## License
 

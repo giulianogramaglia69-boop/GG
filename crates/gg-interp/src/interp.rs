@@ -45,12 +45,19 @@ enum Flow {
 /// loaded in this process (by canonical path: each module runs
 /// once). `loading` is the stack of modules being loaded right now
 /// (by canonical path): an import of one of them is a cycle.
+/// `embedded_cache` and `loading_embedded` are the same pair for
+/// the embedded stdlib modules (by name: they have no file), and
+/// `native_cache` holds the native modules (`math`, `random`),
+/// built once and shared by every import.
 pub struct Interpreter {
     globals: Rc<Environment>,
     super_stack: Vec<Rc<ClassDef>>,
     venv_dirs: Vec<PathBuf>,
     loading: Vec<PathBuf>,
     cache: HashMap<PathBuf, Value>,
+    embedded_cache: HashMap<String, Value>,
+    loading_embedded: Vec<String>,
+    native_cache: HashMap<String, Value>,
 }
 
 impl Default for Interpreter {
@@ -69,6 +76,9 @@ impl Interpreter {
             venv_dirs: Vec::new(),
             loading: Vec::new(),
             cache: HashMap::new(),
+            embedded_cache: HashMap::new(),
+            loading_embedded: Vec::new(),
+            native_cache: HashMap::new(),
         }
     }
 
@@ -732,12 +742,14 @@ impl Interpreter {
 
     /// Load a module by name (`import math` looks for `math.gg`).
     ///
-    /// Search order: (1) the directory of the file doing the
-    /// import (the importing module's directory, or the main
-    /// script's), (2) the `lib/` directories of the active venvs,
-    /// in order, (3) the working directory. The first `name.gg`
-    /// found wins; when nothing is found the error lists every
-    /// path that was tried.
+    /// Search order: (1) a `.gg` file — the directory of the file
+    /// doing the import (the importing module's directory, or the
+    /// main script's), then the `lib/` directories of the active
+    /// venvs, in order, then the working directory; (2) an
+    /// embedded stdlib module written in GG (`stats`); (3) a native
+    /// module written in Rust (`math`, `random`). The first match
+    /// wins, so a user file with the same name overrides a stdlib
+    /// or native module.
     ///
     /// Each module runs exactly once per process: the second import
     /// returns the cached value. A module that (directly or
@@ -768,13 +780,33 @@ impl Interpreter {
                 candidates.push(candidate);
             }
         }
-        let Some(path) = candidates.iter().find(|p| p.is_file()) else {
-            let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
-            return Err(RuntimeError::new(format!(
-                "module '{name}' not found (searched: {})",
-                tried.join(", ")
-            )));
-        };
+        if let Some(path) = candidates.iter().find(|p| p.is_file()) {
+            return self.import_file_module(name, path, input, out);
+        }
+        // No file: an embedded stdlib module, then a native one.
+        if crate::stdlib::get(name).is_some() {
+            return self.import_embedded_module(name, input, out);
+        }
+        if let Some(module) = self.native_module(name) {
+            return Ok(module);
+        }
+        let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+        Err(RuntimeError::new(format!(
+            "module '{name}' not found (searched: {})",
+            tried.join(", ")
+        )))
+    }
+
+    /// Load a module from a `.gg` file: run it once in its own
+    /// environment (a child of the globals, so it sees the
+    /// builtins) with its own directory as the import base.
+    fn import_file_module(
+        &mut self,
+        name: &str,
+        path: &PathBuf,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
         let canonical = std::fs::canonicalize(path).map_err(|e| {
             RuntimeError::new(format!(
                 "module '{name}': cannot read {}: {e}",
@@ -808,20 +840,70 @@ impl Interpreter {
                 canonical.display()
             ))
         })?;
-        let tokens = gg_lexer::lex(&source)
+        let module_env = Environment::child(&self.globals);
+        module_env.set_base_dir(canonical.parent().map(|p| p.to_path_buf()));
+        // Mark the module as loading while it runs, so an import
+        // of itself (directly or through another module) is a
+        // cycle; pop it again afterwards, success or failure.
+        self.loading.push(canonical.clone());
+        let result = self.run_module_source(name, &source, &module_env, input, out);
+        self.loading.pop();
+        let module = result?;
+        self.cache.insert(canonical, module.clone());
+        Ok(module)
+    }
+
+    /// Load an embedded stdlib module (GG source compiled into the
+    /// binary). It runs in its own environment with no base
+    /// directory — it has no file — so its own imports resolve
+    /// through the venv libraries, the working directory, and then
+    /// the stdlib and native modules again. Cached by name, with
+    /// the same cycle detection as file modules.
+    fn import_embedded_module(
+        &mut self,
+        name: &str,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        if self.loading_embedded.contains(&name.to_string()) {
+            let mut chain = self.loading_embedded.clone();
+            chain.push(name.to_string());
+            return Err(RuntimeError::new(format!(
+                "circular import: {}",
+                chain.join(" -> ")
+            )));
+        }
+        if let Some(module) = self.embedded_cache.get(name) {
+            return Ok(module.clone());
+        }
+        // `import_module` checked that the source exists.
+        let source = crate::stdlib::get(name).unwrap();
+        let module_env = Environment::child(&self.globals);
+        self.loading_embedded.push(name.to_string());
+        let result = self.run_module_source(name, source, &module_env, input, out);
+        self.loading_embedded.pop();
+        let module = result?;
+        self.embedded_cache.insert(name.to_string(), module.clone());
+        Ok(module)
+    }
+
+    /// Run a module's source in `module_env` and wrap the result
+    /// as a module value. Lex/parse/runtime errors are prefixed
+    /// with the module name; a `return` at the top level is an
+    /// error.
+    fn run_module_source(
+        &mut self,
+        name: &str,
+        source: &str,
+        module_env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        let tokens = gg_lexer::lex(source)
             .map_err(|e| RuntimeError::new(format!("module '{name}': lex error: {e}")))?;
         let program = gg_parser::parse(&tokens)
             .map_err(|e| RuntimeError::new(format!("module '{name}': parse error: {e}")))?;
-        // The module runs in its own environment (a child of the
-        // globals, so it sees the builtins) with its own directory
-        // as the import base: its imports resolve against where the
-        // module file lives, not against the main script.
-        let module_env = Environment::child(&self.globals);
-        module_env.set_base_dir(canonical.parent().map(|p| p.to_path_buf()));
-        self.loading.push(canonical.clone());
-        let result = self.exec_block(&program.stmts, &module_env, input, out);
-        self.loading.pop();
-        match result {
+        match self.exec_block(&program.stmts, module_env, input, out) {
             Ok(Flow::Normal) => {}
             Ok(Flow::Return(_)) => {
                 return Err(RuntimeError::new(format!(
@@ -832,12 +914,21 @@ impl Interpreter {
                 return Err(RuntimeError::new(format!("module '{name}': {e}")));
             }
         }
-        let module = Value::Module(Rc::new(ModuleData {
+        Ok(Value::Module(Rc::new(ModuleData {
             name: name.to_string(),
-            env: module_env,
-        }));
-        self.cache.insert(canonical, module.clone());
-        Ok(module)
+            env: Rc::clone(module_env),
+        })))
+    }
+
+    /// A native module (`math`, `random`), built once and cached,
+    /// or `None` when GG has no native module with that name.
+    fn native_module(&mut self, name: &str) -> Option<Value> {
+        if let Some(module) = self.native_cache.get(name) {
+            return Some(module.clone());
+        }
+        let module = crate::native::build(name)?;
+        self.native_cache.insert(name.to_string(), module.clone());
+        Some(module)
     }
 
     /// Assign to a field: the target is a `Field` expression

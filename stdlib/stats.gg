@@ -1,0 +1,58 @@
+# stats — basic statistics, in pure GG.
+#
+# Uses `import math` for the square root, so it exercises a GG
+# module importing a native one. An empty list is an error (the
+# loops index out of range).
+
+import math
+
+fn mean(xs)
+    let total = 0
+    for i = 0 to len(xs) - 1 then
+        total = total + xs[i]
+    end
+    return total / len(xs)
+end
+
+# Insertion sort on a copy (the input list is not touched).
+fn sorted_copy(xs)
+    let ys = list(xs)
+    let i = 1
+    while i < len(ys) then
+        let key = ys[i]
+        let j = i - 1
+        while j >= 0 and ys[j] > key then
+            ys[j + 1] = ys[j]
+            j = j - 1
+        end
+        ys[j + 1] = key
+        i = i + 1
+    end
+    return ys
+end
+
+fn median(xs)
+    let ys = sorted_copy(xs)
+    let n = len(ys)
+    if n % 2 == 1 then
+        return ys[int(n / 2)]
+    else
+        return (ys[int(n / 2) - 1] + ys[int(n / 2)]) / 2
+    end
+end
+
+# Population variance: the mean of the squared deviations
+# (divided by N, not N - 1).
+fn variance(xs)
+    let m = mean(xs)
+    let total = 0
+    for i = 0 to len(xs) - 1 then
+        let d = xs[i] - m
+        total = total + d * d
+    end
+    return total / len(xs)
+end
+
+fn stdev(xs)
+    return math.sqrt(variance(xs))
+end

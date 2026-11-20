@@ -101,6 +101,11 @@ pub fn all() -> Vec<Builtin> {
             func: enqueue,
         },
         Builtin {
+            name: "ends_with",
+            arity: Arity::Exact(2),
+            func: ends_with,
+        },
+        Builtin {
             name: "file_exists",
             arity: Arity::Exact(1),
             func: file_exists,
@@ -126,6 +131,11 @@ pub fn all() -> Vec<Builtin> {
             func: is_a,
         },
         Builtin {
+            name: "join",
+            arity: Arity::Exact(2),
+            func: join,
+        },
+        Builtin {
             name: "keys",
             arity: Arity::Exact(1),
             func: keys,
@@ -144,6 +154,11 @@ pub fn all() -> Vec<Builtin> {
             name: "list",
             arity: Arity::Exact(1),
             func: list_of,
+        },
+        Builtin {
+            name: "lower",
+            arity: Arity::Exact(1),
+            func: lower,
         },
         Builtin {
             name: "max",
@@ -186,6 +201,11 @@ pub fn all() -> Vec<Builtin> {
             func: read_file,
         },
         Builtin {
+            name: "replace",
+            arity: Arity::Exact(3),
+            func: replace,
+        },
+        Builtin {
             name: "split",
             arity: Arity::Exact(2),
             func: split,
@@ -196,14 +216,34 @@ pub fn all() -> Vec<Builtin> {
             func: stack_of,
         },
         Builtin {
+            name: "starts_with",
+            arity: Arity::Exact(2),
+            func: starts_with,
+        },
+        Builtin {
             name: "str",
             arity: Arity::Exact(1),
             func: str_of,
         },
         Builtin {
+            name: "sum",
+            arity: Arity::Exact(1),
+            func: sum,
+        },
+        Builtin {
+            name: "trim",
+            arity: Arity::Exact(1),
+            func: trim,
+        },
+        Builtin {
             name: "type",
             arity: Arity::Exact(1),
             func: type_of,
+        },
+        Builtin {
+            name: "upper",
+            arity: Arity::Exact(1),
+            func: upper,
         },
         Builtin {
             name: "write_file",
@@ -877,4 +917,141 @@ fn is_a(
         _ => false,
     };
     Ok(Value::Bool(result))
+}
+
+// ---- Phase 10: standard library builtins ----
+
+/// `sum(list)` — the sum of a list of numbers. All integers give
+/// an integer (an overflow is an error); any float makes the
+/// result a float. An empty list or a non-number is an error.
+fn sum(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let list = as_list("sum", &args[0])?;
+    let borrowed = list.borrow();
+    if borrowed.is_empty() {
+        return Err(RuntimeError::new("sum() of empty list"));
+    }
+    let mut int_total: i64 = 0;
+    let mut float_total: f64 = 0.0;
+    let mut is_float = false;
+    for item in borrowed.iter() {
+        match item {
+            Value::Int(n) => {
+                int_total = int_total
+                    .checked_add(*n)
+                    .ok_or_else(|| RuntimeError::new("integer overflow"))?;
+                float_total += *n as f64;
+            }
+            Value::Float(x) => {
+                is_float = true;
+                float_total += *x;
+            }
+            other => {
+                return Err(RuntimeError::new(format!(
+                    "sum() expects numbers, not {}",
+                    other.type_name()
+                )));
+            }
+        }
+    }
+    if is_float {
+        Ok(Value::Float(float_total))
+    } else {
+        Ok(Value::Int(int_total))
+    }
+}
+
+/// `join(sep, list)` — the complement of `split`: join the
+/// strings of the list with the separator between them.
+fn join(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let sep = as_str("join", &args[0])?;
+    let list = as_list("join", &args[1])?;
+    let borrowed = list.borrow();
+    let mut parts: Vec<&str> = Vec::new();
+    for item in borrowed.iter() {
+        let Value::Str(s) = item else {
+            return Err(RuntimeError::new(format!(
+                "join() expects a List of Str, not {}",
+                item.type_name()
+            )));
+        };
+        parts.push(s.as_str());
+    }
+    Ok(Value::Str(parts.join(sep)))
+}
+
+/// `upper(s)` / `lower(s)` — the string in upper/lower case
+/// (Unicode-aware: `upper("è")` is `"È"`).
+fn upper(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let s = as_str("upper", &args[0])?;
+    Ok(Value::Str(s.to_uppercase()))
+}
+
+fn lower(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let s = as_str("lower", &args[0])?;
+    Ok(Value::Str(s.to_lowercase()))
+}
+
+/// `trim(s)` — the string without leading and trailing
+/// whitespace (Unicode whitespace).
+fn trim(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let s = as_str("trim", &args[0])?;
+    Ok(Value::Str(s.trim().to_string()))
+}
+
+/// `replace(s, old, new)` — the string with every occurrence of
+/// `old` replaced by `new`. An empty `old` is an error.
+fn replace(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let s = as_str("replace", &args[0])?;
+    let old = as_str("replace", &args[1])?;
+    let new = as_str("replace", &args[2])?;
+    if old.is_empty() {
+        return Err(RuntimeError::new("replace() old string must not be empty"));
+    }
+    Ok(Value::Str(s.replace(old, new)))
+}
+
+/// `starts_with(s, prefix)` / `ends_with(s, suffix)` — true when
+/// the string starts/ends with the given text.
+fn starts_with(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let s = as_str("starts_with", &args[0])?;
+    let prefix = as_str("starts_with", &args[1])?;
+    Ok(Value::Bool(s.starts_with(prefix)))
+}
+
+fn ends_with(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let s = as_str("ends_with", &args[0])?;
+    let suffix = as_str("ends_with", &args[1])?;
+    Ok(Value::Bool(s.ends_with(suffix)))
 }
