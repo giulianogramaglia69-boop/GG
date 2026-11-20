@@ -34,7 +34,28 @@ const CONTINUATION_PROMPT: &str = "... ";
 /// `input` is also the reader `input()` in GG programs reads from,
 /// so a program can ask the user for a value mid-session.
 pub fn run_repl(input: &mut dyn BufRead, out: &mut dyn Write) -> std::io::Result<()> {
+    run_repl_with_venv(input, out, Vec::new())
+}
+
+/// Like `run_repl`, but `import` also searches the given venv
+/// `lib/` directories (after the working directory fallback — the
+/// REPL has no script directory). The `gg` binary passes the
+/// `GG_VENV` directories here.
+pub fn run_repl_with_venv(
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    venv_dirs: Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
     let mut interp = Interpreter::new();
+    interp.set_venv_dirs(venv_dirs);
+    run_repl_with(&mut interp, input, out)
+}
+
+fn run_repl_with(
+    interp: &mut Interpreter,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
     writeln!(out, "GG {VERSION} — interactive REPL. Type exit to quit.")?;
     let mut buffer = String::new();
     let mut prompt = PROMPT;
@@ -74,7 +95,7 @@ pub fn run_repl(input: &mut dyn BufRead, out: &mut dyn Write) -> std::io::Result
             Ok(program) => {
                 buffer.clear();
                 prompt = PROMPT;
-                if let Err(e) = run_chunk(&mut interp, &program, &mut *input, out) {
+                if let Err(e) = run_chunk(interp, &program, &mut *input, out) {
                     writeln!(out, "runtime error: {e}")?;
                 }
             }
@@ -255,5 +276,61 @@ mod tests {
                 "{WELCOME}gg> ... ... ... ... ... ... ... gg> gg> Ciao Giuliano\ngg> Persona{{nome: \"Giuliano\"}}\ngg> gg> Persona{{nome: \"Fabiana\"}}\ngg> "
             )
         );
+    }
+
+    #[test]
+    fn import_from_a_venv_lib_in_the_repl() {
+        let dir = std::env::temp_dir().join(format!("gg-test-repl-venv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = dir.join("myproj").join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("maths.gg"),
+            "fn raddoppia(x)\n    return x * 2\nend\n",
+        )
+        .unwrap();
+        let mut input = Cursor::new(
+            "import maths\nmaths.raddoppia(21)\nexit\n"
+                .as_bytes()
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        run_repl_with_venv(&mut input, &mut out, vec![lib]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{WELCOME}gg> gg> 42\ngg> ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restores the working directory when dropped, so a test can
+    /// change it temporarily without affecting other tests.
+    struct RestoreCwd(std::path::PathBuf);
+
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn import_from_the_working_directory_in_the_repl() {
+        let dir = std::env::temp_dir().join(format!("gg-test-repl-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("saluti.gg"),
+            "fn ciao(nome)\n    return \"Ciao \" + nome\nend\n",
+        )
+        .unwrap();
+        // The REPL has no script directory: imports fall back to
+        // the working directory.
+        let _guard = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&dir).unwrap();
+        assert_eq!(
+            session("import saluti\nsaluti.ciao(\"Giuliano\")\nexit\n"),
+            format!("{WELCOME}gg> gg> Ciao Giuliano\ngg> ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

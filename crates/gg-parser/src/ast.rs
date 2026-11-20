@@ -74,6 +74,13 @@ pub enum Stmt {
         parent: Option<String>,
         methods: Vec<MethodDef>,
     },
+    /// A module import: `import math` loads `math.gg` and binds
+    /// the name `math`; `import math as m` binds it as `m`
+    /// instead. There is no `from x import y` (yet).
+    Import {
+        name: String,
+        alias: Option<String>,
+    },
     Return {
         expr: Option<Expr>,
     },
@@ -469,6 +476,13 @@ impl Stmt {
                     writeln!(f)?;
                 }
                 write!(f, "{pad}end")
+            }
+            Stmt::Import { name, alias } => {
+                write!(f, "{pad}import {name}")?;
+                if let Some(alias) = alias {
+                    write!(f, " as {alias}")?;
+                }
+                Ok(())
             }
             Stmt::Return { expr } => match expr {
                 Some(expr) => write!(f, "{pad}return {expr}"),

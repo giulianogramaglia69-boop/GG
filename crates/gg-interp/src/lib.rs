@@ -11,6 +11,7 @@ pub mod error;
 pub mod interp;
 pub mod repl;
 pub mod value;
+pub mod venv;
 
 use std::fmt;
 use std::io::{BufRead, Write};
@@ -18,8 +19,9 @@ use std::io::{BufRead, Write};
 pub use builtin::Builtin;
 pub use error::RuntimeError;
 pub use interp::Interpreter;
-pub use repl::run_repl;
+pub use repl::{run_repl, run_repl_with_venv};
 pub use value::Value;
+pub use venv::{create_venv, venv_dirs_from_env, venv_lib_dir};
 
 use gg_lexer::LexerError;
 use gg_parser::ParserError;
@@ -73,6 +75,27 @@ pub fn run_source(
     let tokens = gg_lexer::lex(source)?;
     let program = gg_parser::parse(&tokens)?;
     Interpreter::new().run(&program, input, out)?;
+    Ok(())
+}
+
+/// Like `run_source`, but with a module search configured: imports
+/// in `source` resolve against `base_dir` (the directory of the
+/// script, if any), then the given venv `lib/` directories, then
+/// the working directory. Used by the `gg` binary for `gg run` and
+/// by the module tests.
+pub fn run_source_with(
+    source: &str,
+    base_dir: Option<std::path::PathBuf>,
+    venv_dirs: Vec<std::path::PathBuf>,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<(), GgError> {
+    let tokens = gg_lexer::lex(source)?;
+    let program = gg_parser::parse(&tokens)?;
+    let mut interp = Interpreter::new();
+    interp.set_base_dir(base_dir);
+    interp.set_venv_dirs(venv_dirs);
+    interp.run(&program, input, out)?;
     Ok(())
 }
 
@@ -1242,5 +1265,263 @@ mod tests {
         assert!(
             run_err("class C\n    fn m(x)\n    end\nend\n").contains("methods must take 'self'")
         );
+    }
+
+    // ---- Phase 9: modules ----
+
+    /// Write a module file `dir/name.gg` with the given source.
+    fn write_module(dir: &std::path::Path, name: &str, source: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{name}.gg"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, source).unwrap();
+        path
+    }
+
+    /// Run `source` with the module search configured: `base_dir`
+    /// is the importing file's directory, `venv_dirs` the venv
+    /// `lib/` directories. Returns the printed output.
+    fn run_with(
+        source: &str,
+        base_dir: Option<std::path::PathBuf>,
+        venv_dirs: Vec<std::path::PathBuf>,
+    ) -> String {
+        let mut input = std::io::Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        run_source_with(source, base_dir, venv_dirs, &mut input, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Like `run_with`, but returns the error text instead.
+    fn run_with_err(
+        source: &str,
+        base_dir: Option<std::path::PathBuf>,
+        venv_dirs: Vec<std::path::PathBuf>,
+    ) -> String {
+        let mut input = std::io::Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        run_source_with(source, base_dir, venv_dirs, &mut input, &mut out)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn import_loads_fn_let_and_class() {
+        let dir = temp_dir("import-basic");
+        write_module(
+            &dir,
+            "math",
+            "let PI = 3.14\nfn doppio(x)\n    return x * 2\nend\nclass Punto\n    fn init(self, x, y)\n        self.x = x\n        self.y = y\n    end\nend\n",
+        );
+        let src = "import math\nprint math.PI\nprint math.doppio(21)\nlet p = math.Punto(1, 2)\nprint p.x\nprint p.y\nprint type(math)\nprint math\n";
+        assert_eq!(
+            run_with(src, Some(dir.clone()), vec![]),
+            "3.14\n42\n1\n2\nmodule\n<module math>\n"
+        );
+        // The module value is a first-class value too.
+        let src = "import math\nlet m = math\nprint m.doppio(3)\nprint math == m\n";
+        assert_eq!(run_with(src, Some(dir.clone()), vec![]), "6\ntrue\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_alias() {
+        let dir = temp_dir("import-alias");
+        write_module(
+            &dir,
+            "greeter",
+            "fn saluta(nome)\n    return \"Ciao \" + nome\nend\n",
+        );
+        let src = "import greeter as g\nprint g.saluta(\"Giuliano\")\n";
+        assert_eq!(run_with(src, Some(dir.clone()), vec![]), "Ciao Giuliano\n");
+        // The original name is not bound when an alias is used.
+        let err = run_with_err(
+            "import greeter as g\nprint greeter\n",
+            Some(dir.clone()),
+            vec![],
+        );
+        assert!(err.contains("undefined variable 'greeter'"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_missing_module_lists_searched_paths() {
+        let dir = temp_dir("import-missing");
+        let err = run_with_err("import nope\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("module 'nope' not found"), "{err}");
+        assert!(err.contains("searched:"), "{err}");
+        // The importing directory is among the searched paths.
+        assert!(
+            err.contains(&dir.join("nope.gg").display().to_string()),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_runs_a_module_only_once() {
+        let dir = temp_dir("import-cache");
+        write_module(&dir, "once", "print \"loaded once\"\nlet x = 1\n");
+        write_module(&dir, "other", "import once\nprint \"other\"\n");
+        // Imported twice directly, and once through `other`: the
+        // module body still runs a single time.
+        let src = "import once\nimport once\nimport other\nprint once.x\n";
+        assert_eq!(
+            run_with(src, Some(dir.clone()), vec![]),
+            "loaded once\nother\n1\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_circular_is_an_error() {
+        let dir = temp_dir("import-circular");
+        write_module(&dir, "a", "import b\nlet x = 1\n");
+        write_module(&dir, "b", "import a\nlet y = 2\n");
+        let err = run_with_err("import a\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("circular import: a -> b -> a"), "{err}");
+        // A module importing itself is a cycle too.
+        write_module(&dir, "selfish", "import selfish\n");
+        let err = run_with_err("import selfish\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("circular import: selfish -> selfish"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_nested_resolves_relative_to_the_module() {
+        let dir = temp_dir("import-nested");
+        let sub = dir.join("sub");
+        // `mod` lives in sub/ and imports `helper`, which lives in
+        // sub/ too — not next to the main script.
+        write_module(&sub, "helper", "fn aiuto()\n    return \"da sub\"\nend\n");
+        write_module(
+            &sub,
+            "mod",
+            "import helper\nfn chiama()\n    return helper.aiuto()\nend\n",
+        );
+        // The entry point runs with sub/ as its base directory, so
+        // `import mod` finds sub/mod.gg; mod's own import of
+        // `helper` then resolves against sub/ as well.
+        let src = "import mod\nprint mod.chiama()\n";
+        assert_eq!(run_with(src, Some(sub.clone()), vec![]), "da sub\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_inside_a_function_uses_the_module_directory() {
+        let dir = temp_dir("import-in-fn");
+        let sub = dir.join("sub");
+        write_module(
+            &sub,
+            "helper",
+            "fn chi()\n    return \"helper di sub\"\nend\n",
+        );
+        // The import happens inside a function defined in the
+        // module: it must still resolve against the module's
+        // directory, even when the function is called from the
+        // main script (whose directory is different).
+        write_module(
+            &sub,
+            "worker",
+            "fn lavora()\n    import helper\n    return helper.chi()\nend\n",
+        );
+        let src = "import worker\nprint worker.lavora()\n";
+        assert_eq!(run_with(src, Some(sub.clone()), vec![]), "helper di sub\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_from_a_venv_lib() {
+        let dir = temp_dir("import-venv");
+        let lib = dir.join("myproj").join("lib");
+        write_module(&lib, "maths", "fn raddoppia(x)\n    return x * 2\nend\n");
+        // The module lives only in the venv lib: found through the
+        // venv search path.
+        let src = "import maths\nprint maths.raddoppia(21)\n";
+        assert_eq!(run_with(src, Some(dir.clone()), vec![lib.clone()]), "42\n");
+        // The script's own directory wins over a venv lib with the
+        // same module name.
+        write_module(&dir, "maths", "fn raddoppia(x)\n    return x * 100\nend\n");
+        assert_eq!(
+            run_with(src, Some(dir.clone()), vec![lib.clone()]),
+            "2100\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_binds_in_the_current_scope() {
+        let dir = temp_dir("import-scope");
+        write_module(&dir, "m", "let x = 1\n");
+        // An import inside a block binds the name there, like `let`.
+        let src = "if true then\n    import m\n    print m.x\nend\n";
+        assert_eq!(run_with(src, Some(dir.clone()), vec![]), "1\n");
+        let err = run_with_err(
+            "if true then\n    import m\nend\nprint m\n",
+            Some(dir.clone()),
+            vec![],
+        );
+        assert!(err.contains("undefined variable 'm'"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn module_attribute_errors() {
+        let dir = temp_dir("import-attrs");
+        write_module(&dir, "m", "let x = 5\nfn f()\n    return 1\nend\n");
+        // A missing attribute names the module.
+        let err = run_with_err("import m\nprint m.y\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("module 'm' has no attribute 'y'"), "{err}");
+        let err = run_with_err(
+            "import m\nprint m.f()\nprint m.y()\n",
+            Some(dir.clone()),
+            vec![],
+        );
+        assert!(err.contains("module 'm' has no attribute 'y'"), "{err}");
+        // Builtins are NOT module attributes: the module's
+        // environment is a child of the globals, but attribute
+        // access only reads the module's own names.
+        let err = run_with_err("import m\nprint m.len\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("module 'm' has no attribute 'len'"), "{err}");
+        // Calling a non-function attribute is a type error.
+        let err = run_with_err("import m\nprint m.x()\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("cannot call Int"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn module_syntax_errors_name_the_module() {
+        let dir = temp_dir("import-syntax");
+        write_module(&dir, "bad", "let x =\n");
+        let err = run_with_err("import bad\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("module 'bad': parse error:"), "{err}");
+        write_module(&dir, "badlex", "print \"oops\n");
+        let err = run_with_err("import badlex\n", Some(dir.clone()), vec![]);
+        assert!(err.contains("module 'badlex': lex error:"), "{err}");
+        // A runtime error inside a module names it too.
+        write_module(&dir, "badrt", "print undefined_var\n");
+        let err = run_with_err("import badrt\n", Some(dir.clone()), vec![]);
+        assert!(
+            err.contains("module 'badrt': undefined variable 'undefined_var'"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn class_from_a_module_and_is_a() {
+        let dir = temp_dir("import-class");
+        write_module(
+            &dir,
+            "animali",
+            "class Animale\n    fn init(self, nome)\n        self.nome = nome\n    end\n    fn verso(self)\n        return \"...\"\n    end\nend\nclass Cane extends Animale\n    fn verso(self)\n        return \"bau\"\n    end\nend\n",
+        );
+        let src = "import animali\nlet c = animali.Cane(\"Fido\")\nprint c.nome\nprint c.verso()\nprint is_a(c, animali.Animale)\nprint is_a(c, animali.Cane)\nprint type(c)\n";
+        assert_eq!(
+            run_with(src, Some(dir.clone()), vec![]),
+            "Fido\nbau\ntrue\ntrue\nCane\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

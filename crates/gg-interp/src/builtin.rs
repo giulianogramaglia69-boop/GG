@@ -266,6 +266,7 @@ fn type_of(
         Value::Stack(_) => "stack".to_string(),
         Value::Function(_) | Value::Builtin(_) | Value::BoundMethod(_) => "fn".to_string(),
         Value::Class(_) => "class".to_string(),
+        Value::Module(_) => "module".to_string(),
         Value::Instance(inst) => inst.borrow().class.name.clone(),
     };
     Ok(Value::Str(name))

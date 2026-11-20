@@ -1,0 +1,9 @@
+class Cerchio
+    fn init(self, r)
+        self.r = r
+    end
+
+    fn area(self)
+        return 3.14 * self.r * self.r
+    end
+end

@@ -11,7 +11,9 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
@@ -20,8 +22,8 @@ use crate::builtin;
 use crate::env::Environment;
 use crate::error::RuntimeError;
 use crate::value::{
-    BoundMethod, ClassDef, DictData, Function, InstanceData, Value, elem_type_of, lookup_method,
-    values_equal,
+    BoundMethod, ClassDef, DictData, Function, InstanceData, ModuleData, Value, elem_type_of,
+    lookup_method, values_equal,
 };
 
 /// What executing a statement produced: either control flows on
@@ -37,9 +39,18 @@ enum Flow {
 /// `super_stack` tracks the class whose method is currently
 /// executing (innermost first): `super.foo()` looks the method up
 /// in that class's parent. It is empty outside methods.
+///
+/// `venv_dirs` are the `lib/` directories of the active virtual
+/// environments, in search order. `cache` holds the modules already
+/// loaded in this process (by canonical path: each module runs
+/// once). `loading` is the stack of modules being loaded right now
+/// (by canonical path): an import of one of them is a cycle.
 pub struct Interpreter {
     globals: Rc<Environment>,
     super_stack: Vec<Rc<ClassDef>>,
+    venv_dirs: Vec<PathBuf>,
+    loading: Vec<PathBuf>,
+    cache: HashMap<PathBuf, Value>,
 }
 
 impl Default for Interpreter {
@@ -55,7 +66,27 @@ impl Interpreter {
         Self {
             globals,
             super_stack: Vec::new(),
+            venv_dirs: Vec::new(),
+            loading: Vec::new(),
+            cache: HashMap::new(),
         }
+    }
+
+    /// The `lib/` directories `import` searches (after the
+    /// importing file's directory, before the working directory),
+    /// in order. Set by the `gg` binary from `--venv` flags, or
+    /// from the `GG_VENV` environment variable when no flag is
+    /// given.
+    pub fn set_venv_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.venv_dirs = dirs;
+    }
+
+    /// The directory the main script lives in: `import` in the
+    /// script (and in any function it defines) resolves against
+    /// it. `None` means "no script" (the REPL): imports fall back
+    /// to the venv libraries and the working directory.
+    pub fn set_base_dir(&mut self, dir: Option<PathBuf>) {
+        self.globals.set_base_dir(dir);
     }
 
     /// The string to show for a value: an instance whose class
@@ -209,6 +240,11 @@ impl Interpreter {
                     methods: def_methods,
                 });
                 env.define(name, Value::Class(class));
+                Ok(Flow::Normal)
+            }
+            Stmt::Import { name, alias } => {
+                let module = self.import_module(name, env, input, out)?;
+                env.define(alias.as_deref().unwrap_or(name), module);
                 Ok(Flow::Normal)
             }
             Stmt::Print { expr } => {
@@ -519,6 +555,16 @@ impl Interpreter {
                     class.name, name
                 ))),
             },
+            Value::Module(module) => match module.env.get_local(name) {
+                // Only the module's own top-level names: builtins
+                // live in the parent (global) scope and are NOT
+                // module attributes (`m.len` is an error).
+                Some(value) => Ok(value),
+                None => Err(RuntimeError::new(format!(
+                    "module '{}' has no attribute '{}'",
+                    module.name, name
+                ))),
+            },
             other => Err(RuntimeError::new(format!(
                 "cannot access field '{}' of {}",
                 name,
@@ -591,6 +637,18 @@ impl Interpreter {
                 None => Err(RuntimeError::new(format!(
                     "class '{}' has no method '{}'",
                     class.name, name
+                ))),
+            },
+            // A module attribute that is callable: a function, a
+            // builtin, or a class (calling it constructs an
+            // instance). `m.len` is not an attribute (see
+            // `get_field`), so this never sees a builtin through
+            // the module.
+            Value::Module(module) => match module.env.get_local(name) {
+                Some(value) => self.call_value(&value, args, input, out),
+                None => Err(RuntimeError::new(format!(
+                    "module '{}' has no attribute '{}'",
+                    module.name, name
                 ))),
             },
             other => Err(RuntimeError::new(format!(
@@ -670,6 +728,116 @@ impl Interpreter {
             }
         }
         Ok(Value::Instance(instance))
+    }
+
+    /// Load a module by name (`import math` looks for `math.gg`).
+    ///
+    /// Search order: (1) the directory of the file doing the
+    /// import (the importing module's directory, or the main
+    /// script's), (2) the `lib/` directories of the active venvs,
+    /// in order, (3) the working directory. The first `name.gg`
+    /// found wins; when nothing is found the error lists every
+    /// path that was tried.
+    ///
+    /// Each module runs exactly once per process: the second import
+    /// returns the cached value. A module that (directly or
+    /// indirectly) imports itself is a circular import.
+    fn import_module(
+        &mut self,
+        name: &str,
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        let file_name = format!("{name}.gg");
+        // Search order: importing file's directory, venv libs,
+        // working directory. Duplicates (e.g. the script's
+        // directory is the working directory) are tried once.
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Some(base) = env.import_base() {
+            bases.push(base);
+        }
+        bases.extend(self.venv_dirs.iter().cloned());
+        if let Ok(cwd) = std::env::current_dir() {
+            bases.push(cwd);
+        }
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for base in bases {
+            let candidate = base.join(&file_name);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        let Some(path) = candidates.iter().find(|p| p.is_file()) else {
+            let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+            return Err(RuntimeError::new(format!(
+                "module '{name}' not found (searched: {})",
+                tried.join(", ")
+            )));
+        };
+        let canonical = std::fs::canonicalize(path).map_err(|e| {
+            RuntimeError::new(format!(
+                "module '{name}': cannot read {}: {e}",
+                path.display()
+            ))
+        })?;
+        // A module that is already being loaded (higher up the
+        // import chain) is a cycle: name the whole chain.
+        if self.loading.contains(&canonical) {
+            let mut chain: Vec<String> = self
+                .loading
+                .iter()
+                .map(|p| {
+                    p.file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .collect();
+            chain.push(name.to_string());
+            return Err(RuntimeError::new(format!(
+                "circular import: {}",
+                chain.join(" -> ")
+            )));
+        }
+        if let Some(module) = self.cache.get(&canonical) {
+            return Ok(module.clone());
+        }
+        let source = std::fs::read_to_string(&canonical).map_err(|e| {
+            RuntimeError::new(format!(
+                "module '{name}': cannot read {}: {e}",
+                canonical.display()
+            ))
+        })?;
+        let tokens = gg_lexer::lex(&source)
+            .map_err(|e| RuntimeError::new(format!("module '{name}': lex error: {e}")))?;
+        let program = gg_parser::parse(&tokens)
+            .map_err(|e| RuntimeError::new(format!("module '{name}': parse error: {e}")))?;
+        // The module runs in its own environment (a child of the
+        // globals, so it sees the builtins) with its own directory
+        // as the import base: its imports resolve against where the
+        // module file lives, not against the main script.
+        let module_env = Environment::child(&self.globals);
+        module_env.set_base_dir(canonical.parent().map(|p| p.to_path_buf()));
+        self.loading.push(canonical.clone());
+        let result = self.exec_block(&program.stmts, &module_env, input, out);
+        self.loading.pop();
+        match result {
+            Ok(Flow::Normal) => {}
+            Ok(Flow::Return(_)) => {
+                return Err(RuntimeError::new(format!(
+                    "module '{name}': return outside function"
+                )));
+            }
+            Err(e) => {
+                return Err(RuntimeError::new(format!("module '{name}': {e}")));
+            }
+        }
+        let module = Value::Module(Rc::new(ModuleData {
+            name: name.to_string(),
+            env: module_env,
+        }));
+        self.cache.insert(canonical, module.clone());
+        Ok(module)
     }
 
     /// Assign to a field: the target is a `Field` expression

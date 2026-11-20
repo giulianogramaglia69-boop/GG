@@ -1,0 +1,5 @@
+let PI = 3.14
+
+fn saluta(nome)
+    return "Ciao " + nome + "!"
+end

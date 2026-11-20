@@ -62,6 +62,8 @@ pub enum TokenKind {
     Extends,
     Super,
     SelfKw,
+    Import,
+    As,
     // Literals
     Ident(String),
     Int(i64),
@@ -120,6 +122,8 @@ impl TokenKind {
             TokenKind::Extends => "Extends",
             TokenKind::Super => "Super",
             TokenKind::SelfKw => "Self",
+            TokenKind::Import => "Import",
+            TokenKind::As => "As",
             TokenKind::Ident(_) => "Ident",
             TokenKind::Int(_) => "Int",
             TokenKind::Float(_) => "Float",
@@ -173,6 +177,8 @@ impl TokenKind {
             TokenKind::Extends => "extends".to_string(),
             TokenKind::Super => "super".to_string(),
             TokenKind::SelfKw => "self".to_string(),
+            TokenKind::Import => "import".to_string(),
+            TokenKind::As => "as".to_string(),
             TokenKind::Ident(name) => name.clone(),
             TokenKind::Int(n) => n.to_string(),
             TokenKind::Float(f) => f.to_string(),
@@ -251,6 +257,8 @@ fn keyword_or_ident(word: &str) -> TokenKind {
         "extends" => TokenKind::Extends,
         "super" => TokenKind::Super,
         "self" => TokenKind::SelfKw,
+        "import" => TokenKind::Import,
+        "as" => TokenKind::As,
         _ => TokenKind::Ident(word.to_string()),
     }
 }
@@ -637,7 +645,7 @@ mod tests {
     fn keywords_are_not_identifiers_but_prefixes_are() {
         assert_eq!(
             kinds_no_eof(
-                "let letter endif endless truex not_now total selfish classy superb extends2"
+                "let letter endif endless truex not_now total selfish classy superb extends2 imported ash"
             ),
             vec![
                 TokenKind::Let,
@@ -651,6 +659,21 @@ mod tests {
                 TokenKind::Ident("classy".to_string()),
                 TokenKind::Ident("superb".to_string()),
                 TokenKind::Ident("extends2".to_string()),
+                TokenKind::Ident("imported".to_string()),
+                TokenKind::Ident("ash".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_and_as_are_keywords() {
+        assert_eq!(
+            kinds_no_eof("import math as m"),
+            vec![
+                TokenKind::Import,
+                TokenKind::Ident("math".to_string()),
+                TokenKind::As,
+                TokenKind::Ident("m".to_string()),
             ]
         );
     }
@@ -664,7 +687,7 @@ mod tests {
     fn all_keywords() {
         assert_eq!(
             kinds_no_eof(
-                "let if then else end while for fn return print true false and or not to class extends super self"
+                "let if then else end while for fn return print true false and or not to class extends super self import as"
             ),
             vec![
                 TokenKind::Let,
@@ -687,6 +710,8 @@ mod tests {
                 TokenKind::Extends,
                 TokenKind::Super,
                 TokenKind::SelfKw,
+                TokenKind::Import,
+                TokenKind::As,
             ]
         );
     }

@@ -34,7 +34,11 @@ and stacks, with new builtins (`array`, `queue`, `stack`, `enqueue`,
 extended to the new types. **Phase 8 — OOP: done.** Classes with
 single inheritance, methods with explicit `self`, bound methods,
 `super`, dynamic fields, and a new builtin `is_a`; `type`/`str`
-extended to instances (see the OOP section below).
+extended to instances (see the OOP section below). **Phase 9 —
+modules + virtual environments: done.** Modules are files loaded
+with `import` (`Value::Module`, `type(m)` is `"module"`); a venv
+holds project modules in `lib/` and is created with `gg venv`
+(see the Modules section below).
 
 ## The REPL
 
@@ -441,6 +445,97 @@ $ gg run numbered.gg
 2. chiamare Fabiana
 ```
 
+## Modules and virtual environments
+
+A module is a `.gg` file. `import nome` loads `nome.gg` and
+binds the name `nome` to the module value in the current scope —
+so an `import` inside a block or a function binds the name there,
+like `let`. Everything defined at top level in the module file
+(`let`, `fn`, `class`) becomes an attribute of the module:
+
+```gg
+import greeter
+print greeter.saluta("Giuliano")   # a function of the module
+print greeter.PI                   # a constant of the module
+let c = shapes.Cerchio(2)          # a class of the module
+print type(greeter)                # module
+print greeter                      # <module greeter>
+```
+
+`import nome as alias` binds the module to `alias` instead (the
+original name is not bound). There is no `from x import y` in
+this phase — it is planned for a later one. A module is a
+first-class value: it can be stored in a variable (`let m =
+greeter`), passed to a function and compared (`greeter == m` is
+`true`). Attribute access reads only the module's own names: a
+builtin such as `len` is *not* an attribute (`module 'm' has no
+attribute 'len'`), and a missing attribute is a runtime error
+(`module 'm' has no attribute 'y'`).
+
+**Search order.** `import nome` looks for `nome.gg` in this
+order: (1) the directory of the file doing the import, (2) the
+`lib/` directories of the active venvs, in flag order, (3) the
+current working directory. A module that is not found is a
+runtime error listing every path that was tried (`module 'nope'
+not found (searched: ...)`). Nested imports resolve against the
+directory of the module that imports, not the main script: if
+`sub/mod.gg` does `import helper`, GG looks for `sub/helper.gg`
+(the interpreter tracks the current file through the import
+chain). In the REPL there is no script, so the base is the
+working directory.
+
+**Cache and cycles.** Each module runs **once** per process: a
+second `import` of the same file returns the same value, and a
+module imported by several files is still executed a single time.
+A circular import is a runtime error naming the whole chain
+(`circular import: a -> b -> a`).
+
+**Virtual environments.** A venv is a project folder with its
+own `lib/` for modules:
+
+```sh
+$ gg venv myproj
+Created venv 'myproj':
+  myproj/
+  myproj/lib/
+  myproj/gg.toml
+$ cat myproj/gg.toml
+name = "myproj"
+version = "0.1.0"
+```
+
+`gg venv <nome>` fails if the directory already exists. Modules
+in `myproj/lib/` are found by `import` when the venv is active:
+
+```sh
+$ gg run --venv myproj main.gg        # the flag is repeatable: --venv a --venv b
+$ GG_VENV=myproj gg run main.gg       # the environment variable, same effect
+```
+
+The flag wins over `GG_VENV` when both are given; a `--venv`
+directory that does not exist is an error. `GG_VENV` pointing
+nowhere is silently ignored (the search just finds nothing
+there).
+
+There is **no standard library** in this phase: a venv holds the
+user's own modules. A minimal stdlib (for example a `math`
+module) is future work, as are the data libraries (NumPy/Pandas
+style) listed in the roadmap.
+
+Full example: `examples/modules_demo/` — `main.gg` imports
+`greeter.gg` (next to it) and `shapes` (a class module in
+`demo-venv/lib/`):
+
+```sh
+$ cd examples/modules_demo
+$ gg run --venv demo-venv main.gg
+Ciao Giuliano!
+PI greco: 3.14
+area: 12.56
+module
+<module greeter>
+```
+
 ## Grammar
 
 ```text
@@ -455,6 +550,7 @@ statement := "let" ident "=" expr
            | "for" ident "=" expr "to" expr "then" block "end"
            | "fn" ident "(" [ident ("," ident)*] ")" block "end"
            | "class" ident ["extends" ident] class_body "end"
+           | "import" ident ["as" ident]
            | "return" [expr]
            | expr
 class_body:= ("fn" ident "(" [ident ("," ident)*] ")" block "end")*
@@ -488,7 +584,10 @@ Phase 2 for the `for` loop (`total` is still a plain identifier).
 `class`, `extends`, `super` and `self` were added as keywords in
 Phase 8 (`selfish` and `classy` are still plain identifiers); `.`
 is the field-access operator since Phase 8, so `5.` is a lex error
-and `.5` is rejected by the parser instead.
+and `.5` is rejected by the parser instead. `import` and `as`
+were added as keywords in Phase 9 (`important` is still a plain
+identifier); a module name is a single identifier — there are no
+dotted module paths (`import sub.mod` is a parse error).
 
 ```gg
 fn sum_to(n)
@@ -506,7 +605,7 @@ print sum_to(10)
 
 | Kind | Examples |
 | --- | --- |
-| Keywords | `let if then else end while for fn return print true false and or not to class extends super self` |
+| Keywords | `let if then else end while for fn return print true false and or not to class extends super self import as` |
 | Identifiers | `[A-Za-z_][A-Za-z0-9_]*` (keywords are reserved) |
 | Numbers | integers `42`, floats `3.14` (`.5` and `5.` are errors) |
 | Strings | `"..."` with escapes `\"` `\\` `\n` `\t` |
@@ -526,6 +625,8 @@ cargo build --release
 ./target/release/gg                 # start the interactive REPL
 ./target/release/gg repl            # same thing
 ./target/release/gg run hello.gg          # run a .gg program
+./target/release/gg run --venv myproj hello.gg   # run with a venv's lib/ on the module path
+./target/release/gg venv myproj            # create a virtual environment (myproj/ + lib/ + gg.toml)
 ./target/release/gg --tokens hello.gg   # print the tokens, one per line
 ./target/release/gg --ast hello.gg      # parse and print the AST (canonical form)
 ./target/release/gg --help
@@ -546,9 +647,17 @@ exit with code 1.
 6. **Lists + file handling** ✅ — lists (`[1, 2, 3]`, indexing, aliasing, `push`/`pop`/`range`/`split`/`lines`) and whole-file helpers (`read_file`/`write_file`/`append_file`/`file_exists`)
 7. **Collections** ✅ — tuples `(1, "a")`, dicts `{"k": v}`, sets `{1, 2}`, arrays `array([1, 2])`, queues `queue()`/`enqueue`/`dequeue`, stacks `stack()`/`push`/`pop`, plus `peek`/`keys`/`contains`/`list`
 8. **OOP** ✅ — classes, methods, inheritance (see below)
-9. **Modules + virtual environments** — `import`, packages, per-project envs (like `venv`)
+9. **Modules + virtual environments** ✅ — `import` (with `as`
+   alias), module values (`type` is `"module"`), search order
+   (script dir → venv `lib/` → working dir), once-per-process
+   cache, circular-import detection, nested imports relative to
+   the importing module, `gg venv`, `gg run --venv <dir>`,
+   `GG_VENV`, REPL imports
 
-Long term, after lists exist: data libraries in the spirit of NumPy/Pandas, and a web framework in the spirit of Django — each is a large project of its own, not a single phase.
+Long term, after lists exist: a minimal standard library (a
+`math` module first) and data libraries in the spirit of
+NumPy/Pandas, and a web framework in the spirit of Django — each
+is a large project of its own, not a single phase.
 
 ## License
 

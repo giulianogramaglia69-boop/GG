@@ -186,6 +186,7 @@ impl<'a> Parser<'a> {
             TokenKind::For => self.parse_for(),
             TokenKind::Fn => self.parse_fn(),
             TokenKind::Class => self.parse_class(),
+            TokenKind::Import => self.parse_import(),
             TokenKind::Return => self.parse_return(),
             TokenKind::Print => self.parse_print(),
             _ => {
@@ -373,6 +374,18 @@ impl<'a> Parser<'a> {
             parent,
             methods,
         })
+    }
+
+    fn parse_import(&mut self) -> Result<Stmt, ParserError> {
+        self.advance(); // import
+        let name = self.expect_ident("module name after 'import'")?;
+        let alias = if self.check(&TokenKind::As) {
+            self.advance(); // as
+            Some(self.expect_ident("alias after 'as'")?)
+        } else {
+            None
+        };
+        Ok(Stmt::Import { name, alias })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParserError> {
@@ -1730,6 +1743,89 @@ mod tests {
     fn class_missing_end_is_incomplete() {
         assert!(parse_err("class C\n    fn m(self)\n    end\n").is_incomplete());
         assert!(parse_err("class C").is_incomplete());
+    }
+
+    #[test]
+    fn import_with_and_without_alias() {
+        assert_eq!(
+            parse_ok("import math").stmts,
+            vec![Stmt::Import {
+                name: "math".to_string(),
+                alias: None,
+            }]
+        );
+        assert_eq!(
+            parse_ok("import math as m").stmts,
+            vec![Stmt::Import {
+                name: "math".to_string(),
+                alias: Some("m".to_string()),
+            }]
+        );
+        // An import is a statement like any other: it can sit
+        // inside a block, after other statements, separated by `;`.
+        assert_eq!(
+            parse_ok("let x = 1; import a\nimport b as c").stmts,
+            vec![
+                Stmt::Let {
+                    name: "x".to_string(),
+                    value: int(1),
+                },
+                Stmt::Import {
+                    name: "a".to_string(),
+                    alias: None,
+                },
+                Stmt::Import {
+                    name: "b".to_string(),
+                    alias: Some("c".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn import_errors() {
+        // No module name.
+        let err = parse_err("import\n");
+        assert!(
+            err.message.contains("expected module name after 'import'"),
+            "{}",
+            err.message
+        );
+        // `as` without an alias.
+        let err = parse_err("import math as\n");
+        assert!(
+            err.message.contains("expected alias after 'as'"),
+            "{}",
+            err.message
+        );
+        // A keyword cannot be a module name.
+        let err = parse_err("import class");
+        assert!(
+            err.message.contains("expected module name after 'import'"),
+            "{}",
+            err.message
+        );
+        // `from` is not a thing in GG (yet): `import` takes a bare
+        // module name, nothing else.
+        let err = parse_err("import math from x");
+        assert!(
+            err.message
+                .contains("expected newline or ';' after statement"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn import_display_round_trip() {
+        let source = "import math\nimport greeter as g\nprint math.pi\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "import math\nimport greeter as g\nprint math.pi"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+import greeter
+import shapes
+
+print greeter.saluta("Giuliano")
+print "PI greco: " + str(greeter.PI)
+let c = shapes.Cerchio(2)
+print "area: " + str(c.area())
+print type(greeter)
+print greeter

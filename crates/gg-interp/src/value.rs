@@ -54,6 +54,20 @@ pub enum Value {
     /// A method bound to an instance: `p.saluta` without the call.
     /// Calling it passes the instance as `self`.
     BoundMethod(Rc<BoundMethod>),
+    /// A module: `import math` loads `math.gg` once and binds the
+    /// value. Its top-level names are its environment; attribute
+    /// access (`math.pi`) reads them. Modules compare by identity.
+    Module(Rc<ModuleData>),
+}
+
+/// A loaded module: its name (as imported) and the environment its
+/// top-level code ran in. The environment is a child of the
+/// interpreter's globals, so module code sees the builtins — but
+/// attribute access only reads the module's own names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleData {
+    pub name: String,
+    pub env: Rc<Environment>,
 }
 
 /// Max collection nesting depth when printing; deeper levels print
@@ -282,6 +296,7 @@ impl Value {
             Value::Class(_) => "Class",
             Value::Instance(_) => "Instance",
             Value::BoundMethod(_) => "Function",
+            Value::Module(_) => "Module",
         }
     }
 
@@ -440,6 +455,7 @@ impl Value {
             Value::BoundMethod(bound) => {
                 write!(f, "<bound method {}.{}>", bound.class.name, bound.name)
             }
+            Value::Module(module) => write!(f, "<module {}>", module.name),
         }
     }
 
@@ -589,6 +605,10 @@ fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
         (Value::BoundMethod(x), Value::BoundMethod(y)) => {
             Rc::ptr_eq(&x.instance, &y.instance) && Rc::ptr_eq(&x.function, &y.function)
         }
+        // Modules compare by identity: importing the same file
+        // twice returns the same value, so this is almost always
+        // true for two imports of one module.
+        (Value::Module(x), Value::Module(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
