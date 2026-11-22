@@ -45,7 +45,7 @@ use std::rc::Rc;
 use crate::builtin::{Arity, Builtin, BuiltinFunc};
 use crate::env::Environment;
 use crate::error::RuntimeError;
-use crate::interp::Interpreter;
+use crate::interp::{CallArgs, Interpreter};
 use crate::value::{ModuleData, Value};
 
 /// Build the `gui` module value.
@@ -415,7 +415,7 @@ fn horizontal(
     let ui = current_ui("gui.horizontal")?;
     ui.horizontal(|inner| {
         let _scope = UiScope::new(inner);
-        interp.call_value(&func, vec![], input, out)
+        interp.call_value(&func, CallArgs::positional(vec![]), input, out)
     })
     .inner
 }
@@ -434,7 +434,7 @@ fn vertical(
     let ui = current_ui("gui.vertical")?;
     ui.vertical(|inner| {
         let _scope = UiScope::new(inner);
-        interp.call_value(&func, vec![], input, out)
+        interp.call_value(&func, CallArgs::positional(vec![]), input, out)
     })
     .inner
 }
@@ -548,7 +548,7 @@ impl eframe::App for GuiApp<'_> {
             let result = unsafe {
                 (*self.interp).call_value(
                     &self.func.clone(),
-                    vec![],
+                    CallArgs::positional(vec![]),
                     &mut *self.input,
                     &mut *self.out,
                 )

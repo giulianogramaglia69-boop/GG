@@ -33,6 +33,66 @@ impl fmt::Display for Program {
     }
 }
 
+/// One pattern in a `case` of a `match`: a literal value, `_`
+/// (matches anything), a binding (a bare identifier, bound to the
+/// value), or a list/tuple pattern matching the elements one by
+/// one (also nested). A literal is the expression as written — a
+/// number, a string, `true`/`false`, or a negated number — so it
+/// still carries its span; equality ignores spans, like
+/// everywhere else in the AST.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Literal(Expr),
+    Wildcard,
+    Binding(String),
+    List(Vec<Pattern>),
+    Tuple(Vec<Pattern>),
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pattern::Literal(expr) => write!(f, "{expr}"),
+            Pattern::Wildcard => write!(f, "_"),
+            Pattern::Binding(name) => write!(f, "{name}"),
+            Pattern::List(patterns) => {
+                write!(f, "[")?;
+                for (i, pattern) in patterns.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{pattern}")?;
+                }
+                write!(f, "]")
+            }
+            Pattern::Tuple(patterns) => {
+                write!(f, "(")?;
+                for (i, pattern) in patterns.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{pattern}")?;
+                }
+                // A one-element tuple keeps its trailing comma,
+                // like a one-element tuple literal.
+                if patterns.len() == 1 {
+                    write!(f, ",")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
+/// One `case` of a `match`: a pattern, an optional `if` guard
+/// (evaluated with the pattern's bindings in scope) and the body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Case {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
 /// One statement. The `span` is the token that opens it: the
 /// keyword for `let`/`if`/`while`/`for`/`fn`/`class`/`import`/
 /// `return`/`print`, the target expression for an assignment, the
@@ -96,7 +156,8 @@ pub enum Stmt {
     },
     Fn {
         name: String,
-        params: Vec<String>,
+        params: Vec<ParamDef>,
+        rest: Option<String>,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -118,6 +179,43 @@ pub enum Stmt {
         span: Span,
     },
     Return {
+        expr: Option<Expr>,
+        span: Span,
+    },
+    /// Error handling: `try then ... except e then ... finally then ... end`.
+    /// The `except` clause is optional when a `finally` is present (and
+    /// vice versa); at least one of the two is required. The bound
+    /// variable receives the error's message as a Str. The `finally`
+    /// block runs on every exit path — normal, error, and `return`.
+    Try {
+        body: Vec<Stmt>,
+        except_var: Option<String>,
+        except_body: Option<Vec<Stmt>>,
+        finally_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
+    /// Raise a runtime error: `raise "message"`. The message must
+    /// be a Str; the error points at the `raise`.
+    Raise {
+        expr: Expr,
+        span: Span,
+    },
+    /// Pattern matching: `match x then case 1 then ... case _ then
+    /// ... end`. The first case whose pattern matches (and whose
+    /// guard, if any, is true) runs; when none matches, nothing
+    /// happens. Match is a statement only (no match expression
+    /// yet).
+    Match {
+        scrutinee: Expr,
+        cases: Vec<Case>,
+        span: Span,
+    },
+    /// Yield a value from a generator function: `yield expr`.
+    /// A function whose body contains a `yield` is a generator:
+    /// calling it returns a generator value instead of running
+    /// the body; `next(gen)` resumes it up to the next `yield`.
+    /// A bare `yield` yields `nil`, like a bare `return`.
+    Yield {
         expr: Option<Expr>,
         span: Span,
     },
@@ -144,6 +242,10 @@ impl Stmt {
             | Stmt::Class { span, .. }
             | Stmt::Import { span, .. }
             | Stmt::Return { span, .. }
+            | Stmt::Try { span, .. }
+            | Stmt::Raise { span, .. }
+            | Stmt::Match { span, .. }
+            | Stmt::Yield { span, .. }
             | Stmt::ExprStmt { span, .. } => *span,
         }
     }
@@ -260,16 +362,18 @@ impl PartialEq for Stmt {
                 Fn {
                     name: n1,
                     params: p1,
+                    rest: r1,
                     body: b1,
                     ..
                 },
                 Fn {
                     name: n2,
                     params: p2,
+                    rest: r2,
                     body: b2,
                     ..
                 },
-            ) => n1 == n2 && p1 == p2 && b1 == b2,
+            ) => n1 == n2 && p1 == p2 && r1 == r2 && b1 == b2,
             (
                 Class {
                     name: n1,
@@ -297,6 +401,36 @@ impl PartialEq for Stmt {
                 },
             ) => n1 == n2 && a1 == a2,
             (Return { expr: e1, .. }, Return { expr: e2, .. }) => e1 == e2,
+            (
+                Try {
+                    body: b1,
+                    except_var: v1,
+                    except_body: e1,
+                    finally_body: f1,
+                    ..
+                },
+                Try {
+                    body: b2,
+                    except_var: v2,
+                    except_body: e2,
+                    finally_body: f2,
+                    ..
+                },
+            ) => b1 == b2 && v1 == v2 && e1 == e2 && f1 == f2,
+            (Raise { expr: e1, .. }, Raise { expr: e2, .. }) => e1 == e2,
+            (
+                Match {
+                    scrutinee: s1,
+                    cases: c1,
+                    ..
+                },
+                Match {
+                    scrutinee: s2,
+                    cases: c2,
+                    ..
+                },
+            ) => s1 == s2 && c1 == c2,
+            (Yield { expr: e1, .. }, Yield { expr: e2, .. }) => e1 == e2,
             (ExprStmt { expr: e1, .. }, ExprStmt { expr: e2, .. }) => e1 == e2,
             _ => false,
         }
@@ -308,8 +442,80 @@ impl PartialEq for Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MethodDef {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<ParamDef>,
+    pub rest: Option<String>,
     pub body: Vec<Stmt>,
+}
+
+/// One parameter of a function, lambda or method definition:
+/// `name`, or `name = default` — a default expression evaluated
+/// at definition time (Python rule), never at the call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamDef {
+    pub name: String,
+    pub default: Option<Expr>,
+}
+
+/// One argument in a call: a plain positional (`f(1)`), a spread
+/// (`f(*xs)`, expanding a list/tuple/array into positionals), or
+/// a keyword argument (`f(k = 2)`). The span is the argument
+/// expression itself for a positional, the `*` for a spread, and
+/// the keyword name for a keyword argument.
+#[derive(Debug, Clone)]
+pub enum Arg {
+    Positional(Expr),
+    Spread {
+        expr: Expr,
+        span: Span,
+    },
+    Keyword {
+        name: String,
+        value: Expr,
+        span: Span,
+    },
+}
+
+impl Arg {
+    /// The position that identifies this argument.
+    pub fn span(&self) -> Span {
+        match self {
+            Arg::Positional(expr) => expr.span(),
+            Arg::Spread { span, .. } | Arg::Keyword { span, .. } => *span,
+        }
+    }
+}
+
+// Spans are metadata: two arguments are equal when their
+// structure is equal, wherever they were written.
+impl PartialEq for Arg {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Arg::Positional(e1), Arg::Positional(e2)) => e1 == e2,
+            (Arg::Spread { expr: e1, .. }, Arg::Spread { expr: e2, .. }) => e1 == e2,
+            (
+                Arg::Keyword {
+                    name: n1,
+                    value: v1,
+                    ..
+                },
+                Arg::Keyword {
+                    name: n2,
+                    value: v2,
+                    ..
+                },
+            ) => n1 == n2 && v1 == v2,
+            _ => false,
+        }
+    }
+}
+
+/// One part of an f-string: literal text, or an interpolated
+/// expression whose value is rendered with the same Display as
+/// `print`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStringPart {
+    Text(String),
+    Expr(Expr),
 }
 
 /// One expression. The `span` is the token that identifies the
@@ -318,7 +524,8 @@ pub struct MethodDef {
 /// `Call`, the `[` for `Index`, the first `:` for `Slice`, the
 /// field or method name for `Field`/`MethodCall`/`SuperCall`,
 /// the opening bracket for `List`/`Tuple`/`Dict`/`Set`, the
-/// `self`/`super` keyword for `SelfExpr`/`SuperCall`.
+/// `self`/`super` keyword for `SelfExpr`/`SuperCall`, the `f`
+/// for `FString`.
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int {
@@ -331,6 +538,13 @@ pub enum Expr {
     },
     Str {
         value: String,
+        span: Span,
+    },
+    /// An f-string: `f"ciao {nome}"` — literal text parts and
+    /// interpolated expressions, evaluated left to right and
+    /// concatenated. The span is the `f` that opens it.
+    FString {
+        parts: Vec<FStringPart>,
         span: Span,
     },
     Bool {
@@ -354,7 +568,7 @@ pub enum Expr {
     },
     Call {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Arg>,
         span: Span,
     },
     /// A list literal: `[1, 2, 3]`, `[]`, nested and mixed.
@@ -379,6 +593,56 @@ pub enum Expr {
     /// empty set (Python convention).
     Set {
         elements: Vec<Expr>,
+        span: Span,
+    },
+    /// A list comprehension: `[x * 2 for x in xs]`, with an
+    /// optional filter: `[x for x in xs if x > 0]`. One `for`
+    /// clause only (no nested fors in this phase). The loop
+    /// variable(s) are scoped to the comprehension; `vars` has
+    /// one element, or two when unpacking pairs (`for k, v in
+    /// pairs`, each item a 2-tuple / 2-list / 2-element 1D array).
+    ListComp {
+        elem: Box<Expr>,
+        vars: Vec<String>,
+        iter: Box<Expr>,
+        cond: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// A dict comprehension: `{k: v for k, v in pairs}`, or with
+    /// a single variable: `{x: x * 2 for x in xs}`. Duplicate
+    /// keys: the last one wins (Python rule).
+    DictComp {
+        key: Box<Expr>,
+        value: Box<Expr>,
+        vars: Vec<String>,
+        iter: Box<Expr>,
+        cond: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// A set comprehension: `{x for x in xs}`, `{x for x in xs
+    /// if x > 0}`. Duplicates are dropped, like a set literal.
+    SetComp {
+        elem: Box<Expr>,
+        vars: Vec<String>,
+        iter: Box<Expr>,
+        cond: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// A lambda: `fn(x) x * 2 end` — `fn` without a name, as an
+    /// expression. The body is a single expression; its value is
+    /// the return value (no `return` inside, no statements).
+    /// Captures the defining environment, like a named function.
+    Lambda {
+        params: Vec<ParamDef>,
+        rest: Option<String>,
+        body: Box<Expr>,
+        span: Span,
+    },
+    /// A call of an arbitrary expression: `fn(x) x end(2)`,
+    /// `f()(3)`. Plain `name(args)` calls are `Expr::Call`.
+    CallExpr {
+        callee: Box<Expr>,
+        args: Vec<Arg>,
         span: Span,
     },
     /// Indexing: `xs[0]`, `f()[0]`, `xs[0][1]`, and multi-index
@@ -416,14 +680,14 @@ pub enum Expr {
     MethodCall {
         target: Box<Expr>,
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Arg>,
         span: Span,
     },
     /// A call into the parent class: `super.init(nome, eta)`,
     /// `super.saluta()`. Only valid inside a method.
     SuperCall {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Arg>,
         span: Span,
     },
 }
@@ -435,6 +699,7 @@ impl Expr {
             Expr::Int { span, .. }
             | Expr::Float { span, .. }
             | Expr::Str { span, .. }
+            | Expr::FString { span, .. }
             | Expr::Bool { span, .. }
             | Expr::Ident { span, .. }
             | Expr::Unary { span, .. }
@@ -444,6 +709,11 @@ impl Expr {
             | Expr::Tuple { span, .. }
             | Expr::Dict { span, .. }
             | Expr::Set { span, .. }
+            | Expr::ListComp { span, .. }
+            | Expr::DictComp { span, .. }
+            | Expr::SetComp { span, .. }
+            | Expr::Lambda { span, .. }
+            | Expr::CallExpr { span, .. }
             | Expr::Index { span, .. }
             | Expr::Slice { span, .. }
             | Expr::SelfExpr { span, .. }
@@ -463,6 +733,7 @@ impl PartialEq for Expr {
             (Int { value: v1, .. }, Int { value: v2, .. }) => v1 == v2,
             (Float { value: v1, .. }, Float { value: v2, .. }) => v1 == v2,
             (Str { value: v1, .. }, Str { value: v2, .. }) => v1 == v2,
+            (FString { parts: p1, .. }, FString { parts: p2, .. }) => p1 == p2,
             (Bool { value: v1, .. }, Bool { value: v2, .. }) => v1 == v2,
             (Ident { name: n1, .. }, Ident { name: n2, .. }) => n1 == n2,
             (
@@ -499,6 +770,82 @@ impl PartialEq for Expr {
             (Tuple { elements: e1, .. }, Tuple { elements: e2, .. }) => e1 == e2,
             (Dict { entries: e1, .. }, Dict { entries: e2, .. }) => e1 == e2,
             (Set { elements: e1, .. }, Set { elements: e2, .. }) => e1 == e2,
+            (
+                ListComp {
+                    elem: e1,
+                    vars: v1,
+                    iter: i1,
+                    cond: c1,
+                    ..
+                },
+                ListComp {
+                    elem: e2,
+                    vars: v2,
+                    iter: i2,
+                    cond: c2,
+                    ..
+                },
+            ) => e1 == e2 && v1 == v2 && i1 == i2 && c1 == c2,
+            (
+                DictComp {
+                    key: k1,
+                    value: v1,
+                    vars: vs1,
+                    iter: i1,
+                    cond: c1,
+                    ..
+                },
+                DictComp {
+                    key: k2,
+                    value: v2,
+                    vars: vs2,
+                    iter: i2,
+                    cond: c2,
+                    ..
+                },
+            ) => k1 == k2 && v1 == v2 && vs1 == vs2 && i1 == i2 && c1 == c2,
+            (
+                SetComp {
+                    elem: e1,
+                    vars: v1,
+                    iter: i1,
+                    cond: c1,
+                    ..
+                },
+                SetComp {
+                    elem: e2,
+                    vars: v2,
+                    iter: i2,
+                    cond: c2,
+                    ..
+                },
+            ) => e1 == e2 && v1 == v2 && i1 == i2 && c1 == c2,
+            (
+                Lambda {
+                    params: p1,
+                    rest: r1,
+                    body: b1,
+                    ..
+                },
+                Lambda {
+                    params: p2,
+                    rest: r2,
+                    body: b2,
+                    ..
+                },
+            ) => p1 == p2 && r1 == r2 && b1 == b2,
+            (
+                CallExpr {
+                    callee: c1,
+                    args: a1,
+                    ..
+                },
+                CallExpr {
+                    callee: c2,
+                    args: a2,
+                    ..
+                },
+            ) => c1 == c2 && a1 == a2,
             (
                 Index {
                     target: t1,
@@ -643,6 +990,16 @@ impl Expr {
             Expr::Int { value, .. } => write!(f, "{value}")?,
             Expr::Float { value, .. } => write!(f, "{}", format_float(*value))?,
             Expr::Str { value, .. } => write!(f, "\"{}\"", escape_str(value))?,
+            Expr::FString { parts, .. } => {
+                write!(f, "f\"")?;
+                for part in parts {
+                    match part {
+                        FStringPart::Text(text) => write!(f, "{}", escape_fstring_text(text))?,
+                        FStringPart::Expr(expr) => write!(f, "{{{expr}}}")?,
+                    }
+                }
+                write!(f, "\"")?;
+            }
             Expr::Bool { value, .. } => write!(f, "{value}")?,
             Expr::Ident { name, .. } => write!(f, "{name}")?,
             Expr::Unary { op, expr, .. } => {
@@ -663,12 +1020,7 @@ impl Expr {
             }
             Expr::Call { name, args, .. } => {
                 write!(f, "{name}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    arg.fmt_prec(f, 0)?;
-                }
+                fmt_args(f, args)?;
                 write!(f, ")")?;
             }
             Expr::List { elements, .. } => {
@@ -718,6 +1070,60 @@ impl Expr {
                 }
                 write!(f, "}}")?;
             }
+            Expr::ListComp {
+                elem,
+                vars,
+                iter,
+                cond,
+                ..
+            } => {
+                write!(f, "[")?;
+                elem.fmt_prec(f, 0)?;
+                write_comp_clause(f, vars, iter, cond)?;
+                write!(f, "]")?;
+            }
+            Expr::DictComp {
+                key,
+                value,
+                vars,
+                iter,
+                cond,
+                ..
+            } => {
+                write!(f, "{{")?;
+                key.fmt_prec(f, 0)?;
+                write!(f, ": ")?;
+                value.fmt_prec(f, 0)?;
+                write_comp_clause(f, vars, iter, cond)?;
+                write!(f, "}}")?;
+            }
+            Expr::SetComp {
+                elem,
+                vars,
+                iter,
+                cond,
+                ..
+            } => {
+                write!(f, "{{")?;
+                elem.fmt_prec(f, 0)?;
+                write_comp_clause(f, vars, iter, cond)?;
+                write!(f, "}}")?;
+            }
+            Expr::Lambda {
+                params, rest, body, ..
+            } => {
+                write!(f, "fn(")?;
+                fmt_params(f, params, rest)?;
+                write!(f, ") ")?;
+                body.fmt_prec(f, 0)?;
+                write!(f, " end")?;
+            }
+            Expr::CallExpr { callee, args, .. } => {
+                callee.fmt_prec(f, 8)?;
+                write!(f, "(")?;
+                fmt_args(f, args)?;
+                write!(f, ")")?;
+            }
             Expr::Index {
                 target, indices, ..
             } => {
@@ -756,22 +1162,12 @@ impl Expr {
             } => {
                 target.fmt_prec(f, 8)?;
                 write!(f, ".{name}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    arg.fmt_prec(f, 0)?;
-                }
+                fmt_args(f, args)?;
                 write!(f, ")")?;
             }
             Expr::SuperCall { name, args, .. } => {
                 write!(f, "super.{name}(")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    arg.fmt_prec(f, 0)?;
-                }
+                fmt_args(f, args)?;
                 write!(f, ")")?;
             }
         }
@@ -810,6 +1206,89 @@ fn escape_str(s: &str) -> String {
         }
     }
     out
+}
+
+/// Escape literal f-string text for re-printing: the string
+/// escapes, plus `{{`/`}}` for literal braces.
+fn escape_fstring_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '{' => out.push_str("{{"),
+            '}' => out.push_str("}}"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The shared tail of a comprehension: ` for x in xs` plus an
+/// optional ` if cond`.
+/// Print a parameter list: `a, b = 1, *rest` — defaults with
+/// ` = `, the rest parameter with a leading `*`.
+fn fmt_params(
+    f: &mut fmt::Formatter<'_>,
+    params: &[ParamDef],
+    rest: &Option<String>,
+) -> fmt::Result {
+    for (i, param) in params.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{}", param.name)?;
+        if let Some(default) = &param.default {
+            write!(f, " = ")?;
+            default.fmt_prec(f, 0)?;
+        }
+    }
+    if let Some(rest) = rest {
+        if !params.is_empty() {
+            write!(f, ", ")?;
+        }
+        write!(f, "*{rest}")?;
+    }
+    Ok(())
+}
+
+/// Print a call's argument list: `1, *xs, k = 2` — positionals
+/// plain, spreads with a leading `*`, keywords as `name = value`.
+fn fmt_args(f: &mut fmt::Formatter<'_>, args: &[Arg]) -> fmt::Result {
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        match arg {
+            Arg::Positional(expr) => expr.fmt_prec(f, 0)?,
+            Arg::Spread { expr, .. } => {
+                write!(f, "*")?;
+                expr.fmt_prec(f, 0)?;
+            }
+            Arg::Keyword { name, value, .. } => {
+                write!(f, "{name} = ")?;
+                value.fmt_prec(f, 0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_comp_clause(
+    f: &mut fmt::Formatter<'_>,
+    vars: &[String],
+    iter: &Expr,
+    cond: &Option<Box<Expr>>,
+) -> fmt::Result {
+    write!(f, " for {} in ", vars.join(", "))?;
+    iter.fmt_prec(f, 0)?;
+    if let Some(cond) = cond {
+        write!(f, " if ")?;
+        cond.fmt_prec(f, 0)?;
+    }
+    Ok(())
 }
 
 /// Write a list of statements, one per line, at the given indent level.
@@ -884,9 +1363,15 @@ impl Stmt {
                 write!(f, "{pad}end")
             }
             Stmt::Fn {
-                name, params, body, ..
+                name,
+                params,
+                rest,
+                body,
+                ..
             } => {
-                write!(f, "{pad}fn {name}({})", params.join(", "))?;
+                write!(f, "{pad}fn {name}(")?;
+                fmt_params(f, params, rest)?;
+                write!(f, ")")?;
                 write_block(f, body, indent + 1)?;
                 write!(f, "{pad}end")
             }
@@ -905,12 +1390,9 @@ impl Stmt {
                     if i > 0 {
                         writeln!(f)?;
                     }
-                    write!(
-                        f,
-                        "{pad}    fn {}({})",
-                        method.name,
-                        method.params.join(", ")
-                    )?;
+                    write!(f, "{pad}    fn {}(", method.name)?;
+                    fmt_params(f, &method.params, &method.rest)?;
+                    write!(f, ")")?;
                     write_block(f, &method.body, indent + 2)?;
                     write!(f, "{pad}    end")?;
                 }
@@ -929,6 +1411,57 @@ impl Stmt {
             Stmt::Return { expr, .. } => match expr {
                 Some(expr) => write!(f, "{pad}return {expr}"),
                 None => write!(f, "{pad}return"),
+            },
+            Stmt::Try {
+                body,
+                except_var,
+                except_body,
+                finally_body,
+                ..
+            } => {
+                write!(f, "{pad}try then")?;
+                write_block(f, body, indent + 1)?;
+                if let Some(except_body) = except_body {
+                    match except_var {
+                        Some(var) => write!(f, "{pad}except {var} then")?,
+                        None => write!(f, "{pad}except then")?,
+                    }
+                    write_block(f, except_body, indent + 1)?;
+                }
+                if let Some(finally_body) = finally_body {
+                    write!(f, "{pad}finally then")?;
+                    write_block(f, finally_body, indent + 1)?;
+                }
+                write!(f, "{pad}end")
+            }
+            Stmt::Raise { expr, .. } => write!(f, "{pad}raise {expr}"),
+            Stmt::Match {
+                scrutinee, cases, ..
+            } => {
+                write!(f, "{pad}match {scrutinee} then")?;
+                if cases.is_empty() {
+                    writeln!(f)?;
+                }
+                // `write_block` ends with a newline, so only the
+                // first case needs one before it.
+                let mut first = true;
+                for case in cases {
+                    if first {
+                        writeln!(f)?;
+                        first = false;
+                    }
+                    write!(f, "{pad}    case {}", case.pattern)?;
+                    if let Some(guard) = &case.guard {
+                        write!(f, " if {guard}")?;
+                    }
+                    write!(f, " then")?;
+                    write_block(f, &case.body, indent + 2)?;
+                }
+                write!(f, "{pad}end")
+            }
+            Stmt::Yield { expr, .. } => match expr {
+                Some(expr) => write!(f, "{pad}yield {expr}"),
+                None => write!(f, "{pad}yield"),
             },
             Stmt::ExprStmt { expr, .. } => write!(f, "{pad}{expr}"),
         }

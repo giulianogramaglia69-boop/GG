@@ -1,0 +1,29 @@
+# F-strings (Phase 22): `f"..."` interpolates any GG expression
+# inside `{...}` — rendered with the same Display as `print`.
+# `{{` and `}}` are literal braces. No format specs (`{x:.2f}`),
+# no `!r`/`!s` conversions, no `{x=}` debug form (yet).
+
+# 1. A greeting with a name and an age.
+let nome = "Giuliano"
+let eta = 14
+print f"ciao {nome}, hai {eta} anni"
+
+# 2. Arithmetic and calls inside the braces.
+print f"2 + 3 fa {2 + 3}, il doppio di 7 e {7 * 2}"
+print f"in maiuscolo: {upper("ciao")}"
+
+# 3. Indexing and a list inside the braces.
+let voti = [8, 9, 7]
+print f"i voti sono {voti}, il primo e {voti[0]}"
+
+# 4. Literal braces with `{{` and `}}` (inner quotes need `\"`,
+# like in a normal string — a raw `"` would close the f-string).
+print f"un dict si scrive cosi: {{\"nome\": \"Giuliano\"}}"
+
+# 5. A nested f-string.
+print f"fuori {f"dentro {nome}"}"
+
+# 6. An f-string is just a Str: it goes in a variable, and it
+# can be built from other values.
+let saluto = f"{nome} ha {eta} anni e {len(voti)} voti"
+print saluto

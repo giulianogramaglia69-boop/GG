@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gg_lexer::Span;
-use gg_parser::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+use gg_parser::ast::{Arg, BinaryOp, Expr, FStringPart, ParamDef, Pattern, Program, Stmt, UnaryOp};
 
 use crate::array::{self, ArrayOp, CompareOp, flat_index, subarray};
 use crate::builtin::{self, BuiltinFunc};
@@ -25,8 +25,8 @@ use crate::env::Environment;
 use crate::error::RuntimeError;
 use crate::slice::{AxisSelector, IndexArg, SliceSpec};
 use crate::value::{
-    BoundMethod, ClassDef, DictData, Function, InstanceData, ModuleData, Value, elem_type_of,
-    lookup_method, values_equal,
+    BoundMethod, ClassDef, DictData, Function, GeneratorData, InstanceData, ModuleData, Value,
+    elem_type_of, lookup_method, values_equal,
 };
 
 /// What executing a statement produced: either control flows on
@@ -35,6 +35,144 @@ enum Flow {
     Normal,
     /// `return` with its value and the span of the `return`.
     Return(Value, Span),
+    /// `yield` with its value and the span of the `yield`: only
+    /// produced while a generator is being replayed (see
+    /// `yield_mode`); it stops the replay at that `yield`.
+    Yield(Value, Span),
+}
+
+/// The state of a generator replay: `next()` replays the body
+/// from the start and counts the `yield`s it meets; the replay
+/// stops at the `target`-th one (`seen` counts them). `None`
+/// outside a replay.
+#[derive(Debug, Clone, Copy)]
+struct YieldMode {
+    target: usize,
+    seen: usize,
+}
+
+/// True when a function body contains a `yield` anywhere — in a
+/// block, a loop, a `try`, a `match` case — but not inside a nested
+/// function or class: those are functions of their own, with
+/// their own generator status.
+fn body_contains_yield(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Yield { .. } => true,
+        Stmt::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            body_contains_yield(then_block)
+                || else_block.as_ref().is_some_and(|b| body_contains_yield(b))
+        }
+        Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ForIn { body, .. } => {
+            body_contains_yield(body)
+        }
+        Stmt::Try {
+            body,
+            except_body,
+            finally_body,
+            ..
+        } => {
+            body_contains_yield(body)
+                || except_body.as_ref().is_some_and(|b| body_contains_yield(b))
+                || finally_body
+                    .as_ref()
+                    .is_some_and(|b| body_contains_yield(b))
+        }
+        Stmt::Match { cases, .. } => cases.iter().any(|case| body_contains_yield(&case.body)),
+        _ => false,
+    })
+}
+
+/// The value of a literal pattern: a number, a string, a boolean,
+/// or a negated number. Anything else cannot appear here — the
+/// parser only builds literals in a pattern.
+fn pattern_literal_value(expr: &Expr) -> Value {
+    match expr {
+        Expr::Int { value, .. } => Value::Int(*value),
+        Expr::Float { value, .. } => Value::Float(*value),
+        Expr::Str { value, .. } => Value::Str(value.clone()),
+        Expr::Bool { value, .. } => Value::Bool(*value),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+            ..
+        } => match pattern_literal_value(expr) {
+            Value::Int(n) => Value::Int(-n),
+            Value::Float(x) => Value::Float(-x),
+            other => other,
+        },
+        _ => Value::Nil,
+    }
+}
+
+/// Match `pattern` against `value`: the bindings the pattern
+/// makes on success (`Some`), or `None` when it does not match.
+/// A structural mismatch (a list pattern against a list of a
+/// different length, a list pattern against a tuple) is simply
+/// no match, never an error — the next `case` is tried.
+fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
+    match pattern {
+        Pattern::Literal(expr) => {
+            let literal = pattern_literal_value(expr);
+            if values_equal(&literal, value) {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }
+        Pattern::Wildcard => Some(Vec::new()),
+        Pattern::Binding(name) => Some(vec![(name.clone(), value.clone())]),
+        Pattern::List(patterns) => {
+            let Value::List(items) = value else {
+                return None;
+            };
+            let items = items.borrow();
+            if items.len() != patterns.len() {
+                return None;
+            }
+            let mut bindings = Vec::new();
+            for (pattern, item) in patterns.iter().zip(items.iter()) {
+                bindings.extend(match_pattern(pattern, item)?);
+            }
+            Some(bindings)
+        }
+        Pattern::Tuple(patterns) => {
+            let Value::Tuple(items) = value else {
+                return None;
+            };
+            if items.len() != patterns.len() {
+                return None;
+            }
+            let mut bindings = Vec::new();
+            for (pattern, item) in patterns.iter().zip(items.iter()) {
+                bindings.extend(match_pattern(pattern, item)?);
+            }
+            Some(bindings)
+        }
+    }
+}
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CallArgs {
+    pub positional: Vec<Value>,
+    pub kwargs: Vec<(String, Value, Span)>,
+}
+
+impl CallArgs {
+    /// Arguments with positionals only (what the GUI module and
+    /// other Rust callers pass).
+    pub fn positional(values: Vec<Value>) -> Self {
+        Self {
+            positional: values,
+            kwargs: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positional.is_empty() && self.kwargs.is_empty()
+    }
 }
 
 /// The items of a value a `for x in ...` loop iterates over, as a
@@ -84,6 +222,179 @@ fn iterable_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
     }
 }
 
+/// The items a spread (`*xs` in a call) expands into positional
+/// arguments: the elements of a list or tuple, the elements of a
+/// 1D array, the rows of a 2D+ array. Anything else — a set, a
+/// dict, a string, a number — is an error: only lists, tuples
+/// and arrays can be spread.
+fn spread_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
+    match value {
+        Value::List(_) | Value::Tuple(_) | Value::Array(_) => iterable_items(value),
+        other => Err(RuntimeError::new(format!(
+            "cannot spread {} (only lists, tuples and arrays can be spread)",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Bind a call's evaluated arguments to a function's parameters
+/// and return the `(name, value)` pairs in parameter order (the
+/// rest parameter, if any, last).
+///
+/// `prebound` are parameters already bound by the caller —
+/// `self` for a method — so a positional argument never lands
+/// on them and a keyword for one is a duplicate. `method` is
+/// the method name for a method call (it shapes the arity
+/// message), `None` for a plain function.
+///
+/// Order of checks: too many positionals (when defaults make
+/// the count non-obvious), then keywords (unknown name, then
+/// duplicate), then the total count for a function with neither
+/// defaults nor a rest parameter, then the missing required
+/// arguments (filled from defaults where there is one).
+fn bind_arguments(
+    params: &[String],
+    defaults: &[Option<Value>],
+    rest: Option<&str>,
+    args: &CallArgs,
+    prebound: &[(&str, Value)],
+    method: Option<&str>,
+) -> Result<Vec<(String, Value)>, RuntimeError> {
+    let n = params.len();
+    let has_defaults = defaults.iter().any(|d| d.is_some());
+    let max_positional = n - prebound.len();
+    // Too many positionals: only ambiguous when defaults exist
+    // (otherwise the total count below reports it with the
+    // plain message).
+    if rest.is_none() && has_defaults && args.positional.len() > max_positional {
+        return Err(RuntimeError::new(match method {
+            Some(name) => format!(
+                "method '{name}' takes at most {max_positional} positional argument(s) but got {}",
+                args.positional.len()
+            ),
+            None => format!(
+                "takes at most {max_positional} positional argument(s) but got {}",
+                args.positional.len()
+            ),
+        }));
+    }
+    let mut assigned: Vec<Option<Value>> = vec![None; n];
+    for (name, value) in prebound {
+        let i = params
+            .iter()
+            .position(|p| p == name)
+            .expect("a prebound parameter is one of the function's parameters");
+        assigned[i] = Some(value.clone());
+    }
+    // Positionals fill the free parameters in order; extras go
+    // to the rest parameter, or are dropped here and reported
+    // by the total count below (no defaults, no rest).
+    let mut extra = Vec::new();
+    let mut next = 0;
+    for value in &args.positional {
+        while next < n && assigned[next].is_some() {
+            next += 1;
+        }
+        if next < n {
+            assigned[next] = Some(value.clone());
+            next += 1;
+        } else if rest.is_some() {
+            extra.push(value.clone());
+        }
+    }
+    for (name, value, span) in &args.kwargs {
+        let Some(i) = params.iter().position(|p| p == name) else {
+            return Err(RuntimeError::with_span(
+                format!("unknown keyword argument '{name}'"),
+                *span,
+            ));
+        };
+        if assigned[i].is_some() {
+            return Err(RuntimeError::with_span(
+                format!("got multiple values for argument '{name}'"),
+                *span,
+            ));
+        }
+        assigned[i] = Some(value.clone());
+    }
+    // A function with neither defaults nor a rest parameter
+    // takes exactly this many arguments — the plain message,
+    // unchanged from before keyword arguments existed.
+    if !has_defaults && rest.is_none() {
+        let total = args.positional.len() + args.kwargs.len();
+        if total != max_positional {
+            return Err(RuntimeError::new(match method {
+                Some(name) => {
+                    format!("method '{name}' expects {max_positional} argument(s) but got {total}")
+                }
+                None => format!("expected {max_positional} argument(s) but got {total}"),
+            }));
+        }
+    }
+    let mut bindings = Vec::with_capacity(n + 1);
+    for (i, slot) in assigned.into_iter().enumerate() {
+        match slot {
+            Some(value) => bindings.push((params[i].clone(), value)),
+            None => match &defaults[i] {
+                Some(default) => bindings.push((params[i].clone(), default.clone())),
+                None => {
+                    return Err(RuntimeError::new(format!(
+                        "missing required argument '{}'",
+                        params[i]
+                    )));
+                }
+            },
+        }
+    }
+    if let Some(rest_name) = rest {
+        bindings.push((
+            rest_name.to_string(),
+            Value::List(Rc::new(RefCell::new(extra))),
+        ));
+    }
+    Ok(bindings)
+}
+
+/// Bind a comprehension's loop variable(s) in a fresh child scope:
+/// one variable takes the item itself; two variables unpack a
+/// 2-tuple, a 2-list, or a 2-element 1D array. The scope is fresh
+/// per item, so the variable never leaks out of the comprehension.
+fn bind_comp_vars(
+    vars: &[String],
+    item: Value,
+    env: &Rc<Environment>,
+    span: Span,
+) -> Result<Rc<Environment>, RuntimeError> {
+    let child = Environment::child(env);
+    if vars.len() == 1 {
+        child.define(&vars[0], item);
+        return Ok(child);
+    }
+    let pair: Option<Vec<Value>> = match &item {
+        Value::Tuple(items) if items.len() == 2 => Some(items.as_ref().clone()),
+        Value::List(list) if list.borrow().len() == 2 => Some(list.borrow().clone()),
+        Value::Array(array) => {
+            let data = array.borrow();
+            if data.shape.len() == 1 && data.shape[0] == 2 {
+                Some(data.items.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let Some(pair) = pair else {
+        return Err(RuntimeError::new(format!(
+            "cannot unpack {} into 2 variables (need a 2-tuple, 2-list or 2-element array)",
+            item.type_name()
+        ))
+        .at(span));
+    };
+    child.define(&vars[0], pair[0].clone());
+    child.define(&vars[1], pair[1].clone());
+    Ok(child)
+}
+
 /// The interpreter. One instance keeps a global environment across
 /// `run` calls, so a REPL can reuse it later.
 ///
@@ -105,6 +416,12 @@ fn iterable_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
 /// frame function calling `gui.run()` again is an error (eframe
 /// cannot nest event loops), and the flag is cleared when the
 /// window closes, success or failure.
+///
+/// `yield_mode` is set while a generator is being replayed by
+/// `next()`: a `yield` counts toward the target and stops the
+/// replay when it reaches it. It is `None` outside a replay, and
+/// saved/restored around a nested `next()` (a generator body
+/// pulling from another generator).
 pub struct Interpreter {
     globals: Rc<Environment>,
     super_stack: Vec<Rc<ClassDef>>,
@@ -114,6 +431,7 @@ pub struct Interpreter {
     embedded_cache: HashMap<String, Value>,
     loading_embedded: Vec<String>,
     native_cache: HashMap<String, Value>,
+    yield_mode: Option<YieldMode>,
     #[cfg(feature = "gui")]
     pub(crate) gui_running: bool,
 }
@@ -137,6 +455,7 @@ impl Interpreter {
             embedded_cache: HashMap::new(),
             loading_embedded: Vec::new(),
             native_cache: HashMap::new(),
+            yield_mode: None,
             #[cfg(feature = "gui")]
             gui_running: false,
         }
@@ -181,7 +500,7 @@ impl Interpreter {
                 function,
                 class,
             };
-            let result = self.call_method(&bound, vec![], input, out)?;
+            let result = self.call_method(&bound, CallArgs::default(), input, out)?;
             let Value::Str(s) = result else {
                 return Err(RuntimeError::new("str() method must return a Str"));
             };
@@ -215,6 +534,9 @@ impl Interpreter {
         match self.exec_block(&program.stmts, &globals, input, out)? {
             Flow::Normal => Ok(()),
             Flow::Return(_, span) => Err(RuntimeError::with_span("return outside function", span)),
+            // Unreachable in practice: the parser rejects `yield`
+            // outside a function.
+            Flow::Yield(_, span) => Err(RuntimeError::with_span("yield outside function", span)),
         }
     }
 
@@ -229,7 +551,7 @@ impl Interpreter {
         for stmt in stmts {
             match self.exec_stmt(stmt, env, input, out)? {
                 Flow::Normal => {}
-                flow @ Flow::Return(..) => return Ok(flow),
+                flow @ (Flow::Return(..) | Flow::Yield(..)) => return Ok(flow),
             }
         }
         Ok(Flow::Normal)
@@ -249,6 +571,26 @@ impl Interpreter {
         let span = stmt.span();
         self.exec_stmt_inner(stmt, env, input, out)
             .map_err(|e| e.at(span))
+    }
+
+    /// Execute a `finally` block, if there is one, in its own
+    /// child scope. `Flow::Normal` when there is no block or it
+    /// ran to completion; a `return` inside it comes back as
+    /// `Flow::Return`, an error as `Err`.
+    fn run_finally(
+        &mut self,
+        finally_body: &Option<Vec<Stmt>>,
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Flow, RuntimeError> {
+        match finally_body {
+            Some(finally_body) => {
+                let child = Environment::child(env);
+                self.exec_block(finally_body, &child, input, out)
+            }
+            None => Ok(Flow::Normal),
+        }
     }
 
     /// Execute one statement (the body; see `exec_stmt`).
@@ -307,8 +649,13 @@ impl Interpreter {
                 // an earlier one (like Python).
                 let mut def_methods: Vec<(String, Rc<Function>)> = Vec::new();
                 for method in methods {
+                    // Defaults are evaluated once, here, in the
+                    // environment where the class is defined.
+                    let defaults = self.eval_param_defaults(&method.params, env, input, out)?;
                     let function = Rc::new(Function {
-                        params: method.params.clone(),
+                        params: method.params.iter().map(|p| p.name.clone()).collect(),
+                        defaults,
+                        rest: method.rest.clone(),
                         body: method.body.clone(),
                         env: Rc::clone(env),
                         // Methods get their `super` context from the
@@ -368,7 +715,7 @@ impl Interpreter {
                 let child = Environment::child(env);
                 match self.exec_block(body, &child, input, out)? {
                     Flow::Normal => {}
-                    flow @ Flow::Return(..) => return Ok(flow),
+                    flow @ (Flow::Return(..) | Flow::Yield(..)) => return Ok(flow),
                 }
             },
             Stmt::For {
@@ -406,7 +753,7 @@ impl Interpreter {
                     let child = Environment::child(&loop_env);
                     match self.exec_block(body, &child, input, out)? {
                         Flow::Normal => {}
-                        flow @ Flow::Return(..) => return Ok(flow),
+                        flow @ (Flow::Return(..) | Flow::Yield(..)) => return Ok(flow),
                     }
                     i += if from <= to { 1 } else { -1 };
                 }
@@ -415,9 +762,28 @@ impl Interpreter {
             Stmt::ForIn {
                 var, iter, body, ..
             } => {
+                let value = self.eval_expr(iter, env, input, out)?;
+                // A generator is pulled lazily, one `next()` at a
+                // time: snapshotting it would run an infinite
+                // generator forever. Its exhaustion ends the loop
+                // silently; any other error inside it propagates.
+                if let Value::Generator(generator) = &value {
+                    let generator = Rc::clone(generator);
+                    let loop_env = Environment::child(env);
+                    while let Some(item) = self.next_generator(&generator, input, out)? {
+                        loop_env.define(var, item);
+                        let child = Environment::child(&loop_env);
+                        match self.exec_block(body, &child, input, out)? {
+                            Flow::Normal => {}
+                            flow @ (Flow::Return(..) | Flow::Yield(..)) => {
+                                return Ok(flow);
+                            }
+                        }
+                    }
+                    return Ok(Flow::Normal);
+                }
                 // The iterable is evaluated once, then snapshotted:
                 // the loop visits exactly those items, in order.
-                let value = self.eval_expr(iter, env, input, out)?;
                 let items = iterable_items(&value).map_err(|e| e.at(iter.span()))?;
                 // Same scoping as the numeric for: the loop variable
                 // lives in its own scope, visible only to the body.
@@ -427,20 +793,28 @@ impl Interpreter {
                     let child = Environment::child(&loop_env);
                     match self.exec_block(body, &child, input, out)? {
                         Flow::Normal => {}
-                        flow @ Flow::Return(..) => return Ok(flow),
+                        flow @ (Flow::Return(..) | Flow::Yield(..)) => return Ok(flow),
                     }
                 }
                 Ok(Flow::Normal)
             }
             Stmt::Fn {
-                name, params, body, ..
+                name,
+                params,
+                rest,
+                body,
+                ..
             } => {
                 // The function captures `env` itself, so it can see the
                 // name being defined here: recursion works. It also
                 // captures the class of the method it is defined in
                 // (if any), so `super` inside it resolves lexically.
+                // Defaults are evaluated once, here, at definition.
+                let defaults = self.eval_param_defaults(params, env, input, out)?;
                 let function = Function {
-                    params: params.clone(),
+                    params: params.iter().map(|p| p.name.clone()).collect(),
+                    defaults,
+                    rest: rest.clone(),
                     body: body.clone(),
                     env: Rc::clone(env),
                     super_class: self.super_stack.last().cloned(),
@@ -454,6 +828,105 @@ impl Interpreter {
                     None => Value::Nil,
                 };
                 Ok(Flow::Return(value, stmt.span()))
+            }
+            Stmt::Try {
+                body,
+                except_var,
+                except_body,
+                finally_body,
+                ..
+            } => {
+                // The outcome of the guarded region: either the
+                // body's flow, or the except body's flow when an
+                // error was caught. The `finally` block runs
+                // afterwards on every path (see below).
+                let outcome = match self.exec_block(body, env, input, out) {
+                    Ok(flow) => Ok(flow),
+                    Err(err) => match except_body {
+                        Some(except_body) => {
+                            // The handler runs in its own child
+                            // scope; the bound variable holds the
+                            // error's message as a Str.
+                            let child = Environment::child(env);
+                            if let Some(var) = except_var {
+                                child.define(var, Value::Str(err.message.clone()));
+                            }
+                            self.exec_block(except_body, &child, input, out)
+                        }
+                        None => Err(err),
+                    },
+                };
+                // `finally` always runs — after a normal exit, after
+                // a caught error, after an uncaught one, and after a
+                // `return`. A `return` inside it replaces the
+                // pending outcome (Python rule); an error inside it
+                // replaces it too. A `yield` inside it replaces it
+                // the same way (the replay stops there).
+                match self.run_finally(finally_body, env, input, out)? {
+                    Flow::Normal => outcome,
+                    flow @ (Flow::Return(..) | Flow::Yield(..)) => Ok(flow),
+                }
+            }
+            Stmt::Raise { expr, .. } => {
+                let value = self.eval_expr(expr, env, input, out)?;
+                let Value::Str(message) = value else {
+                    return Err(RuntimeError::with_span(
+                        "raise requires a Str message",
+                        expr.span(),
+                    ));
+                };
+                Err(RuntimeError::with_span(message, stmt.span()))
+            }
+            Stmt::Match {
+                scrutinee, cases, ..
+            } => {
+                let value = self.eval_expr(scrutinee, env, input, out)?;
+                for case in cases {
+                    if let Some(bindings) = match_pattern(&case.pattern, &value) {
+                        // The guard runs in the case's own scope,
+                        // with the pattern's bindings visible; a
+                        // false guard means this case is not
+                        // chosen, and the next one is tried.
+                        let child = Environment::child(env);
+                        for (name, bound) in bindings {
+                            child.define(&name, bound);
+                        }
+                        let guard_ok = match &case.guard {
+                            Some(guard) => self.eval_expr(guard, &child, input, out)?.is_truthy(),
+                            None => true,
+                        };
+                        if guard_ok {
+                            return self.exec_block(&case.body, &child, input, out);
+                        }
+                    }
+                }
+                // No case matched: nothing happens (`case _` is
+                // the idiomatic fallback).
+                Ok(Flow::Normal)
+            }
+            Stmt::Yield { expr, .. } => {
+                let value = match expr {
+                    Some(expr) => self.eval_expr(expr, env, input, out)?,
+                    None => Value::Nil,
+                };
+                // Outside a replay this is unreachable in practice
+                // (the parser rejects `yield` outside a function,
+                // and a function with `yield` is a generator, so
+                // its body only ever runs in a replay) — but a
+                // stray `yield` must be an error, not a silent
+                // drop of the value.
+                let Some(mode) = &mut self.yield_mode else {
+                    return Err(RuntimeError::with_span(
+                        "yield outside a generator",
+                        stmt.span(),
+                    ));
+                };
+                mode.seen += 1;
+                if mode.seen == mode.target {
+                    Ok(Flow::Yield(value, stmt.span()))
+                } else {
+                    Ok(Flow::Normal)
+                }
             }
             Stmt::ExprStmt { expr, .. } => {
                 self.eval_expr(expr, env, input, out)?;
@@ -474,6 +947,19 @@ impl Interpreter {
             Expr::Int { value, .. } => Ok(Value::Int(*value)),
             Expr::Float { value, .. } => Ok(Value::Float(*value)),
             Expr::Str { value, .. } => Ok(Value::Str(value.clone())),
+            Expr::FString { parts, .. } => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        FStringPart::Text(text) => result.push_str(text),
+                        FStringPart::Expr(expr) => {
+                            let value = self.eval_expr(expr, env, input, out)?;
+                            result.push_str(&self.display(&value, input, out)?);
+                        }
+                    }
+                }
+                Ok(Value::Str(result))
+            }
             Expr::Bool { value, .. } => Ok(Value::Bool(*value)),
             Expr::Ident { name, span } => env.get(name).map_err(|e| e.at(*span)),
             Expr::List { elements, .. } => {
@@ -524,6 +1010,122 @@ impl Interpreter {
                 }
                 Ok(Value::Set(Rc::new(RefCell::new(items))))
             }
+            Expr::ListComp {
+                elem,
+                vars,
+                iter,
+                cond,
+                span,
+            } => {
+                let iter_value = self.eval_expr(iter, env, input, out)?;
+                let items = iterable_items(&iter_value).map_err(|e| e.at(iter.span()))?;
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    let child = bind_comp_vars(vars, item, env, *span)?;
+                    if let Some(cond) = cond {
+                        let keep = self.eval_expr(cond, &child, input, out)?;
+                        if !keep.is_truthy() {
+                            continue;
+                        }
+                    }
+                    values.push(self.eval_expr(elem, &child, input, out)?);
+                }
+                Ok(Value::List(Rc::new(RefCell::new(values))))
+            }
+            Expr::DictComp {
+                key: key_expr,
+                value: value_expr,
+                vars,
+                iter,
+                cond,
+                span,
+            } => {
+                let iter_value = self.eval_expr(iter, env, input, out)?;
+                let items = iterable_items(&iter_value).map_err(|e| e.at(iter.span()))?;
+                let mut data = DictData::new();
+                for item in items {
+                    let child = bind_comp_vars(vars, item, env, *span)?;
+                    if let Some(cond) = cond {
+                        let keep = self.eval_expr(cond, &child, input, out)?;
+                        if !keep.is_truthy() {
+                            continue;
+                        }
+                    }
+                    let key = self.eval_expr(key_expr, &child, input, out)?;
+                    let Some(key) = key.to_key() else {
+                        return Err(RuntimeError::new(format!(
+                            "dict key must be Int, Float, Str or Bool, not {}",
+                            key.type_name()
+                        ))
+                        .at(key_expr.span()));
+                    };
+                    let value = self.eval_expr(value_expr, &child, input, out)?;
+                    // Duplicate keys: the last one wins (Python rule).
+                    data.insert(key, value);
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(data))))
+            }
+            Expr::SetComp {
+                elem,
+                vars,
+                iter,
+                cond,
+                span,
+            } => {
+                let iter_value = self.eval_expr(iter, env, input, out)?;
+                let items = iterable_items(&iter_value).map_err(|e| e.at(iter.span()))?;
+                let mut items_out = Vec::new();
+                for item in items {
+                    let child = bind_comp_vars(vars, item, env, *span)?;
+                    if let Some(cond) = cond {
+                        let keep = self.eval_expr(cond, &child, input, out)?;
+                        if !keep.is_truthy() {
+                            continue;
+                        }
+                    }
+                    let value = self.eval_expr(elem, &child, input, out)?;
+                    let Some(key) = value.to_key() else {
+                        return Err(RuntimeError::new(format!(
+                            "set element must be Int, Float, Str or Bool, not {}",
+                            value.type_name()
+                        ))
+                        .at(elem.span()));
+                    };
+                    // Duplicates are ignored silently.
+                    if !items_out.contains(&key) {
+                        items_out.push(key);
+                    }
+                }
+                Ok(Value::Set(Rc::new(RefCell::new(items_out))))
+            }
+            Expr::Lambda {
+                params, rest, body, ..
+            } => {
+                // The body is a single expression: desugar it to a
+                // `return`, so calling the lambda runs the body and
+                // yields the expression's value — like a named
+                // function's body, including the captured env.
+                // Defaults are evaluated once, here, at definition.
+                let defaults = self.eval_param_defaults(params, env, input, out)?;
+                let function = Function {
+                    params: params.iter().map(|p| p.name.clone()).collect(),
+                    defaults,
+                    rest: rest.clone(),
+                    body: vec![Stmt::Return {
+                        expr: Some((**body).clone()),
+                        span: body.span(),
+                    }],
+                    env: Rc::clone(env),
+                    super_class: self.super_stack.last().cloned(),
+                };
+                Ok(Value::Function(Rc::new(function)))
+            }
+            Expr::CallExpr { callee, args, span } => {
+                let callee = self.eval_expr(callee, env, input, out)?;
+                let args = self.eval_call_args(args, env, input, out)?;
+                self.call_value(&callee, args, input, out)
+                    .map_err(|e| e.at(*span))
+            }
             Expr::Index {
                 target,
                 indices,
@@ -548,11 +1150,8 @@ impl Interpreter {
                 span,
             } => {
                 let obj = self.eval_expr(target, env, input, out)?;
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval_expr(arg, env, input, out)?);
-                }
-                self.call_method_on(&obj, name, values, input, out)
+                let args = self.eval_call_args(args, env, input, out)?;
+                self.call_method_on(&obj, name, args, input, out)
                     .map_err(|e| e.at(*span))
             }
             Expr::SuperCall { name, args, span } => {
@@ -574,17 +1173,14 @@ impl Interpreter {
                 let Value::Instance(instance) = env.get("self").map_err(|e| e.at(*span))? else {
                     return Err(RuntimeError::new("'self' is not an instance").at(*span));
                 };
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval_expr(arg, env, input, out)?);
-                }
+                let args = self.eval_call_args(args, env, input, out)?;
                 let bound = BoundMethod {
                     name: name.to_string(),
                     instance,
                     function,
                     class,
                 };
-                self.call_method(&bound, values, input, out)
+                self.call_method(&bound, args, input, out)
                     .map_err(|e| e.at(*span))
             }
             Expr::Unary { op, expr, span } => {
@@ -609,11 +1205,8 @@ impl Interpreter {
             Expr::Binary { .. } => self.eval_binary(expr, env, input, out),
             Expr::Call { name, args, span } => {
                 let callee = env.get(name).map_err(|e| e.at(*span))?;
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval_expr(arg, env, input, out)?);
-                }
-                self.call_value(&callee, values, input, out)
+                let args = self.eval_call_args(args, env, input, out)?;
+                self.call_value(&callee, args, input, out)
                     .map_err(|e| e.at(*span))
             }
         }
@@ -685,42 +1278,44 @@ impl Interpreter {
     pub(crate) fn call_value(
         &mut self,
         callee: &Value,
-        args: Vec<Value>,
+        args: CallArgs,
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
         match callee {
-            Value::Function(function) => {
-                if args.len() != function.params.len() {
+            Value::Function(function) => self.call(function, args, input, out),
+            Value::Builtin(builtin) => {
+                // Builtins stay positional in this phase: a
+                // keyword argument is a clear error, not a
+                // silent ignore.
+                if !args.kwargs.is_empty() {
                     return Err(RuntimeError::new(format!(
-                        "expected {} argument(s) but got {}",
-                        function.params.len(),
-                        args.len()
+                        "builtin '{}' does not accept keyword arguments",
+                        builtin.name
                     )));
                 }
-                self.call(function, args, input, out)
-            }
-            Value::Builtin(builtin) => {
-                if !builtin.arity.accepts(args.len()) {
+                if !builtin.arity.accepts(args.positional.len()) {
                     return Err(RuntimeError::new(format!(
                         "{}() expects {} argument(s) but got {}",
                         builtin.name,
                         builtin.arity.describe(),
-                        args.len()
+                        args.positional.len()
                     )));
                 }
                 // `str` on an instance with a custom `str` method
                 // uses it (see `display`); anything else goes to
                 // the builtin itself.
-                if builtin.name == "str" && matches!(args.first(), Some(Value::Instance(_))) {
-                    return Ok(Value::Str(self.display(&args[0], input, out)?));
+                if builtin.name == "str"
+                    && matches!(args.positional.first(), Some(Value::Instance(_)))
+                {
+                    return Ok(Value::Str(self.display(&args.positional[0], input, out)?));
                 }
                 // Plain builtins are Rust functions; `WithInterp`
                 // builtins (the `gui` module) get the interpreter
                 // so they can call GG code back.
                 match &builtin.func {
-                    BuiltinFunc::Plain(func) => func(&args, input, out),
-                    BuiltinFunc::WithInterp(func) => func(self, &args, input, out),
+                    BuiltinFunc::Plain(func) => func(&args.positional, input, out),
+                    BuiltinFunc::WithInterp(func) => func(self, &args.positional, input, out),
                 }
             }
             Value::BoundMethod(bound) => self.call_method(bound, args, input, out),
@@ -788,7 +1383,7 @@ impl Interpreter {
         &mut self,
         obj: &Value,
         name: &str,
-        args: Vec<Value>,
+        args: CallArgs,
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
@@ -821,8 +1416,11 @@ impl Interpreter {
                     // When it is an instance, go through the method
                     // call so `super` works inside; otherwise call
                     // the function plainly and let it fail on `self`.
-                    if let Some(Value::Instance(inst)) = args.first() {
-                        let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+                    if let Some(Value::Instance(inst)) = args.positional.first() {
+                        let rest = CallArgs {
+                            positional: args.positional.iter().skip(1).cloned().collect(),
+                            kwargs: args.kwargs.clone(),
+                        };
                         let bound = BoundMethod {
                             name: name.to_string(),
                             instance: Rc::clone(inst),
@@ -831,13 +1429,6 @@ impl Interpreter {
                         };
                         self.call_method(&bound, rest, input, out)
                     } else {
-                        if args.len() != function.params.len() {
-                            return Err(RuntimeError::new(format!(
-                                "expected {} argument(s) but got {}",
-                                function.params.len(),
-                                args.len()
-                            )));
-                        }
                         self.call(&function, args, input, out)
                     }
                 }
@@ -874,26 +1465,35 @@ impl Interpreter {
     fn call_method(
         &mut self,
         bound: &BoundMethod,
-        args: Vec<Value>,
+        args: CallArgs,
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
         let function = &bound.function;
-        if args.len() + 1 != function.params.len() {
-            return Err(RuntimeError::new(format!(
-                "method '{}' expects {} argument(s) but got {}",
-                bound.name,
-                function.params.len() - 1,
-                args.len()
-            )));
+        // `self` is already bound to the instance; the rest of
+        // the parameters are bound like a plain call (positionals,
+        // keywords, defaults, rest).
+        let bindings = bind_arguments(
+            &function.params,
+            &function.defaults,
+            function.rest.as_deref(),
+            &args,
+            &[("self", Value::Instance(Rc::clone(&bound.instance)))],
+            Some(&bound.name),
+        )?;
+        // A method with `yield` in its body is a generator, like
+        // a plain function: the call returns the generator, and
+        // the `super` context is the class the method belongs to.
+        if body_contains_yield(&function.body) {
+            return Ok(Value::Generator(Rc::new(RefCell::new(GeneratorData::new(
+                Rc::clone(function),
+                bindings,
+                Some(Rc::clone(&bound.class)),
+            )))));
         }
         let call_env = Environment::child(&function.env);
-        call_env.define(
-            &function.params[0],
-            Value::Instance(Rc::clone(&bound.instance)),
-        );
-        for (param, value) in function.params.iter().skip(1).zip(args) {
-            call_env.define(param, value);
+        for (name, value) in bindings {
+            call_env.define(&name, value);
         }
         let saved = std::mem::replace(&mut self.super_stack, vec![Rc::clone(&bound.class)]);
         let result = self.exec_block(&function.body, &call_env, input, out);
@@ -901,6 +1501,9 @@ impl Interpreter {
         match result? {
             Flow::Normal => Ok(Value::Nil),
             Flow::Return(value, _) => Ok(value),
+            // Unreachable: a method with `yield` is a generator
+            // and never reaches this point.
+            Flow::Yield(..) => Err(RuntimeError::new("yield outside a generator")),
         }
     }
 
@@ -910,7 +1513,7 @@ impl Interpreter {
     fn construct(
         &mut self,
         class: &Rc<ClassDef>,
-        args: Vec<Value>,
+        args: CallArgs,
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
@@ -1105,6 +1708,14 @@ impl Interpreter {
             Ok(Flow::Return(_, span)) => {
                 return Err(RuntimeError::with_span(
                     format!("module '{name}': return outside function"),
+                    span,
+                ));
+            }
+            // Unreachable in practice: the parser rejects `yield`
+            // outside a function.
+            Ok(Flow::Yield(_, span)) => {
+                return Err(RuntimeError::with_span(
+                    format!("module '{name}': yield outside function"),
                     span,
                 ));
             }
@@ -1423,16 +2034,37 @@ impl Interpreter {
     /// context is the class the function was defined in (if any): a
     /// plain function called from a method does not inherit the
     /// method's `super`.
+    ///
+    /// A function whose body contains a `yield` is a generator:
+    /// calling it does not run the body — it returns a generator
+    /// value holding the bound arguments, to be replayed by
+    /// `next()`. The arguments are bound (and checked) here, so a
+    /// wrong call fails now, not at the first `next()`.
     fn call(
         &mut self,
         function: &Rc<Function>,
-        args: Vec<Value>,
+        args: CallArgs,
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
+        let bindings = bind_arguments(
+            &function.params,
+            &function.defaults,
+            function.rest.as_deref(),
+            &args,
+            &[],
+            None,
+        )?;
+        if body_contains_yield(&function.body) {
+            return Ok(Value::Generator(Rc::new(RefCell::new(GeneratorData::new(
+                Rc::clone(function),
+                bindings,
+                function.super_class.clone(),
+            )))));
+        }
         let call_env = Environment::child(&function.env);
-        for (param, value) in function.params.iter().zip(args) {
-            call_env.define(param, value);
+        for (name, value) in bindings {
+            call_env.define(&name, value);
         }
         let saved = std::mem::replace(
             &mut self.super_stack,
@@ -1446,7 +2078,117 @@ impl Interpreter {
         match result? {
             Flow::Normal => Ok(Value::Nil),
             Flow::Return(value, _) => Ok(value),
+            // Unreachable: a function with `yield` is a generator
+            // and never reaches this point.
+            Flow::Yield(..) => Err(RuntimeError::new("yield outside a generator")),
         }
+    }
+
+    /// Pull the next value out of a generator: replay its body
+    /// from the start, counting the `yield`s, and stop at the next
+    /// one after those already consumed. `Ok(Some(value))` is that
+    /// value; `Ok(None)` means the body finished (or returned)
+    /// before the next `yield` — the generator is exhausted. An
+    /// error inside the body propagates; the replay mode and the
+    /// `super` stack are saved and restored, so a `next()` inside
+    /// a generator body (a nested generator) works.
+    ///
+    /// The cost is O(n) per `next()`, O(n²) over a whole iteration:
+    /// every replay starts from the beginning, and the body's side
+    /// effects repeat on each replay — the body must be
+    /// deterministic for the values to be right (see the README).
+    pub(crate) fn next_generator(
+        &mut self,
+        generator: &Rc<RefCell<GeneratorData>>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let (function, bindings, super_context) = {
+            let data = generator.borrow();
+            (
+                Rc::clone(&data.function),
+                data.bindings.clone(),
+                data.super_context.clone(),
+            )
+        };
+        let target = generator.borrow().consumed + 1;
+        let call_env = Environment::child(&function.env);
+        for (name, value) in bindings {
+            call_env.define(&name, value);
+        }
+        let saved_super = std::mem::replace(
+            &mut self.super_stack,
+            match &super_context {
+                Some(class) => vec![Rc::clone(class)],
+                None => Vec::new(),
+            },
+        );
+        let saved_mode = self.yield_mode.take();
+        self.yield_mode = Some(YieldMode { target, seen: 0 });
+        let result = self.exec_block(&function.body, &call_env, input, out);
+        self.yield_mode = saved_mode;
+        self.super_stack = saved_super;
+        match result? {
+            Flow::Yield(value, _) => {
+                generator.borrow_mut().consumed += 1;
+                Ok(Some(value))
+            }
+            Flow::Normal | Flow::Return(..) => Ok(None),
+        }
+    }
+
+    /// Evaluate a function's default expressions in the defining
+    /// environment, once, at definition time (Python rule): one
+    /// entry per parameter, `None` for required parameters.
+    fn eval_param_defaults(
+        &mut self,
+        params: &[ParamDef],
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Vec<Option<Value>>, RuntimeError> {
+        let mut defaults = Vec::with_capacity(params.len());
+        for param in params {
+            match &param.default {
+                Some(expr) => defaults.push(Some(self.eval_expr(expr, env, input, out)?)),
+                None => defaults.push(None),
+            }
+        }
+        Ok(defaults)
+    }
+
+    /// Evaluate a call's argument list: positionals in order (a
+    /// spread expands a list/tuple/array into positionals),
+    /// keyword arguments by name. An error points at the argument
+    /// that failed (a spread error at the `*`, an evaluation error
+    /// at the expression itself).
+    fn eval_call_args(
+        &mut self,
+        args: &[Arg],
+        env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<CallArgs, RuntimeError> {
+        let mut out_args = CallArgs::default();
+        for arg in args {
+            match arg {
+                Arg::Positional(expr) => {
+                    out_args
+                        .positional
+                        .push(self.eval_expr(expr, env, input, out)?);
+                }
+                Arg::Spread { expr, span } => {
+                    let value = self.eval_expr(expr, env, input, out)?;
+                    let items = spread_items(&value).map_err(|e| e.at(*span))?;
+                    out_args.positional.extend(items);
+                }
+                Arg::Keyword { name, value, .. } => {
+                    let value = self.eval_expr(value, env, input, out)?;
+                    out_args.kwargs.push((name.clone(), value, arg.span()));
+                }
+            }
+        }
+        Ok(out_args)
     }
 }
 

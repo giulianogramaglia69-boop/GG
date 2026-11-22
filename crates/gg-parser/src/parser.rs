@@ -4,9 +4,11 @@
 //! Statements are separated by newlines and/or `;` (any number of
 //! separators is allowed, including at the start and end of a program
 //! or block). Blocks end with `end` — or with `else` in the `then`
-//! branch of an `if`.
+//! branch of an `if`, and with `except`/`finally` in a `try`.
 
-use crate::ast::{BinaryOp, Expr, MethodDef, Program, Stmt, UnaryOp};
+use crate::ast::{
+    Arg, BinaryOp, Case, Expr, FStringPart, MethodDef, ParamDef, Pattern, Program, Stmt, UnaryOp,
+};
 use gg_lexer::{Span, Token, TokenKind};
 use std::fmt;
 
@@ -65,11 +67,20 @@ pub fn parse(tokens: &[Token]) -> Result<Program, ParserError> {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// How many function bodies the parser is inside (a `fn`
+    /// counts, a class method too — it goes through `parse_fn`).
+    /// `yield` is only legal inside one, so the parser can reject
+    /// it outside a function instead of the interpreter.
+    fn_depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            fn_depth: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -159,7 +170,12 @@ impl<'a> Parser<'a> {
     fn is_block_end(&self) -> bool {
         matches!(
             self.peek_kind(),
-            TokenKind::End | TokenKind::Else | TokenKind::Eof
+            TokenKind::End
+                | TokenKind::Else
+                | TokenKind::Except
+                | TokenKind::Finally
+                | TokenKind::Case
+                | TokenKind::Eof
         )
     }
 
@@ -170,6 +186,9 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             TokenKind::End => Err(self.error_here("unexpected 'end'")),
             TokenKind::Else => Err(self.error_here("unexpected 'else'")),
+            TokenKind::Except => Err(self.error_here("unexpected 'except'")),
+            TokenKind::Finally => Err(self.error_here("unexpected 'finally'")),
+            TokenKind::Case => Err(self.error_here("unexpected 'case'")),
             TokenKind::Eof => Ok(Program { stmts }),
             _ => Err(self.error_here("expected end of input")),
         }
@@ -205,6 +224,10 @@ impl<'a> Parser<'a> {
             TokenKind::Import => self.parse_import(),
             TokenKind::Return => self.parse_return(),
             TokenKind::Print => self.parse_print(),
+            TokenKind::Try => self.parse_try(),
+            TokenKind::Raise => self.parse_raise(),
+            TokenKind::Match => self.parse_match(),
+            TokenKind::Yield => self.parse_yield(),
             _ => {
                 // An assignment starts with an expression (a plain
                 // name, an index like `xs[0]`, or a field like
@@ -322,23 +345,157 @@ impl<'a> Parser<'a> {
         let span = self.advance().span(); // fn
         let name = self.expect_ident("function name after 'fn'")?;
         self.expect(&TokenKind::LParen, "'(' after function name")?;
-        let mut params = Vec::new();
-        if !self.check(&TokenKind::RParen) {
-            params.push(self.expect_param_name()?);
-            while self.check(&TokenKind::Comma) {
-                self.advance(); // ,
-                params.push(self.expect_param_name()?);
-            }
-        }
+        let (params, rest) = self.parse_params()?;
         self.expect(&TokenKind::RParen, "')' after parameter list")?;
-        let body = self.parse_block()?;
+        // A `yield` inside this body belongs to this function
+        // (a nested `fn` increments the depth again, so its own
+        // `yield` belongs to it instead).
+        self.fn_depth += 1;
+        let body = self.parse_block();
+        self.fn_depth -= 1;
+        let body = body?;
         self.expect(&TokenKind::End, "'end' to close function body")?;
         Ok(Stmt::Fn {
             name,
             params,
+            rest,
             body,
             span,
         })
+    }
+
+    /// A parameter list (the `(` was already consumed, the `)`
+    /// is not): `a, b = expr, *rest` — plain parameters, each
+    /// optionally with a default expression, and an optional
+    /// trailing rest parameter `*name` collecting extra
+    /// positional arguments into a List.
+    ///
+    /// Rules: a parameter without a default after one with a
+    /// default is an error; `*rest` must be the last parameter
+    /// and there is at most one; duplicate names are an error.
+    fn parse_params(&mut self) -> Result<(Vec<ParamDef>, Option<String>), ParserError> {
+        let mut params = Vec::new();
+        let mut rest = None;
+        let mut saw_default = false;
+        if self.check(&TokenKind::RParen) {
+            return Ok((params, rest));
+        }
+        loop {
+            if self.check(&TokenKind::Star) {
+                self.advance(); // *
+                if self.check(&TokenKind::Star) {
+                    return Err(self.error_here(
+                        "'**' is not supported (there are no **kwargs in this phase)",
+                    ));
+                }
+                let name = self.expect_param_name()?;
+                if rest.is_some() {
+                    return Err(
+                        self.error_here("a function takes at most one rest parameter ('*name')")
+                    );
+                }
+                rest = Some(name);
+            } else {
+                let name = self.expect_param_name()?;
+                if params.iter().any(|p: &ParamDef| p.name == name)
+                    || rest.as_deref() == Some(name.as_str())
+                {
+                    return Err(self.error_here(format!("duplicate parameter name '{name}'")));
+                }
+                let default = if self.check(&TokenKind::Eq) {
+                    self.advance(); // =
+                    saw_default = true;
+                    Some(self.parse_expr()?)
+                } else {
+                    if saw_default {
+                        return Err(self.error_here(format!(
+                            "parameter '{name}' without a default follows a parameter with a default"
+                        )));
+                    }
+                    None
+                };
+                if name == "self" && default.is_some() {
+                    return Err(self.error_here("'self' cannot have a default value"));
+                }
+                params.push(ParamDef { name, default });
+            }
+            if self.check(&TokenKind::Comma) {
+                self.advance(); // ,
+                if rest.is_some() {
+                    return Err(
+                        self.error_here("a rest parameter ('*name') must be the last parameter")
+                    );
+                }
+                continue;
+            }
+            break;
+        }
+        Ok((params, rest))
+    }
+
+    /// A call's argument list (the `(` was already consumed, the
+    /// `)` is not): positionals, spreads (`*expr`) and keyword
+    /// arguments (`name = expr`). A positional or a spread after
+    /// a keyword argument is an error.
+    fn parse_arg_list(&mut self) -> Result<Vec<Arg>, ParserError> {
+        let mut args = Vec::new();
+        let mut saw_kwarg = false;
+        if self.check(&TokenKind::RParen) {
+            return Ok(args);
+        }
+        loop {
+            if self.check(&TokenKind::Star) {
+                if saw_kwarg {
+                    return Err(self.error_here("cannot use '*' after a keyword argument"));
+                }
+                let span = self.advance().span(); // *
+                if self.check(&TokenKind::Star) {
+                    return Err(self.error_here(
+                        "'**' is not supported (there are no **kwargs in this phase)",
+                    ));
+                }
+                let expr = self.parse_expr()?;
+                args.push(Arg::Spread { expr, span });
+            } else if self.is_keyword_arg() {
+                let name_token = self.advance(); // the keyword name
+                let name_span = name_token.span();
+                let TokenKind::Ident(name) = name_token.kind else {
+                    unreachable!("is_keyword_arg saw an identifier");
+                };
+                self.advance(); // =
+                let value = self.parse_expr()?;
+                saw_kwarg = true;
+                args.push(Arg::Keyword {
+                    name,
+                    value,
+                    span: name_span,
+                });
+            } else {
+                if saw_kwarg {
+                    return Err(self.error_here("positional argument follows a keyword argument"));
+                }
+                args.push(Arg::Positional(self.parse_expr()?));
+            }
+            if self.check(&TokenKind::Comma) {
+                self.advance(); // ,
+                continue;
+            }
+            break;
+        }
+        Ok(args)
+    }
+
+    /// True when the current argument is a keyword argument:
+    /// an identifier immediately followed by `=` (a single `=`,
+    /// not `==` — `f(x == 1)` is a positional comparison).
+    fn is_keyword_arg(&self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Eq)
+        )
     }
 
     /// A parameter name: a plain identifier, or `self` (methods
@@ -387,13 +544,14 @@ impl<'a> Parser<'a> {
                     let Stmt::Fn {
                         name: method_name,
                         params,
+                        rest,
                         body,
                         ..
                     } = self.parse_fn()?
                     else {
                         unreachable!("parse_fn always returns Stmt::Fn")
                     };
-                    if params.is_empty() || params[0] != "self" {
+                    if params.is_empty() || params[0].name != "self" {
                         return Err(ParserError::new(
                             "methods must take 'self' as their first parameter",
                             fn_token.line,
@@ -404,6 +562,7 @@ impl<'a> Parser<'a> {
                     methods.push(MethodDef {
                         name: method_name,
                         params,
+                        rest,
                         body,
                     });
                 }
@@ -441,10 +600,254 @@ impl<'a> Parser<'a> {
             | TokenKind::Semicolon
             | TokenKind::End
             | TokenKind::Else
+            | TokenKind::Except
+            | TokenKind::Finally
+            | TokenKind::Case
             | TokenKind::Eof => None,
             _ => Some(self.parse_expr()?),
         };
         Ok(Stmt::Return { expr, span })
+    }
+
+    fn parse_try(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.advance().span(); // try
+        self.expect(&TokenKind::Then, "'then' after 'try'")?;
+        let body = self.parse_block()?;
+        let mut except_var = None;
+        let mut except_body = None;
+        if self.check(&TokenKind::Except) {
+            self.advance(); // except
+            if !self.check(&TokenKind::Then) {
+                except_var = Some(self.expect_ident("variable name after 'except'")?);
+            }
+            self.expect(&TokenKind::Then, "'then' after 'except'")?;
+            except_body = Some(self.parse_block()?);
+        }
+        let mut finally_body = None;
+        if self.check(&TokenKind::Finally) {
+            self.advance(); // finally
+            self.expect(&TokenKind::Then, "'then' after 'finally'")?;
+            finally_body = Some(self.parse_block()?);
+        }
+        if except_body.is_none() && finally_body.is_none() {
+            return Err(self.error_here("try needs an 'except' or 'finally' clause"));
+        }
+        self.expect(&TokenKind::End, "'end' to close 'try' block")?;
+        Ok(Stmt::Try {
+            body,
+            except_var,
+            except_body,
+            finally_body,
+            span,
+        })
+    }
+
+    fn parse_raise(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.advance().span(); // raise
+        let expr = match self.peek_kind() {
+            TokenKind::Newline
+            | TokenKind::Semicolon
+            | TokenKind::End
+            | TokenKind::Else
+            | TokenKind::Except
+            | TokenKind::Finally
+            | TokenKind::Case
+            | TokenKind::Eof => return Err(self.error_here("expected expression after 'raise'")),
+            _ => self.parse_expr()?,
+        };
+        Ok(Stmt::Raise { expr, span })
+    }
+
+    /// Pattern matching: `match expr then case pattern [if guard]
+    /// then ... case ... end`. Each case body is a block that ends
+    /// at the next `case` or at `end` (`case` is a block end).
+    fn parse_match(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.advance().span(); // match
+        let scrutinee = self.parse_expr()?;
+        self.expect(&TokenKind::Then, "'then' after match value")?;
+        let mut cases = Vec::new();
+        loop {
+            self.skip_separators();
+            match self.peek_kind() {
+                TokenKind::Case => {
+                    self.advance(); // case
+                    let pattern = self.parse_pattern()?;
+                    let guard = if self.check(&TokenKind::If) {
+                        self.advance(); // if
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::Then, "'then' after case pattern")?;
+                    let body = self.parse_block()?;
+                    cases.push(Case {
+                        pattern,
+                        guard,
+                        body,
+                    });
+                }
+                TokenKind::End => {
+                    self.advance(); // end
+                    break;
+                }
+                TokenKind::Eof => {
+                    return Err(self.error_here("expected 'end' to close 'match' block"));
+                }
+                _ => {
+                    return Err(self.error_here("expected 'case' or 'end' in 'match'"));
+                }
+            }
+        }
+        Ok(Stmt::Match {
+            scrutinee,
+            cases,
+            span,
+        })
+    }
+
+    /// One pattern: a literal (number, string, `true`/`false`, or
+    /// a negated number), `_`, a binding (a bare identifier), or a
+    /// list/tuple pattern (also nested). `(p)` is grouping — the
+    /// pattern itself — while `(p,)` is a one-element tuple.
+    fn parse_pattern(&mut self) -> Result<Pattern, ParserError> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) if name == "_" => {
+                self.advance(); // _
+                Ok(Pattern::Wildcard)
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(Pattern::Binding(name))
+            }
+            TokenKind::Int(n) => {
+                let n = *n;
+                let span = self.advance().span();
+                Ok(Pattern::Literal(Expr::Int { value: n, span }))
+            }
+            TokenKind::Float(x) => {
+                let x = *x;
+                let span = self.advance().span();
+                Ok(Pattern::Literal(Expr::Float { value: x, span }))
+            }
+            TokenKind::Str(s) => {
+                let s = s.clone();
+                let span = self.advance().span();
+                Ok(Pattern::Literal(Expr::Str { value: s, span }))
+            }
+            TokenKind::True => {
+                let span = self.advance().span();
+                Ok(Pattern::Literal(Expr::Bool { value: true, span }))
+            }
+            TokenKind::False => {
+                let span = self.advance().span();
+                Ok(Pattern::Literal(Expr::Bool { value: false, span }))
+            }
+            TokenKind::Minus => {
+                let span = self.advance().span(); // -
+                match self.peek_kind() {
+                    TokenKind::Int(n) => {
+                        let n = *n;
+                        let inner_span = self.advance().span();
+                        Ok(Pattern::Literal(Expr::Unary {
+                            op: UnaryOp::Neg,
+                            expr: Box::new(Expr::Int {
+                                value: n,
+                                span: inner_span,
+                            }),
+                            span,
+                        }))
+                    }
+                    TokenKind::Float(x) => {
+                        let x = *x;
+                        let inner_span = self.advance().span();
+                        Ok(Pattern::Literal(Expr::Unary {
+                            op: UnaryOp::Neg,
+                            expr: Box::new(Expr::Float {
+                                value: x,
+                                span: inner_span,
+                            }),
+                            span,
+                        }))
+                    }
+                    _ => Err(self.error_here("expected a number after '-' in a pattern")),
+                }
+            }
+            TokenKind::LBracket => {
+                self.advance(); // [
+                let mut patterns = Vec::new();
+                if !self.check(&TokenKind::RBracket) {
+                    loop {
+                        patterns.push(self.parse_pattern()?);
+                        if self.check(&TokenKind::Comma) {
+                            self.advance(); // ,
+                            if self.check(&TokenKind::RBracket) {
+                                break;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "']' after list pattern")?;
+                Ok(Pattern::List(patterns))
+            }
+            TokenKind::LParen => {
+                self.advance(); // (
+                if self.check(&TokenKind::RParen) {
+                    self.advance(); // )
+                    return Ok(Pattern::Tuple(vec![]));
+                }
+                let first = self.parse_pattern()?;
+                if self.check(&TokenKind::Comma) {
+                    let mut patterns = vec![first];
+                    while self.check(&TokenKind::Comma) {
+                        self.advance(); // ,
+                        if self.check(&TokenKind::RParen) {
+                            break;
+                        }
+                        patterns.push(self.parse_pattern()?);
+                    }
+                    self.expect(&TokenKind::RParen, "')' after tuple pattern")?;
+                    Ok(Pattern::Tuple(patterns))
+                } else {
+                    self.expect(&TokenKind::RParen, "')' after pattern")?;
+                    Ok(first)
+                }
+            }
+            _ => Err(self.error_here(format!(
+                "expected a pattern but found {}",
+                describe(self.peek())
+            ))),
+        }
+    }
+
+    /// Yield a value from a generator function: `yield expr`
+    /// (a bare `yield` yields `nil`). `yield` outside a function
+    /// is a parse error — the parser tracks function depth, so it
+    /// can tell.
+    fn parse_yield(&mut self) -> Result<Stmt, ParserError> {
+        let span = self.advance().span(); // yield
+        if self.fn_depth == 0 {
+            return Err(ParserError::new(
+                "'yield' outside a function",
+                span.line,
+                span.col,
+                false,
+            ));
+        }
+        let expr = match self.peek_kind() {
+            TokenKind::Newline
+            | TokenKind::Semicolon
+            | TokenKind::End
+            | TokenKind::Else
+            | TokenKind::Except
+            | TokenKind::Finally
+            | TokenKind::Case
+            | TokenKind::Eof => None,
+            _ => Some(self.parse_expr()?),
+        };
+        Ok(Stmt::Yield { expr, span })
     }
 
     // ----- expressions (lowest precedence first) -----
@@ -614,14 +1017,7 @@ impl<'a> Parser<'a> {
                 let (name, span) = self.expect_ident_span("field name after '.'")?;
                 if self.check(&TokenKind::LParen) {
                     self.advance(); // (
-                    let mut args = Vec::new();
-                    if !self.check(&TokenKind::RParen) {
-                        args.push(self.parse_expr()?);
-                        while self.check(&TokenKind::Comma) {
-                            self.advance(); // ,
-                            args.push(self.parse_expr()?);
-                        }
-                    }
+                    let args = self.parse_arg_list()?;
                     self.expect(&TokenKind::RParen, "')' after method arguments")?;
                     expr = Expr::MethodCall {
                         target: Box::new(expr),
@@ -636,6 +1032,20 @@ impl<'a> Parser<'a> {
                         span,
                     };
                 }
+            } else if self.check(&TokenKind::LParen) {
+                // A call of the value the primary produced:
+                // `fn(x) x end(2)`, `f()(3)`. Plain `name(args)`
+                // calls are parsed in parse_primary; this is for
+                // any other callable expression.
+                self.advance(); // (
+                let args = self.parse_arg_list()?;
+                self.expect(&TokenKind::RParen, "')' after call arguments")?;
+                let span = expr.span();
+                expr = Expr::CallExpr {
+                    callee: Box::new(expr),
+                    args,
+                    span,
+                };
             } else {
                 break;
             }
@@ -696,6 +1106,49 @@ impl<'a> Parser<'a> {
             || self.check(&TokenKind::RBracket)
     }
 
+    /// Parse an f-string: `f"..."` — a run of literal text and
+    /// `{expr}` interpolations, ending at the closing quote.
+    fn parse_fstring(&mut self) -> Result<Expr, ParserError> {
+        let span = self.advance().span(); // f"
+        let mut parts = Vec::new();
+        loop {
+            match self.peek_kind().clone() {
+                TokenKind::FStringText(text) => {
+                    self.advance();
+                    parts.push(FStringPart::Text(text));
+                }
+                TokenKind::FStringExprStart => {
+                    self.advance(); // {
+                    if self.check(&TokenKind::FStringExprEnd) {
+                        return Err(self.error_here(
+                            "empty expression in f-string (write '{}' as '{{}}' for a literal brace)",
+                        ));
+                    }
+                    let expr = self.parse_expr()?;
+                    self.expect(
+                        &TokenKind::FStringExprEnd,
+                        "'}' to close f-string expression",
+                    )?;
+                    parts.push(FStringPart::Expr(expr));
+                }
+                TokenKind::FStringEnd => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::Eof => {
+                    return Err(self.error_here("unterminated f-string"));
+                }
+                _ => {
+                    return Err(self.error_here(format!(
+                        "expected f-string text or expression but found {}",
+                        describe(self.peek())
+                    )));
+                }
+            }
+        }
+        Ok(Expr::FString { parts, span })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, ParserError> {
         match self.peek_kind().clone() {
             TokenKind::Int(n) => {
@@ -710,6 +1163,7 @@ impl<'a> Parser<'a> {
                 let span = self.advance().span();
                 Ok(Expr::Str { value: s, span })
             }
+            TokenKind::FStringStart => self.parse_fstring(),
             TokenKind::True => {
                 let span = self.advance().span();
                 Ok(Expr::Bool { value: true, span })
@@ -727,14 +1181,7 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::Dot, "'.' after 'super'")?;
                 let (name, span) = self.expect_ident_span("method name after 'super.'")?;
                 self.expect(&TokenKind::LParen, "'(' after super method name")?;
-                let mut args = Vec::new();
-                if !self.check(&TokenKind::RParen) {
-                    args.push(self.parse_expr()?);
-                    while self.check(&TokenKind::Comma) {
-                        self.advance(); // ,
-                        args.push(self.parse_expr()?);
-                    }
-                }
+                let args = self.parse_arg_list()?;
                 self.expect(&TokenKind::RParen, "')' after super method arguments")?;
                 Ok(Expr::SuperCall { name, args, span })
             }
@@ -742,14 +1189,7 @@ impl<'a> Parser<'a> {
                 let span = self.advance().span();
                 if self.check(&TokenKind::LParen) {
                     self.advance(); // (
-                    let mut args = Vec::new();
-                    if !self.check(&TokenKind::RParen) {
-                        args.push(self.parse_expr()?);
-                        while self.check(&TokenKind::Comma) {
-                            self.advance(); // ,
-                            args.push(self.parse_expr()?);
-                        }
-                    }
+                    let args = self.parse_arg_list()?;
                     self.expect(&TokenKind::RParen, "')' after call arguments")?;
                     Ok(Expr::Call { name, args, span })
                 } else {
@@ -787,22 +1227,85 @@ impl<'a> Parser<'a> {
             TokenKind::LBrace => self.parse_brace(),
             TokenKind::LBracket => {
                 let span = self.advance().span(); // [
-                let mut elements = Vec::new();
-                if !self.check(&TokenKind::RBracket) {
+                if self.check(&TokenKind::RBracket) {
+                    self.advance(); // ]
+                    return Ok(Expr::List {
+                        elements: vec![],
+                        span,
+                    });
+                }
+                let first = self.parse_expr()?;
+                if self.check(&TokenKind::For) {
+                    // List comprehension: `[x * 2 for x in xs]`,
+                    // with an optional `if` filter.
+                    let (vars, iter, cond) = self.parse_comp_clause()?;
+                    self.expect(&TokenKind::RBracket, "']' after list comprehension")?;
+                    return Ok(Expr::ListComp {
+                        elem: Box::new(first),
+                        vars,
+                        iter: Box::new(iter),
+                        cond: cond.map(Box::new),
+                        span,
+                    });
+                }
+                let mut elements = vec![first];
+                while self.check(&TokenKind::Comma) {
+                    self.advance(); // ,
                     elements.push(self.parse_expr()?);
-                    while self.check(&TokenKind::Comma) {
-                        self.advance(); // ,
-                        elements.push(self.parse_expr()?);
-                    }
                 }
                 self.expect(&TokenKind::RBracket, "']' after list elements")?;
                 Ok(Expr::List { elements, span })
+            }
+            TokenKind::Fn => {
+                // A lambda: `fn(x) x * 2 end` — `fn` without a
+                // name, as an expression. The body is a single
+                // expression; its value is the return value.
+                let span = self.advance().span(); // fn
+                self.expect(&TokenKind::LParen, "'(' after 'fn' in lambda")?;
+                let (params, rest) = self.parse_params()?;
+                self.expect(&TokenKind::RParen, "')' after parameter list")?;
+                let body = self.parse_expr()?;
+                self.expect(&TokenKind::End, "'end' to close lambda")?;
+                Ok(Expr::Lambda {
+                    params,
+                    rest,
+                    body: Box::new(body),
+                    span,
+                })
             }
             _ => Err(self.error_here(format!(
                 "expected expression but found {}",
                 describe(self.peek())
             ))),
         }
+    }
+
+    /// The `for ... in ... [if ...]` tail of a comprehension.
+    /// One `for` clause only in this phase: a second `for` is a
+    /// parse error. The variables are one identifier, or two
+    /// separated by a comma (unpacking pairs, used by dict
+    /// comprehensions: `for k, v in pairs`).
+    fn parse_comp_clause(&mut self) -> Result<(Vec<String>, Expr, Option<Expr>), ParserError> {
+        self.expect(&TokenKind::For, "'for' in comprehension")?;
+        let mut vars = vec![self.expect_ident("variable name after 'for' in comprehension")?];
+        if self.check(&TokenKind::Comma) {
+            self.advance(); // ,
+            vars.push(self.expect_ident("second variable name in comprehension")?);
+        }
+        self.expect(&TokenKind::In, "'in' in comprehension")?;
+        let iter = self.parse_expr()?;
+        let cond = if self.check(&TokenKind::If) {
+            self.advance(); // if
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        if self.check(&TokenKind::For) {
+            return Err(self.error_here(
+                "a comprehension has a single 'for' clause — nested 'for' clauses are not supported",
+            ));
+        }
+        Ok((vars, iter, cond))
     }
 
     /// `{...}`: a dict when the entries have `:`, a set otherwise.
@@ -818,11 +1321,22 @@ impl<'a> Parser<'a> {
         }
         let first = self.parse_expr()?;
         if self.check(&TokenKind::Colon) {
-            // Dict: key: value, key: value, ... (trailing comma ok).
-            let mut entries = Vec::new();
+            // Dict literal, or dict comprehension (`{k: v for ...}`).
             self.advance(); // :
             let value = self.parse_expr()?;
-            entries.push((first, value));
+            if self.check(&TokenKind::For) {
+                let (vars, iter, cond) = self.parse_comp_clause()?;
+                self.expect(&TokenKind::RBrace, "'}' after dict comprehension")?;
+                return Ok(Expr::DictComp {
+                    key: Box::new(first),
+                    value: Box::new(value),
+                    vars,
+                    iter: Box::new(iter),
+                    cond: cond.map(Box::new),
+                    span,
+                });
+            }
+            let mut entries = vec![(first, value)];
             while self.check(&TokenKind::Comma) {
                 self.advance(); // ,
                 if self.check(&TokenKind::RBrace) {
@@ -835,6 +1349,18 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokenKind::RBrace, "'}' after dict entries")?;
             Ok(Expr::Dict { entries, span })
+        } else if self.check(&TokenKind::For) {
+            // Set comprehension: `{x for x in xs}`, with an
+            // optional `if` filter.
+            let (vars, iter, cond) = self.parse_comp_clause()?;
+            self.expect(&TokenKind::RBrace, "'}' after set comprehension")?;
+            Ok(Expr::SetComp {
+                elem: Box::new(first),
+                vars,
+                iter: Box::new(iter),
+                cond: cond.map(Box::new),
+                span,
+            })
         } else {
             // Set: elements separated by commas (trailing comma ok).
             let mut elements = vec![first];
@@ -899,6 +1425,17 @@ mod tests {
             left: Box::new(left),
             right: Box::new(right),
         }
+    }
+
+    fn param(name: &str) -> ParamDef {
+        ParamDef {
+            name: name.to_string(),
+            default: None,
+        }
+    }
+
+    fn pos(expr: Expr) -> Arg {
+        Arg::Positional(expr)
     }
 
     #[test]
@@ -1073,6 +1610,7 @@ mod tests {
                 span: Span::dummy(),
                 name: "greet".to_string(),
                 params: vec![],
+                rest: None,
                 body: vec![Stmt::Print {
                     span: Span::dummy(),
                     expr: Expr::Str {
@@ -1087,7 +1625,8 @@ mod tests {
             vec![Stmt::Fn {
                 span: Span::dummy(),
                 name: "add".to_string(),
-                params: vec!["a".to_string(), "b".to_string()],
+                params: vec![param("a"), param("b")],
+                rest: None,
                 body: vec![Stmt::Return {
                     span: Span::dummy(),
                     expr: Some(bin(Add, ident("a"), ident("b"))),
@@ -1100,6 +1639,7 @@ mod tests {
                 span: Span::dummy(),
                 name: "f".to_string(),
                 params: vec![],
+                rest: None,
                 body: vec![Stmt::Return {
                     span: Span::dummy(),
                     expr: None
@@ -1231,12 +1771,12 @@ mod tests {
                     span: Span::dummy(),
                     name: "f".to_string(),
                     args: vec![
-                        int(1),
-                        ident("x"),
-                        Expr::Str {
+                        pos(int(1)),
+                        pos(ident("x")),
+                        pos(Expr::Str {
                             value: "s".to_string(),
                             span: Span::dummy()
-                        },
+                        }),
                     ],
                 },
             }]
@@ -1498,7 +2038,7 @@ mod tests {
                         Expr::Call {
                             span: Span::dummy(),
                             name: "f".to_string(),
-                            args: vec![int(3)],
+                            args: vec![pos(int(3))],
                         },
                     ],
                     span: Span::dummy()
@@ -1847,7 +2387,7 @@ mod tests {
                         Expr::Call {
                             span: Span::dummy(),
                             name: "f".to_string(),
-                            args: vec![int(3)],
+                            args: vec![pos(int(3))],
                         },
                     ],
                     span: Span::dummy()
@@ -2009,6 +2549,337 @@ mod tests {
     }
 
     #[test]
+    fn comprehensions_parse() {
+        // List comprehension, with and without a filter.
+        assert_eq!(
+            parse_ok("print [x * 2 for x in xs]").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::ListComp {
+                    elem: Box::new(bin(Mul, ident("x"), int(2))),
+                    vars: vec!["x".to_string()],
+                    iter: Box::new(ident("xs")),
+                    cond: None,
+                    span: Span::dummy(),
+                },
+            }]
+        );
+        assert_eq!(
+            parse_ok("print [x for x in xs if x > 0]").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::ListComp {
+                    elem: Box::new(ident("x")),
+                    vars: vec!["x".to_string()],
+                    iter: Box::new(ident("xs")),
+                    cond: Some(Box::new(bin(Gt, ident("x"), int(0)))),
+                    span: Span::dummy(),
+                },
+            }]
+        );
+        // Dict comprehension with two variables (unpacking pairs).
+        assert_eq!(
+            parse_ok("print {k: v for k, v in pairs}").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::DictComp {
+                    key: Box::new(ident("k")),
+                    value: Box::new(ident("v")),
+                    vars: vec!["k".to_string(), "v".to_string()],
+                    iter: Box::new(ident("pairs")),
+                    cond: None,
+                    span: Span::dummy(),
+                },
+            }]
+        );
+        // Dict comprehension with one variable, set comprehension.
+        assert_eq!(
+            parse_ok("print {x: x * x for x in xs}").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::DictComp {
+                    key: Box::new(ident("x")),
+                    value: Box::new(bin(Mul, ident("x"), ident("x"))),
+                    vars: vec!["x".to_string()],
+                    iter: Box::new(ident("xs")),
+                    cond: None,
+                    span: Span::dummy(),
+                },
+            }]
+        );
+        assert_eq!(
+            parse_ok("print {x for x in xs if x > 0}").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::SetComp {
+                    elem: Box::new(ident("x")),
+                    vars: vec!["x".to_string()],
+                    iter: Box::new(ident("xs")),
+                    cond: Some(Box::new(bin(Gt, ident("x"), int(0)))),
+                    span: Span::dummy(),
+                },
+            }]
+        );
+        // A nested comprehension: the element is a comprehension too.
+        assert_eq!(
+            parse_ok("print [[y for y in row] for row in matrix]").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::ListComp {
+                    elem: Box::new(Expr::ListComp {
+                        elem: Box::new(ident("y")),
+                        vars: vec!["y".to_string()],
+                        iter: Box::new(ident("row")),
+                        cond: None,
+                        span: Span::dummy(),
+                    }),
+                    vars: vec!["row".to_string()],
+                    iter: Box::new(ident("matrix")),
+                    cond: None,
+                    span: Span::dummy(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn comprehensions_display_round_trip() {
+        let source = "let a = [x * 2 for x in xs]\nlet b = [x for x in xs if x > 0]\nlet c = {k: v for k, v in pairs}\nlet d = {x for x in xs}\nprint a\nprint b\nprint c\nprint d\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "let a = [x * 2 for x in xs]\nlet b = [x for x in xs if x > 0]\nlet c = {k: v for k, v in pairs}\nlet d = {x for x in xs}\nprint a\nprint b\nprint c\nprint d"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn fstring_parses_to_parts() {
+        assert_eq!(
+            parse_ok("let s = f\"ciao {nome}, hai {eta} anni\"").stmts,
+            vec![Stmt::Let {
+                name: "s".to_string(),
+                value: Expr::FString {
+                    parts: vec![
+                        FStringPart::Text("ciao ".to_string()),
+                        FStringPart::Expr(ident("nome")),
+                        FStringPart::Text(", hai ".to_string()),
+                        FStringPart::Expr(ident("eta")),
+                        FStringPart::Text(" anni".to_string()),
+                    ],
+                    span: Span::dummy(),
+                },
+                span: Span::dummy(),
+            }]
+        );
+        // No placeholder is still an f-string; an empty one has no parts.
+        assert_eq!(
+            parse_ok("let a = f\"testo\"\nlet b = f\"\"").stmts,
+            vec![
+                Stmt::Let {
+                    name: "a".to_string(),
+                    value: Expr::FString {
+                        parts: vec![FStringPart::Text("testo".to_string())],
+                        span: Span::dummy(),
+                    },
+                    span: Span::dummy(),
+                },
+                Stmt::Let {
+                    name: "b".to_string(),
+                    value: Expr::FString {
+                        parts: vec![],
+                        span: Span::dummy(),
+                    },
+                    span: Span::dummy(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fstring_empty_expression_is_an_error() {
+        let err = parse_err("let s = f\"a {} b\"");
+        assert!(err.message.contains("empty expression"), "{}", err.message);
+        assert_eq!((err.line, err.col), (1, 14));
+    }
+
+    #[test]
+    fn fstring_display_round_trip() {
+        let source = "let s = f\"ciao {nome}, {{lit}} {1 + 2}\"\nprint s\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "let s = f\"ciao {nome}, {{lit}} {1 + 2}\"\nprint s"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn multiple_for_in_a_comprehension_is_an_error() {
+        let err = parse_err("print [x for x in xs for y in ys]");
+        assert!(
+            err.message.contains("single 'for' clause"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("print {x for x in xs for y in ys}");
+        assert!(
+            err.message.contains("single 'for' clause"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn lambda_parses_and_round_trips() {
+        assert_eq!(
+            parse_ok("let f = fn(x) x * 2 end").stmts,
+            vec![Stmt::Let {
+                name: "f".to_string(),
+                value: Expr::Lambda {
+                    params: vec![param("x")],
+                    rest: None,
+                    body: Box::new(bin(Mul, ident("x"), int(2))),
+                    span: Span::dummy(),
+                },
+                span: Span::dummy(),
+            }]
+        );
+        // Zero parameters, and more than one.
+        let source = "let g = fn() 42 end\nlet h = fn(a, b) a + b end\nprint g\nprint h\n";
+        let prog = parse_ok(source);
+        assert_eq!(
+            prog.to_string(),
+            "let g = fn() 42 end\nlet h = fn(a, b) a + b end\nprint g\nprint h"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn immediate_lambda_call_parses() {
+        // `fn(x) x + 1 end(2)` calls the lambda on the spot.
+        assert_eq!(
+            parse_ok("print fn(x) x + 1 end(2)").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::CallExpr {
+                    callee: Box::new(Expr::Lambda {
+                        params: vec![param("x")],
+                        rest: None,
+                        body: Box::new(bin(Add, ident("x"), int(1))),
+                        span: Span::dummy(),
+                    }),
+                    args: vec![pos(int(2))],
+                    span: Span::dummy(),
+                },
+            }]
+        );
+        let prog = parse_ok("print fn(x) x + 1 end(2)\n");
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+    }
+
+    #[test]
+    fn defaults_rest_kwargs_and_spread_parse_and_round_trip() {
+        // A definition with a default and a rest parameter.
+        let prog = parse_ok("fn saluta(nome, saluto = \"ciao\", *altri)\n    return nome\nend\n");
+        assert_eq!(
+            prog.to_string(),
+            "fn saluta(nome, saluto = \"ciao\", *altri)\n    return nome\nend"
+        );
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+        // A call with a spread and keywords, in order.
+        let prog = parse_ok("print f(1, *xs, k = 2)\n");
+        assert_eq!(prog.to_string(), "print f(1, *xs, k = 2)");
+        let reparsed = parse_ok(&prog.to_string());
+        assert_eq!(reparsed, prog);
+        // Exact AST for a keyword call.
+        assert_eq!(
+            parse_ok("print f(a = 1)").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::Call {
+                    span: Span::dummy(),
+                    name: "f".to_string(),
+                    args: vec![Arg::Keyword {
+                        name: "a".to_string(),
+                        value: int(1),
+                        span: Span::dummy(),
+                    }],
+                },
+            }]
+        );
+        // Exact AST for a spread call.
+        assert_eq!(
+            parse_ok("print f(*xs)").stmts,
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: Expr::Call {
+                    span: Span::dummy(),
+                    name: "f".to_string(),
+                    args: vec![Arg::Spread {
+                        expr: ident("xs"),
+                        span: Span::dummy(),
+                    }],
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn argument_syntax_errors() {
+        let err = parse_err("fn f(a = 1, b)\n    return a\nend\n");
+        assert!(
+            err.message
+                .contains("without a default follows a parameter with a default"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("fn f(*resto, a)\n    return a\nend\n");
+        assert!(
+            err.message.contains("must be the last parameter"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("fn f(a, a)\n    return a\nend\n");
+        assert!(
+            err.message.contains("duplicate parameter name 'a'"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("print f(a = 1, 2)\n");
+        assert!(
+            err.message
+                .contains("positional argument follows a keyword argument"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("print f(a = 1, *[2])\n");
+        assert!(
+            err.message
+                .contains("cannot use '*' after a keyword argument"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("print f(**d)\n");
+        assert!(
+            err.message.contains("'**' is not supported"),
+            "{}",
+            err.message
+        );
+        let err = parse_err("fn f(*a, *b)\n    return 1\nend\n");
+        assert!(
+            err.message.contains("must be the last parameter"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
     fn class_with_init_and_methods() {
         let src = "class Persona\n    fn init(self, nome, eta)\n        self.nome = nome\n        self.eta = eta\n    end\n    fn saluta(self)\n        print self.nome\n    end\nend\n";
         assert_eq!(
@@ -2020,7 +2891,8 @@ mod tests {
                 methods: vec![
                     MethodDef {
                         name: "init".to_string(),
-                        params: vec!["self".to_string(), "nome".to_string(), "eta".to_string()],
+                        params: vec![param("self"), param("nome"), param("eta")],
+                        rest: None,
                         body: vec![
                             Stmt::FieldAssign {
                                 span: Span::dummy(),
@@ -2048,7 +2920,8 @@ mod tests {
                     },
                     MethodDef {
                         name: "saluta".to_string(),
-                        params: vec!["self".to_string()],
+                        params: vec![param("self")],
+                        rest: None,
                         body: vec![Stmt::Print {
                             span: Span::dummy(),
                             expr: Expr::Field {
@@ -2110,10 +2983,10 @@ mod tests {
                     span: Span::dummy(),
                     target: Box::new(ident("p")),
                     name: "saluta".to_string(),
-                    args: vec![Expr::Str {
+                    args: vec![pos(Expr::Str {
                         value: "ciao".to_string(),
                         span: Span::dummy()
-                    }],
+                    })],
                 },
             }]
         );
@@ -2159,7 +3032,7 @@ mod tests {
                 expr: Expr::SuperCall {
                     span: Span::dummy(),
                     name: "init".to_string(),
-                    args: vec![ident("nome"), ident("eta")],
+                    args: vec![pos(ident("nome")), pos(ident("eta"))],
                 },
             }]
         );
@@ -2549,5 +3422,344 @@ mod tests {
             panic!("expected a return value");
         };
         assert_eq!(expr.span(), Span::new(2, 14));
+    }
+
+    // ----- Phase 19: try/except/raise -----
+
+    #[test]
+    fn try_except_parses_with_and_without_binding() {
+        let prog = parse_ok("try then\nprint 1 / 0\nexcept e then\nprint e\nend\n");
+        assert_eq!(
+            prog.stmts,
+            vec![Stmt::Try {
+                span: Span::dummy(),
+                body: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: bin(Div, int(1), int(0)),
+                }],
+                except_var: Some("e".to_string()),
+                except_body: Some(vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: ident("e"),
+                }]),
+                finally_body: None,
+            }]
+        );
+        let prog = parse_ok("try then\nprint 1\nexcept then\nprint 2\nend\n");
+        assert_eq!(
+            prog.stmts,
+            vec![Stmt::Try {
+                span: Span::dummy(),
+                body: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: int(1),
+                }],
+                except_var: None,
+                except_body: Some(vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: int(2),
+                }]),
+                finally_body: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn try_with_only_finally_and_with_both_clauses_parses() {
+        let prog = parse_ok("try then\nprint 1\nfinally then\nprint 2\nend\n");
+        assert_eq!(
+            prog.stmts,
+            vec![Stmt::Try {
+                span: Span::dummy(),
+                body: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: int(1),
+                }],
+                except_var: None,
+                except_body: None,
+                finally_body: Some(vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: int(2),
+                }]),
+            }]
+        );
+        let prog =
+            parse_ok("try then\nprint 1\nexcept e then\nprint e\nfinally then\nprint 2\nend\n");
+        let [
+            Stmt::Try {
+                except_var,
+                except_body,
+                finally_body,
+                ..
+            },
+        ] = prog.stmts.as_slice()
+        else {
+            panic!("expected a try");
+        };
+        assert_eq!(except_var.as_deref(), Some("e"));
+        assert!(except_body.is_some());
+        assert!(finally_body.is_some());
+    }
+
+    #[test]
+    fn raise_parses() {
+        assert_eq!(
+            parse_ok("raise \"boom\"\n").stmts,
+            vec![Stmt::Raise {
+                span: Span::dummy(),
+                expr: Expr::Str {
+                    value: "boom".to_string(),
+                    span: Span::dummy(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn try_needs_except_or_finally() {
+        let err = parse_err("try then\nprint 1\nend\n");
+        assert!(
+            err.message
+                .contains("try needs an 'except' or 'finally' clause"),
+            "{}",
+            err.message
+        );
+        assert_eq!((err.line, err.col), (3, 1));
+        assert!(!err.is_incomplete());
+    }
+
+    #[test]
+    fn try_missing_end_is_incomplete() {
+        // The REPL uses this to keep reading more lines.
+        let err = parse_err("try then\nprint 1\nexcept e then\nprint 2\n");
+        assert!(err.is_incomplete());
+        let err = parse_err("try then\nprint 1\n");
+        assert!(err.is_incomplete());
+    }
+
+    #[test]
+    fn raise_needs_an_expression() {
+        let err = parse_err("raise\n");
+        assert!(
+            err.message.contains("expected expression after 'raise'"),
+            "{}",
+            err.message
+        );
+        assert!(!err.is_incomplete());
+    }
+
+    #[test]
+    fn try_display_round_trip() {
+        let source = "try then\n    print 1 / 0\nexcept e then\n    print e\nfinally then\n    print \"fatto\"\nend\n";
+        let prog = parse_ok(source);
+        let printed = prog.to_string();
+        assert_eq!(
+            printed,
+            "try then\n    print 1 / 0\nexcept e then\n    print e\nfinally then\n    print \"fatto\"\nend"
+        );
+        let reparsed = parse_ok(&printed);
+        assert_eq!(reparsed, prog);
+        // `except` without a binding round-trips too.
+        let source = "try then\n    print 1\nexcept then\n    print 2\nend\n";
+        let prog = parse_ok(source);
+        assert_eq!(parse_ok(&prog.to_string()), prog);
+    }
+
+    #[test]
+    fn try_and_raise_spans_point_at_the_keyword() {
+        let prog = parse_ok("try then\nprint 1 / 0\nexcept e then\nprint e\nend\nraise \"x\"\n");
+        let [try_stmt, raise_stmt] = prog.stmts.as_slice() else {
+            panic!("expected a try and a raise");
+        };
+        assert_eq!(try_stmt.span(), Span::new(1, 1));
+        assert_eq!(raise_stmt.span(), Span::new(6, 1));
+    }
+
+    #[test]
+    fn match_parses_with_literal_wildcard_binding_and_guard() {
+        let prog = parse_ok(
+            "match x then\ncase 1 then\nprint \"uno\"\ncase n if n > 10 then\nprint \"grande\"\ncase _ then\nprint \"altro\"\nend\n",
+        );
+        assert_eq!(
+            prog.stmts,
+            vec![Stmt::Match {
+                span: Span::dummy(),
+                scrutinee: ident("x"),
+                cases: vec![
+                    Case {
+                        pattern: Pattern::Literal(int(1)),
+                        guard: None,
+                        body: vec![Stmt::Print {
+                            span: Span::dummy(),
+                            expr: Expr::Str {
+                                value: "uno".to_string(),
+                                span: Span::dummy(),
+                            },
+                        }],
+                    },
+                    Case {
+                        pattern: Pattern::Binding("n".to_string()),
+                        guard: Some(bin(Gt, ident("n"), int(10))),
+                        body: vec![Stmt::Print {
+                            span: Span::dummy(),
+                            expr: Expr::Str {
+                                value: "grande".to_string(),
+                                span: Span::dummy(),
+                            },
+                        }],
+                    },
+                    Case {
+                        pattern: Pattern::Wildcard,
+                        guard: None,
+                        body: vec![Stmt::Print {
+                            span: Span::dummy(),
+                            expr: Expr::Str {
+                                value: "altro".to_string(),
+                                span: Span::dummy(),
+                            },
+                        }],
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn match_list_and_tuple_patterns_parse_including_nested() {
+        let prog = parse_ok(
+            "match p then\ncase [a, [b, c]] then\nprint a\ncase (x, y) then\nprint x\ncase (z,) then\nprint z\ncase (w) then\nprint w\nend\n",
+        );
+        let [Stmt::Match { cases, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a match");
+        };
+        assert_eq!(
+            cases[0].pattern,
+            Pattern::List(vec![
+                Pattern::Binding("a".to_string()),
+                Pattern::List(vec![
+                    Pattern::Binding("b".to_string()),
+                    Pattern::Binding("c".to_string()),
+                ]),
+            ])
+        );
+        assert_eq!(
+            cases[1].pattern,
+            Pattern::Tuple(vec![
+                Pattern::Binding("x".to_string()),
+                Pattern::Binding("y".to_string()),
+            ])
+        );
+        // `(z,)` is a one-element tuple, `(w)` is grouping.
+        assert_eq!(
+            cases[2].pattern,
+            Pattern::Tuple(vec![Pattern::Binding("z".to_string())])
+        );
+        assert_eq!(cases[3].pattern, Pattern::Binding("w".to_string()));
+        // A negative literal and a string literal are patterns too.
+        let prog = parse_ok("match x then\ncase -1 then\nprint 1\ncase \"a\" then\nprint 2\nend\n");
+        let [Stmt::Match { cases, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a match");
+        };
+        assert_eq!(
+            cases[0].pattern,
+            Pattern::Literal(Expr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(int(1)),
+                span: Span::dummy(),
+            })
+        );
+        assert_eq!(
+            cases[1].pattern,
+            Pattern::Literal(Expr::Str {
+                value: "a".to_string(),
+                span: Span::dummy(),
+            })
+        );
+    }
+
+    #[test]
+    fn match_display_round_trip() {
+        let source = "match x then\n    case 1 then\n        print \"uno\"\n    case n if n > 10 then\n        print \"grande\"\n    case [a, b] then\n        print a + b\n    case _ then\n        print \"altro\"\nend\n";
+        let prog = parse_ok(source);
+        let printed = prog.to_string();
+        assert_eq!(
+            printed,
+            "match x then\n    case 1 then\n        print \"uno\"\n    case n if n > 10 then\n        print \"grande\"\n    case [a, b] then\n        print a + b\n    case _ then\n        print \"altro\"\nend"
+        );
+        assert_eq!(parse_ok(&printed), prog);
+    }
+
+    #[test]
+    fn match_without_case_or_end_is_an_error() {
+        let err = parse_err("match x then\nprint 1\nend\n");
+        assert!(
+            err.message.contains("expected 'case' or 'end' in 'match'"),
+            "{}",
+            err.message
+        );
+        assert!(!err.is_incomplete());
+    }
+
+    #[test]
+    fn match_missing_end_is_incomplete() {
+        // The REPL uses this to keep reading more lines.
+        let err = parse_err("match x then\ncase 1 then\nprint 1\n");
+        assert!(err.is_incomplete());
+    }
+
+    #[test]
+    fn match_and_case_spans_point_at_the_keyword() {
+        let prog = parse_ok("match x then\ncase 1 then\nprint 1\nend\n");
+        let [match_stmt] = prog.stmts.as_slice() else {
+            panic!("expected a match");
+        };
+        assert_eq!(match_stmt.span(), Span::new(1, 1));
+    }
+
+    #[test]
+    fn yield_parses_inside_a_function() {
+        let prog = parse_ok("fn f()\n    yield 1\n    yield\nend\n");
+        assert_eq!(
+            prog.stmts,
+            vec![Stmt::Fn {
+                span: Span::dummy(),
+                name: "f".to_string(),
+                params: vec![],
+                rest: None,
+                body: vec![
+                    Stmt::Yield {
+                        expr: Some(int(1)),
+                        span: Span::dummy(),
+                    },
+                    Stmt::Yield {
+                        expr: None,
+                        span: Span::dummy(),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn yield_outside_a_function_is_a_parse_error() {
+        let err = parse_err("yield 1\n");
+        assert!(
+            err.message.contains("'yield' outside a function"),
+            "{}",
+            err.message
+        );
+        assert_eq!((err.line, err.col), (1, 1));
+        assert!(!err.is_incomplete());
+        // A nested function's `yield` belongs to the nested
+        // function, so it is legal.
+        let prog = parse_ok("fn outer()\n    fn inner()\n        yield 1\n    end\nend\n");
+        assert_eq!(prog.stmts.len(), 1);
+    }
+
+    #[test]
+    fn yield_display_round_trip() {
+        let source = "fn f()\n    yield 1\n    yield\nend\n";
+        let prog = parse_ok(source);
+        assert_eq!(parse_ok(&prog.to_string()), prog);
     }
 }

@@ -14,8 +14,13 @@
 //! other statements print nothing by themselves, and `nil` is never
 //! echoed. Errors are printed and the session goes on with its state
 //! intact. `exit` (or `quit`) on its own line leaves; end of input
-//! (Ctrl-D) leaves too. No line editing or history: the REPL reads
-//! plain lines from stdin (a `rustyline` upgrade can add that later).
+//! (Ctrl-D) leaves too.
+//!
+//! The plain loop in `run_repl_with_venv` reads lines from stdin,
+//! which is also how the REPL works when stdin is piped (and how the
+//! tests drive it). When stdin is a terminal, the `gg` binary drives
+//! the same session through `rustyline` instead (`ReplSession`),
+//! which adds line editing and arrow-key history.
 
 use std::io::{BufRead, Write};
 
@@ -46,21 +51,10 @@ pub fn run_repl_with_venv(
     out: &mut dyn Write,
     venv_dirs: Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
-    let mut interp = Interpreter::new();
-    interp.set_venv_dirs(venv_dirs);
-    run_repl_with(&mut interp, input, out)
-}
-
-fn run_repl_with(
-    interp: &mut Interpreter,
-    input: &mut dyn BufRead,
-    out: &mut dyn Write,
-) -> std::io::Result<()> {
-    writeln!(out, "GG {VERSION} — interactive REPL. Type exit to quit.")?;
-    let mut buffer = String::new();
-    let mut prompt = PROMPT;
+    print_welcome(out)?;
+    let mut session = ReplSession::new(venv_dirs);
     loop {
-        out.write_all(prompt.as_bytes())?;
+        out.write_all(session.prompt().as_bytes())?;
         out.flush()?;
         let mut line = String::new();
         let read = input.read_line(&mut line)?;
@@ -69,46 +63,114 @@ fn run_repl_with(
             writeln!(out)?;
             return Ok(());
         }
-        let trimmed = line.trim();
-        if buffer.is_empty() && (trimmed == "exit" || trimmed == "quit") {
+        if session.handle_line(&line, input, out)? {
             return Ok(());
         }
-        if buffer.is_empty() && trimmed.is_empty() {
-            continue;
+    }
+}
+
+/// The banner printed once at the start of a session, by both the
+/// stream loop and the interactive (`rustyline`) driver.
+pub fn print_welcome(out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "GG {VERSION} — interactive REPL. Type exit to quit.")
+}
+
+/// The state of one REPL session, shared by the plain stream loop
+/// above and by the `gg` binary's interactive driver: the
+/// interpreter, the lines of the block being typed, and the prompt
+/// currently shown (`gg> ` or `... `).
+pub struct ReplSession {
+    interp: Interpreter,
+    buffer: String,
+    prompt: &'static str,
+}
+
+impl ReplSession {
+    /// A fresh session: the interpreter has no definitions yet.
+    pub fn new(venv_dirs: Vec<std::path::PathBuf>) -> Self {
+        let mut interp = Interpreter::new();
+        interp.set_venv_dirs(venv_dirs);
+        Self {
+            interp,
+            buffer: String::new(),
+            prompt: PROMPT,
         }
-        buffer.push_str(&line);
+    }
+
+    /// The prompt to show before the next line.
+    pub fn prompt(&self) -> &'static str {
+        self.prompt
+    }
+
+    /// True when no block is being typed: the next line starts a
+    /// fresh chunk. The interactive driver uses this to know when a
+    /// chunk is complete (and so is one history entry).
+    pub fn at_chunk_start(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Drop the block being typed and go back to the `gg> ` prompt
+    /// (Ctrl-C in the interactive REPL).
+    pub fn abort_chunk(&mut self) {
+        self.buffer.clear();
+        self.prompt = PROMPT;
+    }
+
+    /// Feed one line of input (with or without its trailing
+    /// newline). Returns `true` when the session should end
+    /// (`exit`/`quit` on its own line). Errors are printed and the
+    /// session goes on with its state intact; `input` is the reader
+    /// GG `input()` reads from.
+    pub fn handle_line(
+        &mut self,
+        line: &str,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> std::io::Result<bool> {
+        let trimmed = line.trim();
+        if self.buffer.is_empty() && (trimmed == "exit" || trimmed == "quit") {
+            return Ok(true);
+        }
+        if self.buffer.is_empty() && trimmed.is_empty() {
+            return Ok(false);
+        }
+        self.buffer.push_str(line);
+        if !self.buffer.ends_with('\n') {
+            self.buffer.push('\n');
+        }
         // Trailing whitespace is stripped before parsing, so an
         // unfinished block fails at end of input (and is detected as
         // incomplete) instead of at the trailing newline.
-        let tokens = match gg_lexer::lex(buffer.trim_end()) {
+        let tokens = match gg_lexer::lex(self.buffer.trim_end()) {
             Ok(tokens) => tokens,
             Err(e) => {
                 // A lex error is never "unfinished": strings cannot
                 // span lines, so more input cannot fix it.
                 writeln!(out, "error: {e}")?;
-                buffer.clear();
-                prompt = PROMPT;
-                continue;
+                self.buffer.clear();
+                self.prompt = PROMPT;
+                return Ok(false);
             }
         };
         match gg_parser::parse(&tokens) {
             Ok(program) => {
-                buffer.clear();
-                prompt = PROMPT;
-                if let Err(e) = run_chunk(interp, &program, &mut *input, out) {
+                self.buffer.clear();
+                self.prompt = PROMPT;
+                if let Err(e) = run_chunk(&mut self.interp, &program, input, out) {
                     writeln!(out, "runtime error: {e}")?;
                 }
             }
             Err(e) if e.is_incomplete() => {
                 // Keep the buffer and wait for more lines.
-                prompt = CONTINUATION_PROMPT;
+                self.prompt = CONTINUATION_PROMPT;
             }
             Err(e) => {
                 writeln!(out, "error: {e}")?;
-                buffer.clear();
-                prompt = PROMPT;
+                self.buffer.clear();
+                self.prompt = PROMPT;
             }
         }
+        Ok(false)
     }
 }
 
@@ -185,6 +247,22 @@ mod tests {
         assert_eq!(
             session("for x in [1, 2] then\nprint x\nend\nexit\n"),
             format!("{WELCOME}gg> ... ... 1\n2\ngg> ")
+        );
+    }
+
+    #[test]
+    fn multi_line_try_except_uses_the_continuation_prompt() {
+        assert_eq!(
+            session("try then\nprint 1 / 0\nexcept e then\nprint e\nend\nexit\n"),
+            format!("{WELCOME}gg> ... ... ... ... division by zero\ngg> ")
+        );
+    }
+
+    #[test]
+    fn raise_in_the_repl_is_caught_by_try() {
+        assert_eq!(
+            session("try then\nraise \"ciao\"\nexcept e then\nprint e\nend\nexit\n"),
+            format!("{WELCOME}gg> ... ... ... ... ciao\ngg> ")
         );
     }
 
@@ -366,5 +444,95 @@ mod tests {
             format!("{WELCOME}gg> gg> Ciao Giuliano\ngg> ")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_tracks_the_continuation_prompt() {
+        let mut session = ReplSession::new(Vec::new());
+        assert_eq!(session.prompt(), "gg> ");
+        assert!(session.at_chunk_start());
+        let mut input = Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        assert!(
+            !session
+                .handle_line("if true then\n", &mut input, &mut out)
+                .unwrap()
+        );
+        assert_eq!(session.prompt(), "... ");
+        assert!(!session.at_chunk_start());
+        assert!(
+            !session
+                .handle_line("print \"x\"\n", &mut input, &mut out)
+                .unwrap()
+        );
+        assert_eq!(session.prompt(), "... ");
+        assert!(!session.handle_line("end\n", &mut input, &mut out).unwrap());
+        assert_eq!(session.prompt(), "gg> ");
+        assert!(session.at_chunk_start());
+        assert_eq!(String::from_utf8(out).unwrap(), "x\n");
+    }
+
+    #[test]
+    fn session_accepts_lines_without_a_trailing_newline() {
+        // Lines from rustyline have no trailing newline.
+        let mut session = ReplSession::new(Vec::new());
+        let mut input = Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        assert!(
+            !session
+                .handle_line("let x = 5", &mut input, &mut out)
+                .unwrap()
+        );
+        assert!(!session.handle_line("x", &mut input, &mut out).unwrap());
+        assert_eq!(String::from_utf8(out).unwrap(), "5\n");
+    }
+
+    #[test]
+    fn session_abort_chunk_discards_the_block() {
+        let mut session = ReplSession::new(Vec::new());
+        let mut input = Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        assert!(
+            !session
+                .handle_line("if true then\n", &mut input, &mut out)
+                .unwrap()
+        );
+        session.abort_chunk();
+        assert_eq!(session.prompt(), "gg> ");
+        assert!(session.at_chunk_start());
+        // The aborted block never ran, and the session still works.
+        assert!(
+            !session
+                .handle_line("1 + 1\n", &mut input, &mut out)
+                .unwrap()
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "2\n");
+    }
+
+    #[test]
+    fn session_exit_and_empty_lines() {
+        let mut session = ReplSession::new(Vec::new());
+        let mut input = Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        assert!(!session.handle_line("\n", &mut input, &mut out).unwrap());
+        assert!(!session.handle_line("   \n", &mut input, &mut out).unwrap());
+        assert!(session.at_chunk_start());
+        assert!(session.handle_line("exit\n", &mut input, &mut out).unwrap());
+    }
+
+    #[test]
+    fn session_error_lines_finish_the_chunk() {
+        // A line that fails is still a finished chunk: the driver
+        // records it in the history like any other line.
+        let mut session = ReplSession::new(Vec::new());
+        let mut input = Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        assert!(
+            !session
+                .handle_line("let = 5\n", &mut input, &mut out)
+                .unwrap()
+        );
+        assert!(session.at_chunk_start());
+        assert_eq!(session.prompt(), "gg> ");
     }
 }

@@ -28,8 +28,8 @@ pub type BuiltinFn = fn(&[Value], &mut dyn BufRead, &mut dyn Write) -> Result<Va
 
 /// A builtin function implementation that also gets the interpreter,
 /// so it can call back into GG code (a frame function, a layout
-/// callback). Only the `gui` module uses this: every other builtin
-/// is `Plain`.
+/// callback, or a generator replay). The `gui` module and `next`
+/// use this: every other builtin is `Plain`.
 pub type InterpFn =
     fn(&mut Interpreter, &[Value], &mut dyn BufRead, &mut dyn Write) -> Result<Value, RuntimeError>;
 
@@ -213,6 +213,11 @@ pub fn all() -> Vec<Builtin> {
             func: BuiltinFunc::Plain(ndim),
         },
         Builtin {
+            name: "next",
+            arity: Arity::Exact(1),
+            func: BuiltinFunc::WithInterp(next_gen),
+        },
+        Builtin {
             name: "ones",
             arity: Arity::Exact(1),
             func: BuiltinFunc::Plain(ones),
@@ -384,9 +389,33 @@ fn type_of(
         Value::Function(_) | Value::Builtin(_) | Value::BoundMethod(_) => "fn".to_string(),
         Value::Class(_) => "class".to_string(),
         Value::Module(_) => "module".to_string(),
+        Value::Generator(_) => "generator".to_string(),
         Value::Instance(inst) => inst.borrow().class.name.clone(),
     };
     Ok(Value::Str(name))
+}
+
+/// `next(gen)` — pull the next value out of a generator (replay
+/// its body up to the next `yield`). When the generator is
+/// exhausted, the error is `"generator exhausted"` — catchable
+/// with `try`/`except`, and swallowed silently by `for x in gen`.
+/// Anything that is not a generator is an error.
+fn next_gen(
+    interp: &mut Interpreter,
+    args: &[Value],
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let Value::Generator(generator) = &args[0] else {
+        return Err(RuntimeError::new(format!(
+            "next() expects a generator, not {}",
+            args[0].type_name()
+        )));
+    };
+    match interp.next_generator(generator, input, out)? {
+        Some(value) => Ok(value),
+        None => Err(RuntimeError::new("generator exhausted")),
+    }
 }
 
 /// `str(x)` — convert to a string, same representation as `print`.

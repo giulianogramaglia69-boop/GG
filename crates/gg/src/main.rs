@@ -15,6 +15,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod interactive;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
@@ -153,6 +155,13 @@ fn main() -> ExitCode {
 }
 
 fn start_repl() -> ExitCode {
+    use std::io::IsTerminal;
+    // On a terminal the interactive driver adds line editing and
+    // arrow-key history (rustyline); piped stdin keeps the plain
+    // stream loop, so scripts and tests behave exactly as before.
+    if std::io::stdin().is_terminal() {
+        return interactive::start_repl_interactive();
+    }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let stdout = std::io::stdout();

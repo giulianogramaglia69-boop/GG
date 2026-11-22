@@ -1,0 +1,46 @@
+# Pattern matching (Phase 23): `match` picks the first case whose
+# pattern matches and whose guard (if any) is true; when no case
+# matches, nothing happens (`case _` is the idiomatic fallback).
+# Patterns: literals, `_`, bindings, list/tuple patterns (nested).
+
+fn descrivi(x)
+    match x then
+    case 0 then
+        print "zero"
+    case 1 then
+        print "uno"
+    case n if n > 10 then
+        print f"{n} e grande"
+    case n then
+        print f"altro: {n}"
+    end
+end
+
+descrivi(0)
+descrivi(1)
+descrivi(7)
+descrivi(42)
+
+# A list pattern unpacks the elements; a structural mismatch is
+# simply no match, never an error.
+match [3, 4] then
+case [a, b] then
+    print f"somma: {a + b}"
+case _ then
+    print "non una coppia"
+end
+
+match [1, 2, 3] then
+case [a, b] then
+    print "coppia"
+case _ then
+    print "non una coppia"
+end
+
+# Tuple patterns, nested patterns and guards with bindings.
+match (2, [5, 6]) then
+case (x, [y, z]) if x + y + z > 10 then
+    print f"totale: {x + y + z}"
+case (x, [y, z]) then
+    print f"totale: {x + y + z}"
+end

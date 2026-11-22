@@ -1,0 +1,26 @@
+# Default arguments, keyword arguments, *args and spread (Phase 21).
+
+fn saluta(nome, saluto = "ciao", *extra)
+    let msg = saluto + " " + nome
+    for parola in extra then
+        msg = msg + " " + parola
+    end
+    return msg
+end
+
+print saluta("Giuliano")
+print saluta("Giuliano", "buongiorno")
+print saluta("Giuliano", saluto = "hey")
+print saluta("Giuliano", "hey", "come", "va?")
+
+fn somma(*numeri)
+    let totale = 0
+    for n in numeri then
+        totale = totale + n
+    end
+    return totale
+end
+
+print somma(1, 2, 3)
+print somma(*[4, 5, 6])
+print somma(*range(4))

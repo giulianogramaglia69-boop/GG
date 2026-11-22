@@ -83,7 +83,72 @@ clicked, exclusive groups are the script's own logic),
 `combo` (dropdown over a List of Str, returns the selected
 index), `progress` (bar, value clamped to [0, 1]) and
 `vertical` (like `horizontal`, vertical layout) — see
-`examples/gui_widgets_demo.gg`.
+`examples/gui_widgets_demo.gg`. **Phase 18 — `linalg.rank`:
+done.** `rank(A)` → Int, the rank of a 2D numeric matrix,
+square or rectangular; with it, an indeterminate system is
+told from an impossible one (`rank(A) == rank([A|b]) < n` vs
+`rank(A) < rank([A|b])`) — see `examples/rank_demo.gg`.
+**Phase 19 — error handling: done.** `try then ... except e
+then ... finally then ... end` catches runtime errors (the
+bound variable holds the error's message as a Str; `except`
+without a binding ignores it; at least one of `except` and
+`finally` is required), `raise "message"` throws one, and
+`finally` runs on every exit — normal, error, and `return`
+(see the Errors bullet below and `examples/try_demo.gg`).
+**Phase 20 — comprehensions and lambdas: done.** List
+`[x * 2 for x in xs]`, dict `{k: v for k, v in pairs}` and set
+`{x for x in xs}` comprehensions, each with an optional `if`
+filter and a single `for` clause (no nested fors); the loop
+variable is scoped to the comprehension. Lambdas: `fn(x) x * 2
+end` — `fn` without a name, as an expression, whose body is a
+single expression; they capture the defining environment and
+are values like any function, so they can be assigned, passed
+as arguments, and called on the spot (`fn(x) x + 1 end(41)`) —
+see the Comprehensions bullet below and
+`examples/comprehension_demo.gg`. **Phase 21 — default
+arguments, keyword arguments and `*args`: done.** Parameters
+with defaults (`fn saluta(nome, saluto = "ciao")`), keyword
+arguments (`saluta(nome = "x")`, in any order), a rest
+parameter (`fn somma(*numeri)`, the extras as a List) and
+spread at the call (`f(*xs)`, over lists, tuples and arrays);
+defaults are evaluated once at definition time (Python rule —
+a mutable default is shared between calls), and the same
+mechanism works for named functions, lambdas and methods
+(including `init` through the constructor and `super` calls);
+builtins stay positional, and there is no `**kwargs` yet — see
+the Arguments bullet below and `examples/args_demo.gg`.
+**Phase 22 — f-strings: done.** `f"ciao {nome}, hai {eta} anni"`
+interpolates any GG expression inside `{...}` — variables,
+arithmetic, calls, indexing, comprehensions, lambdas — rendered
+with the same Display as `print`; `{{` and `}}` are literal
+braces, and the usual escapes work in the literal text. The `f`
+must touch the quote (`f "..."` is still an identifier plus a
+string). Errors have positions: an unclosed `{`, a lone `}`,
+an empty `{}` and an unterminated f-string are lex/parse errors
+pointing at the spot, and an error inside the braces points at
+its own token and can be caught by `try`/`except`. Strings
+inside the braces work, dict/set literals too, and f-strings
+nest (`f"a {f"b {x}"} c"`). Out of scope: format specs
+(`{x:.2f}`), `!r`/`!s` conversions and `{x=}` — see the
+F-strings bullet below and `examples/fstring_demo.gg`.
+**Phase 23 — `match` and generators: done.** `match x then
+case 1 then ... case [a, b] then ... case n if n > 10 then ...
+case _ then ... end` picks the first case whose pattern matches
+(literals, `_`, bindings, list/tuple patterns, nested) and whose
+guard, if any, is true; when no case matches, nothing happens.
+A function whose body contains `yield` is a generator: calling
+it returns a `<generator>` without running the body, and
+`next(gen)` replays the body from the start up to the next
+`yield` (lazy replay — see the Match and Generators bullets
+below, with the limits in evidence, and
+`examples/match_demo.gg` / `examples/generators_demo.gg`).
+**Phase 24 — REPL history: done.** On a terminal the REPL runs
+through `rustyline` (19.0.0): up/down arrows walk the history,
+which persists in `~/.gg_history` across sessions, and a
+multi-line block is a single history entry. Ctrl-C drops the
+line (and the block in progress); Ctrl-D on an empty line
+leaves. When stdin is piped, the REPL uses the plain stream
+loop instead, so piped sessions behave exactly as before.
 
 ## The REPL
 
@@ -120,9 +185,14 @@ goes on with its state intact — a line that fails halfway may have
 executed part of its statements before failing. Blocks wait for their
 `end` with the `... ` prompt; note that `then` must stay on the same
 line as the condition (`if x` followed by `then` on the next line is
-an error, not a continuation). The REPL reads plain lines from stdin:
-no arrow-key history and no line editing yet (that needs a line-editing
-library like `rustyline`, a future upgrade).
+an error, not a continuation). On a terminal the REPL has arrow-key
+history (`rustyline`): up/down recall previous chunks, the history
+persists in `~/.gg_history` across sessions, and a multi-line block
+is a single history entry (up-arrow recalls the whole block).
+Ctrl-C drops the line being typed and the block in progress — before
+this, Ctrl-C killed the process — and `exit`/`quit` are not
+recorded in the history. When stdin is piped (scripts, tests), the
+REPL reads plain lines as before and never touches the history file.
 
 ## Semantics
 
@@ -151,11 +221,113 @@ works.
   elements of a 1D array, the rows of a 2D+ array), sets (insertion
   order), dicts (the keys, in insertion order), strings (one
   character at a time), queues and stacks (a snapshot — iterating
-  does not consume them). The iterable is evaluated once before
-  the loop starts, so mutations inside the body do not change what
-  the loop visits. Anything else is a runtime error (`Int is not
-  iterable`). The loop variable exists only inside the loop body,
-  like the numeric `for`.
+  does not consume them), and generators (Phase 23 — pulled
+  lazily, one `next()` at a time, until exhaustion ends the loop).
+  The iterable is evaluated once before the loop starts, so
+  mutations inside the body do not change what the loop visits —
+  except for a generator, whose body runs again on every pull
+  (see the Generators bullet). Anything else is a runtime error
+  (`Int is not iterable`). The loop variable exists only inside
+  the loop body, like the numeric `for`.
+- **Comprehensions (Phase 20):** `[expr for x in xs]`,
+  `{k: v for k, v in pairs}`, `{x for x in xs}` — a list, dict or
+  set built from any iterable of `for-in` (lists, tuples, arrays,
+  sets, dict keys, strings, queues, stacks, `range`), with an
+  optional `if` filter (`[x for x in xs if x > 0]`). One `for`
+  clause only (no nested fors — nest a comprehension in the
+  element instead: `[[y for y in row] for row in matrix]`). The
+  loop variable exists only inside the comprehension, like a
+  `for` variable; two variables unpack a pair (`for k, v in
+  pairs`, each item a 2-tuple, 2-list or 2-element 1D array).
+  Dict keys must be Int, Float, Str or Bool, and duplicate keys
+  keep the last value; set duplicates are dropped.
+- **Lambdas (Phase 20):** `fn(x) x * 2 end` is `fn` without a
+  name, as an expression. The body is a single expression and its
+  value is the return value (no statements, no `return` inside).
+  A lambda captures the environment where it was defined, like a
+  named function, and is a value: assign it (`let doppia = fn(x)
+  x * 2 end`), pass it to a function, or call it on the spot
+  (`fn(x) x + 1 end(41)`). `type` is `"fn"`, it prints as
+  `<fn>`.
+- **Arguments (Phase 21):** `fn saluta(nome, saluto = "ciao")
+  ... end` gives `saluto` a default; a call may pass it
+  positionally or by keyword (`saluta("x", saluto = "hey")`,
+  keywords in any order, after the positionals). A default is
+  evaluated once, at definition time (Python rule) — `let d =
+  1` then `fn f(x = d)` then `d = 2` still gives `f()` as `1`,
+  and a mutable default (a list) is shared between calls.
+  `fn somma(*numeri) ... end` collects extra positionals
+  into a List (empty when there are none); `*rest` must be the
+  last parameter and there is at most one. `f(*xs)` spreads a
+  list, tuple or array into positional arguments (anything
+  else is an error). Unknown keywords, duplicates (the same
+  parameter positional and by keyword, or twice by keyword)
+  and missing required arguments are runtime errors pointing
+  at the call — or at the keyword name for the first two.
+  A parameter without a default after one with a default, a
+  positional after a keyword, and a spread after a keyword
+  are parse errors. The same mechanism works for lambdas and
+  methods (`init` included, through the constructor, and
+  `super` calls); builtins stay positional (a keyword
+  argument to one is an error) and there is no `**kwargs`
+  yet.
+- **F-strings (Phase 22):** `f"ciao {nome}"` — the `f` must touch
+  the quote. Inside `{...}` goes any GG expression, evaluated in
+  the current environment and rendered with the same Display as
+  `print` (`f"{1 + 2} e {xs[0]}"`, `f"{upper("ciao")}"`,
+  `f"{[x * 2 for x in xs]}"`); the parts are concatenated left to
+  right, and the result is an ordinary Str — assign it, pass it,
+  print it. `{{` and `}}` are literal braces; the escapes
+  `\"` `\\` `\n` `\t` work in the literal text (a raw `"` would
+  close the string). Errors point at the spot: an unclosed `{`, a
+  lone `}`, an empty `{}` and an unterminated f-string are
+  lex/parse errors, and an error inside the braces (an undefined
+  variable, a division by zero) points at its own token and can be
+  caught by `try`/`except`. F-strings nest
+  (`f"a {f"b {x}"} c"`). No format specs (`{x:.2f}`), no
+  `!r`/`!s` conversions, no `{x=}`.
+- **Match (Phase 23):** `match x then case 1 then ... case [a, b]
+  then ... case n if n > 10 then ... case _ then ... end` — a
+  statement, not an expression (no match expression yet). The
+  first case whose pattern matches runs: literals (numbers,
+  strings, `true`/`false`, also negative numbers), `_` (matches
+  anything), a binding (a bare identifier, bound to the value),
+  a list pattern `[a, b]` or a tuple pattern `(a, b)`, also
+  nested (`[a, [b, c]]`). A list pattern matches only a List, a
+  tuple pattern only a Tuple, and a length mismatch is simply no
+  match, never an error. An optional guard `if <expr>` after the
+  pattern is evaluated with the bindings in scope; a false guard
+  skips the case. When no case matches, nothing happens — `case _`
+  is the idiomatic fallback. Bindings live only in their case's
+  body; a `return` inside a case returns from the enclosing
+  function.
+- **Generators (Phase 23):** a function whose body contains
+  `yield` is a generator: calling it does **not** run the body —
+  it returns a generator value (`type` is `"generator"`, it
+  prints as `<generator>`), and `next(gen)` pulls the next value
+  out of it. `yield expr` yields the value (a bare `yield` yields
+  `nil`); `return` inside a generator ends it (the returned value
+  is ignored). When the body ends before the next `yield`,
+  `next()` fails with `"generator exhausted"` — catchable with
+  `try`/`except`. `for x in gen` pulls lazily, one `next()` at a
+  time, until exhaustion (which ends the loop silently). Two
+  generators from one function are independent; a method with
+  `yield` is a generator too. `yield` outside a function is a
+  parse error.
+  **Limits of the replay design — read this before using one:**
+  GG has no threads and no state machine for real suspension
+  (the interpreter shares everything through `Rc`), so `next()`
+  works by **replay**: it runs the body from the start, counting
+  the `yield`s, and stops at the next one after those already
+  consumed. That means (1) the total cost is O(n²) over a whole
+  iteration — every `next()` starts from the beginning; (2) the
+  body's side effects **repeat** on every `next()` — a `print`
+  before the target `yield` runs again, and a mutation of an
+  outer variable runs again; the body must be deterministic for
+  the values to be right. Infinite generators still work: a
+  replay stops at the N-th `yield` without ever running forever.
+  Comprehensions do not take generators (they would need a
+  snapshot — use `for-in` or `next()` to collect into a list).
 - **Scopes:** every block (`if`/`while`/`for`/function body) runs in
   its own child scope. `let` inside a block is invisible outside;
   assignment updates the variable where it was defined.
@@ -362,6 +534,26 @@ true
   `print 10 / 0` fails with
   `runtime error: 10:10: division by zero`.
 
+- **Error handling (Phase 19):** a runtime error can be caught
+  instead of stopping the program:
+  ```gg
+  try then
+      print 10 / 0
+  except e then
+      print "preso: " + e
+  end
+  ```
+  `except e then` binds the error's message as a Str to `e`
+  (scoped to the handler); `except then` without a binding
+  ignores it. `raise "message"` throws an error pointing at the
+  `raise` (the message must be a Str). `finally then ... end`
+  runs on every exit — normal, error, and `return` — and a
+  `return` or an error inside it replaces the pending outcome.
+  At least one of `except` and `finally` is required, so a bare
+  `try ... end` is a parse error. Errors unwind through function
+  calls; lex and parse errors happen before any code runs and
+  cannot be caught. See `examples/try_demo.gg`.
+
 ```gg
 fn fib(n)
     if n < 2 then
@@ -396,7 +588,7 @@ end
 
 ## Builtins
 
-Forty-seven builtin functions are predefined in the global environment of
+Forty-nine builtin functions are predefined in the global environment of
 every program. They are first-class values: they can be assigned to
 variables (`let f = len`), passed as arguments and returned from
 functions. `type()` returns `"fn"` for user functions and builtins
@@ -448,6 +640,7 @@ instance and `"class"` for a class (Phase 8).
 | `keys(d)` | The keys of a dict as a list, in insertion order | `keys({"b": 1, "a": 2})` → `["b", "a"]` |
 | `contains(coll, x)` | Membership: in a list, tuple, array or set; a key in a dict; a substring in a string | `contains([1, 2], 2)` → `true`, `contains("ciao", "ia")` → `true` |
 | `list(x)` | Convert a tuple, set, array, queue or stack — or a dict (its keys) — into a list; an error on strings and other types | `list((1, 2))` → `[1, 2]`, `list({"a": 1})` → `["a"]` |
+| `next(gen)` | Pull the next value out of a generator (see the Generators bullet below); an error when the generator is exhausted (`"generator exhausted"`) or the argument is not a generator | `next(g)` → `10` |
 | `is_a(x, Classe)` | `true` when `x` is an instance of `Classe` or of any class inheriting from it; the second argument must be a class | `is_a(s, Persona)` → `true`, `is_a(5, Persona)` → `false` |
 | `sum(list)` | The sum of a list of numbers, or of all the elements of an array; all integers give an integer, any float gives a float; on a Bool array it counts the `true` values; an error on an empty list or a non-number | `sum([1, 2, 3])` → `6`, `sum([1.5, 2])` → `3.5`, `sum(reshape(array([1, 2, 3, 4]), [2, 2]))` → `10`, `sum(array([true, false]))` → `1` |
 | `join(sep, list)` | The complement of `split`: join the strings of the list with the separator between them | `join(", ", ["a", "b"])` → `"a, b"` |
@@ -1033,13 +1226,27 @@ statement := "let" ident "=" expr
            | "if" expr "then" block ["else" block] "end"
            | "while" expr "then" block "end"
            | "for" ident "=" expr "to" expr "then" block "end"
-           | "fn" ident "(" [ident ("," ident)*] ")" block "end"
+           | "fn" ident "(" [param ("," param)*] ")" block "end"
            | "class" ident ["extends" ident] class_body "end"
            | "import" ident ["as" ident]
+           | "try" "then" block ["except" [ident] "then" block] ["finally" "then" block] "end"
+           | "raise" expr
+           | "match" expr "then" (case)* "end"
+           | "yield" [expr]
            | "return" [expr]
            | expr
-class_body:= ("fn" ident "(" [ident ("," ident)*] ")" block "end")*
+case      := "case" pattern ["if" expr] "then" block
+pattern   := number | string | "true" | "false" | "-" number
+           | "_" | ident
+           | "[" [pattern ("," pattern)*] "]"
+           | "(" [pattern ("," pattern)*] ")" ; one comma or more → tuple, else grouping
+class_body:= ("fn" ident "(" [param ("," param)*] ")" block "end")*
            ; a method's first parameter must be "self"
+param     := ident ["=" expr] | "*" ident
+           ; a parameter with a default, or the rest parameter —
+           ; at most one rest parameter, and it must be last
+arg       := "*" expr | ident "=" expr | expr
+           ; a spread, a keyword argument, or a positional
 expr      := or
 or        := and ("or" and)*
 and       := equality ("and" equality)*
@@ -1048,14 +1255,26 @@ comparison:= term (("<" | "<=" | ">" | ">=") term)*
 term      := factor (("+" | "-") factor)*
 factor    := unary (("*" | "/" | "%") unary)*
 unary     := ("-" | "not") unary | postfix
-postfix   := primary ("[" index_item ("," index_item)* "]" | "." ident ["(" [expr ("," expr)*] ")"])*
+postfix   := primary ("[" index_item ("," index_item)* "]" | "." ident ["(" [arg ("," arg)*] ")"] | "(" [arg ("," arg)*] ")")*
+           ; the last alternative calls the value the primary
+           ; produced: `fn(x) x end(2)`, `f()(3)`
 index_item:= expr | [expr] ":" [expr] [":" [expr]] ; a slice — each bound optional
 primary   := number | string | "true" | "false" | "self"
-           | "super" "." ident ["(" [expr ("," expr)*] ")"]
+           | "f" string   ; an f-string: `f"ciao {nome}"`, `{expr}`
+           ; interpolates any expression, `{{`/`}}` literal braces
+           | "super" "." ident ["(" [arg ("," arg)*] ")"]
            | "[" [expr ("," expr)*] "]"
+           | "[" expr "for" ident ["," ident] "in" expr ["if" expr] "]"
+           ; a list comprehension — one `for` clause only
            | "(" [expr ("," expr)*] ")"   ; one comma or more → tuple, else grouping
            | "{" [dict | set] "}"         ; "k: v" entries → dict, plain values → set, "{}" → empty dict
-           | ident ["(" [expr ("," expr)*] ")"]
+           | "{" expr "for" ident ["," ident] "in" expr ["if" expr] "}"
+           ; a set comprehension — one `for` clause only
+           | "{" expr ":" expr "for" ident ["," ident] "in" expr ["if" expr] "}"
+           ; a dict comprehension — one `for` clause only
+           | "fn" "(" [param ("," param)*] ")" expr "end"
+           ; a lambda — the body is a single expression
+           | ident ["(" [arg ("," arg)*] ")"]
 dict      := expr ":" expr ("," expr ":" expr)* [","]
 set       := expr ("," expr)* [","]
 index     := postfix "[" index_item ("," index_item)* "]"
@@ -1073,7 +1292,11 @@ is the field-access operator since Phase 8, so `5.` is a lex error
 and `.5` is rejected by the parser instead. `import` and `as`
 were added as keywords in Phase 9 (`important` is still a plain
 identifier); a module name is a single identifier — there are no
-dotted module paths (`import sub.mod` is a parse error).
+dotted module paths (`import sub.mod` is a parse error). `try`,
+`except`, `finally` and `raise` were added as keywords in Phase 19
+(`tryout` and `excepted` are still plain identifiers). `match`,
+`case` and `yield` were added as keywords in Phase 23
+(`matching` and `yielding` are still plain identifiers).
 
 ```gg
 fn sum_to(n)
@@ -1091,10 +1314,10 @@ print sum_to(10)
 
 | Kind | Examples |
 | --- | --- |
-| Keywords | `let if then else end while for fn return print true false and or not to class extends super self import as` |
+| Keywords | `let if then else end while for fn return print true false and or not to class extends super self import as try except finally raise match case yield` |
 | Identifiers | `[A-Za-z_][A-Za-z0-9_]*` (keywords are reserved) |
 | Numbers | integers `42`, floats `3.14` (`.5` and `5.` are errors) |
-| Strings | `"..."` with escapes `\"` `\\` `\n` `\t` |
+| Strings | `"..."` with escapes `\"` `\\` `\n` `\t`; f-strings `f"..."` with `{expr}` interpolation, `{{`/`}}` literal braces |
 | Operators | `+ - * / % == != < <= > >= =` (`!` alone is not an operator) |
 | Punctuation | `( ) , [ ] { } : .` (braces are dict/set literals, not blocks; `.` is field access) |
 | Separators | newline, `;` |
@@ -1196,9 +1419,63 @@ exit with code 1.
     rank 0. With it, an indeterminate system is told from an
     impossible one: `rank(A) == rank([A|b]) < n` vs
     `rank(A) < rank([A|b])`; see `examples/rank_demo.gg`
+19. **Error handling** ✅ — `try then ... except e then ...
+    finally then ... end` catches runtime errors (the bound
+    variable holds the error's message as a Str; `except`
+    without a binding ignores it; at least one of `except`
+    and `finally` is required), `raise "message"` throws one
+    (Str only, pointing at the `raise`), and `finally` runs on
+    every exit — normal, error, and `return`; errors unwind
+    through function calls, while lex/parse errors cannot be
+    caught; see `examples/try_demo.gg`
+20. **Comprehensions and lambdas** ✅ — list `[x * 2 for x in
+    xs]`, dict `{k: v for k, v in pairs}` and set `{x for x in
+    xs}` comprehensions (one `for` clause only, optional `if`
+    filter; loop variable scoped to the comprehension; two
+    variables unpack pairs; duplicate dict keys keep the last
+    value) and lambdas `fn(x) x * 2 end` (single-expression
+    body, closures, first-class values, callable on the spot);
+    see `examples/comprehension_demo.gg`
+21. **Default arguments, keyword arguments and `*args`** ✅ —
+    parameters with defaults (`fn saluta(nome, saluto =
+    "ciao")`, evaluated once at definition time), keyword
+    arguments (`saluta(nome = "x")`, any order, after the
+    positionals), a rest parameter (`fn somma(*numeri)`,
+    extras as a List) and spread at the call (`f(*xs)`, over
+    lists, tuples and arrays); same mechanism for named
+    functions, lambdas and methods; builtins stay positional,
+    no `**kwargs` yet; see `examples/args_demo.gg`
+22. **F-strings** ✅ — `f"ciao {nome}"` interpolates any
+    expression inside `{...}` (variables, arithmetic, calls,
+    indexing, comprehensions, lambdas), rendered with the same
+    Display as `print`; `{{`/`}}` are literal braces; errors
+    point at the spot and are catchable by `try`/`except`;
+    f-strings nest; no format specs, no `!r`/`!s`, no `{x=}`;
+    see `examples/fstring_demo.gg`
+23. **`match` and generators** ✅ — `match x then case 1 then
+    ... case [a, b] then ... case n if n > 10 then ... case _
+    then ... end` (first matching case wins; literals, `_`,
+    bindings, list/tuple patterns, nested; optional `if` guard;
+    no match when nothing matches; statement only, no match
+    expression yet) and generators: a function with `yield` in
+    its body returns a `<generator>` on call, `next(gen)` replays
+    the body up to the next `yield`, `"generator exhausted"`
+    when it ends (catchable with `try`/`except`), `for x in gen`
+    pulls lazily; replay limits (O(n²) total, side effects
+    repeat) documented in the Semantics section; see
+    `examples/match_demo.gg` and `examples/generators_demo.gg`
+24. **REPL history** ✅ — on a terminal the REPL runs through
+    `rustyline` 19.0.0: up/down arrows walk the history, which
+    persists in `~/.gg_history` across sessions, and a multi-line
+    block is a single history entry; Ctrl-C drops the line and
+    the block in progress, Ctrl-D on an empty line leaves;
+    piped stdin keeps the plain stream loop (no history file
+    touched). This closes the "migliora tutto" series (Fasi
+    19–24)
 
-Next: not decided yet — Fase 18 is done; the GUI's first real
-interactive test on the laptop is still open.
+Next: not decided yet — the "migliora tutto" series is done
+(Fasi 19–24); the GUI's first real interactive test on the
+laptop is still open.
 
 Long term: more data libraries in the spirit of Pandas, and a
 web framework in the spirit of Django — each is a large project

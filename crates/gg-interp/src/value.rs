@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gg_parser::ast::Stmt;
 
@@ -58,6 +59,13 @@ pub enum Value {
     /// value. Its top-level names are its environment; attribute
     /// access (`math.pi`) reads them. Modules compare by identity.
     Module(Rc<ModuleData>),
+    /// A generator: a function whose body contains `yield`, called
+    /// but not yet run. Calling it returns this value instead of
+    /// executing the body; `next(gen)` replays the body from the
+    /// start up to the next `yield` (see `Interpreter`). Two
+    /// generators from the same function are independent: each
+    /// keeps its own bindings and count of yielded values.
+    Generator(Rc<RefCell<GeneratorData>>),
 }
 
 /// A loaded module: its name (as imported) and the environment its
@@ -68,6 +76,52 @@ pub enum Value {
 pub struct ModuleData {
     pub name: String,
     pub env: Rc<Environment>,
+}
+
+/// The state of a generator: the function to replay, the
+/// arguments bound at the call (already checked for arity, so a
+/// wrong call fails when the generator is created, not at the
+/// first `next`), the `super` context to run it in (the defining
+/// class for a method, the function's own for a plain function),
+/// and how many values have been yielded so far.
+///
+/// `id` is unique per generator (a process-wide counter): two
+/// generators are equal only when they are the same one, even
+/// when they come from the same function with the same arguments.
+#[derive(Debug, Clone)]
+pub struct GeneratorData {
+    pub function: Rc<Function>,
+    pub bindings: Vec<(String, Value)>,
+    pub super_context: Option<Rc<ClassDef>>,
+    pub consumed: usize,
+    pub id: u64,
+}
+
+/// The next generator id: one counter for the whole process, so
+/// every generator is unique.
+static NEXT_GENERATOR_ID: AtomicU64 = AtomicU64::new(1);
+
+impl GeneratorData {
+    pub fn new(
+        function: Rc<Function>,
+        bindings: Vec<(String, Value)>,
+        super_context: Option<Rc<ClassDef>>,
+    ) -> Self {
+        Self {
+            function,
+            bindings,
+            super_context,
+            consumed: 0,
+            id: NEXT_GENERATOR_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+// Two generators are equal only when they are the same one.
+impl PartialEq for GeneratorData {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
 }
 
 /// Max collection nesting depth when printing; deeper levels print
@@ -82,6 +136,12 @@ const MAX_COMPARE_DEPTH: usize = 64;
 /// A user-defined function: parameters, body, and the environment
 /// captured at definition time.
 ///
+/// `defaults` holds one entry per parameter: the default value
+/// for parameters with one (evaluated at definition time, Python
+/// rule — a mutable default is shared between calls), `None`
+/// for required parameters. `rest` is the `*name` parameter, if
+/// any, collecting extra positional arguments into a List.
+///
 /// `super_class` is the class whose method the function was defined
 /// in, if any (a nested function inside a method): `super` inside
 /// it resolves against that class — lexical, like Python's
@@ -90,6 +150,8 @@ const MAX_COMPARE_DEPTH: usize = 64;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub params: Vec<String>,
+    pub defaults: Vec<Option<Value>>,
+    pub rest: Option<String>,
     pub body: Vec<Stmt>,
     pub env: Rc<Environment>,
     pub super_class: Option<Rc<ClassDef>>,
@@ -323,6 +385,7 @@ impl Value {
             Value::Instance(_) => "Instance",
             Value::BoundMethod(_) => "Function",
             Value::Module(_) => "Module",
+            Value::Generator(_) => "Generator",
         }
     }
 
@@ -477,6 +540,7 @@ impl Value {
                 write!(f, "<bound method {}.{}>", bound.class.name, bound.name)
             }
             Value::Module(module) => write!(f, "<module {}>", module.name),
+            Value::Generator(_) => write!(f, "<generator>"),
         }
     }
 
@@ -664,6 +728,9 @@ fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
         // twice returns the same value, so this is almost always
         // true for two imports of one module.
         (Value::Module(x), Value::Module(y)) => Rc::ptr_eq(x, y),
+        // Generators compare by identity: two generators from the
+        // same function are different generators.
+        (Value::Generator(x), Value::Generator(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }

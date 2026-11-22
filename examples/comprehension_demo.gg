@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Comprehensions and lambdas (Phase 20).
+
+let xs = [1, 2, 3, 4, 5]
+
+# A list comprehension builds a new list from an old one.
+print [x * 2 for x in xs]
+# With a filter: only the even numbers, squared.
+print [x * x for x in xs if x % 2 == 0]
+
+# A dict comprehension: keys and values are expressions.
+print {x: x * x for x in xs}
+# Unpacking pairs into key and value.
+print {k: v for k, v in [("a", 1), ("b", 2)]}
+
+# A set comprehension drops duplicates.
+print {x % 3 for x in xs}
+
+# A lambda is a function without a name: fn(params) expr end.
+let doppia = fn(x) x * 2 end
+print doppia(21)
+
+# Lambdas are values: pass one to a function...
+fn applica(f, v)
+    return f(v)
+end
+print applica(fn(x) x + 1 end, 41)
+
+# ...or call one on the spot.
+print fn(x) x * 10 end(3)
+
+# A lambda captures the variables around it, like a named function.
+let base = 100
+let somma = fn(x) x + base end
+print somma(5)

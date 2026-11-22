@@ -13,6 +13,8 @@
 //!   statement separators. `;` is also accepted as a separator.
 //! - `.` is the field-access operator (`p.nome`, `p.saluta()`);
 //!   a dot inside a number (`1.5`) belongs to the number.
+//! - F-strings (Phase 22): `f"ciao {nome}"` — the `f` must touch
+//!   the quote; `{expr}` interpolates, `{{`/`}}` are literal braces.
 
 use std::fmt;
 
@@ -107,11 +109,27 @@ pub enum TokenKind {
     SelfKw,
     Import,
     As,
+    Try,
+    Except,
+    Finally,
+    Raise,
+    Match,
+    Case,
+    Yield,
     // Literals
     Ident(String),
     Int(i64),
     Float(f64),
     Str(String),
+    // F-strings (Phase 22): `f"..."` lexes as a start token,
+    // literal text runs, `{`/`}` expression markers, and an end
+    // token; the expressions between the markers lex as ordinary
+    // tokens, so braces, strings and nested f-strings work inside.
+    FStringStart,
+    FStringText(String),
+    FStringExprStart,
+    FStringExprEnd,
+    FStringEnd,
     // Operators
     Plus,
     Minus,
@@ -168,10 +186,22 @@ impl TokenKind {
             TokenKind::SelfKw => "Self",
             TokenKind::Import => "Import",
             TokenKind::As => "As",
+            TokenKind::Try => "Try",
+            TokenKind::Except => "Except",
+            TokenKind::Finally => "Finally",
+            TokenKind::Raise => "Raise",
+            TokenKind::Match => "Match",
+            TokenKind::Case => "Case",
+            TokenKind::Yield => "Yield",
             TokenKind::Ident(_) => "Ident",
             TokenKind::Int(_) => "Int",
             TokenKind::Float(_) => "Float",
             TokenKind::Str(_) => "Str",
+            TokenKind::FStringStart => "FStringStart",
+            TokenKind::FStringText(_) => "FStringText",
+            TokenKind::FStringExprStart => "FStringExprStart",
+            TokenKind::FStringExprEnd => "FStringExprEnd",
+            TokenKind::FStringEnd => "FStringEnd",
             TokenKind::Plus => "Plus",
             TokenKind::Minus => "Minus",
             TokenKind::Star => "Star",
@@ -224,10 +254,22 @@ impl TokenKind {
             TokenKind::SelfKw => "self".to_string(),
             TokenKind::Import => "import".to_string(),
             TokenKind::As => "as".to_string(),
+            TokenKind::Try => "try".to_string(),
+            TokenKind::Except => "except".to_string(),
+            TokenKind::Finally => "finally".to_string(),
+            TokenKind::Raise => "raise".to_string(),
+            TokenKind::Match => "match".to_string(),
+            TokenKind::Case => "case".to_string(),
+            TokenKind::Yield => "yield".to_string(),
             TokenKind::Ident(name) => name.clone(),
             TokenKind::Int(n) => n.to_string(),
             TokenKind::Float(f) => f.to_string(),
             TokenKind::Str(s) => s.clone(),
+            TokenKind::FStringStart => "f\"".to_string(),
+            TokenKind::FStringText(s) => s.clone(),
+            TokenKind::FStringExprStart => "{".to_string(),
+            TokenKind::FStringExprEnd => "}".to_string(),
+            TokenKind::FStringEnd => "\"".to_string(),
             TokenKind::Plus => "+".to_string(),
             TokenKind::Minus => "-".to_string(),
             TokenKind::Star => "*".to_string(),
@@ -305,8 +347,28 @@ fn keyword_or_ident(word: &str) -> TokenKind {
         "self" => TokenKind::SelfKw,
         "import" => TokenKind::Import,
         "as" => TokenKind::As,
+        "try" => TokenKind::Try,
+        "except" => TokenKind::Except,
+        "finally" => TokenKind::Finally,
+        "raise" => TokenKind::Raise,
+        "match" => TokenKind::Match,
+        "case" => TokenKind::Case,
+        "yield" => TokenKind::Yield,
         _ => TokenKind::Ident(word.to_string()),
     }
+}
+
+/// The lexer's mode stack (Phase 22): inside an f-string the
+/// lexer switches between literal text and ordinary tokens.
+/// `FString` remembers where the f-string started, so an
+/// unterminated one points at its `f`. `Expr` counts nested `{`
+/// inside one interpolation, so a dict literal there does not
+/// close it — and a nested `f"..."` pushes a fresh `FString`
+/// frame on top, so nesting comes for free.
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    FString { line: usize, col: usize },
+    Expr { depth: usize },
 }
 
 struct Lexer {
@@ -314,6 +376,7 @@ struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
+    modes: Vec<Mode>,
 }
 
 impl Lexer {
@@ -323,6 +386,7 @@ impl Lexer {
             pos: 0,
             line: 1,
             col: 1,
+            modes: Vec::new(),
         }
     }
 
@@ -365,6 +429,10 @@ impl Lexer {
     }
 
     fn next_token(&mut self) -> Result<Token, LexerError> {
+        // Inside an f-string, literal text is its own lexing mode.
+        if matches!(self.modes.last(), Some(Mode::FString { .. })) {
+            return self.lex_fstring_text();
+        }
         loop {
             let (line, col) = (self.line, self.col);
             let Some(c) = self.peek() else {
@@ -409,10 +477,26 @@ impl Lexer {
                 }
                 '{' => {
                     self.advance();
+                    // A `{` inside an interpolation is a nested
+                    // brace (a dict literal, say), not a new
+                    // interpolation: count it so its `}` does not
+                    // close the expression.
+                    if let Some(Mode::Expr { depth }) = self.modes.last_mut() {
+                        *depth += 1;
+                    }
                     return Ok(self.token(TokenKind::LBrace, line, col));
                 }
                 '}' => {
                     self.advance();
+                    if let Some(Mode::Expr { depth }) = self.modes.last_mut() {
+                        if *depth == 0 {
+                            // The `}` that closes the interpolation:
+                            // back to literal text of the f-string.
+                            self.modes.pop();
+                            return Ok(self.token(TokenKind::FStringExprEnd, line, col));
+                        }
+                        *depth -= 1;
+                    }
                     return Ok(self.token(TokenKind::RBrace, line, col));
                 }
                 ':' => {
@@ -485,7 +569,15 @@ impl Lexer {
                 }
                 '"' => return self.lex_string(),
                 c if c.is_ascii_digit() => return self.lex_number(),
-                c if c.is_ascii_alphabetic() || c == '_' => return self.lex_ident(),
+                c if c.is_ascii_alphabetic() || c == '_' => {
+                    // `f` immediately followed by `"` opens an
+                    // f-string; `f "..."` with a space is still
+                    // an identifier plus a string.
+                    if c == 'f' && self.peek_next() == Some('"') {
+                        return self.lex_fstring_start();
+                    }
+                    return self.lex_ident();
+                }
                 _ => {
                     return Err(LexerError::new(
                         format!("unexpected character '{c}'"),
@@ -611,6 +703,114 @@ impl Lexer {
             }
         }
     }
+
+    /// Consume the `f"` that opens an f-string and switch to
+    /// literal-text mode.
+    fn lex_fstring_start(&mut self) -> Result<Token, LexerError> {
+        let (line, col) = (self.line, self.col);
+        self.advance(); // f
+        self.advance(); // "
+        self.modes.push(Mode::FString { line, col });
+        Ok(self.token(TokenKind::FStringStart, line, col))
+    }
+
+    /// Lex one literal-text run inside an f-string: everything up
+    /// to the next `{`, `}` or closing `"`. Escapes work as in a
+    /// normal string; `{{` and `}}` are literal braces. Returns
+    /// the text run, or the token for the boundary itself when
+    /// there is no text before it — the boundary character is
+    /// left for the next call in that case.
+    fn lex_fstring_text(&mut self) -> Result<Token, LexerError> {
+        let (start_line, start_col) = match self.modes.last() {
+            Some(Mode::FString { line, col }) => (*line, *col),
+            _ => unreachable!("lex_fstring_text called outside an f-string"),
+        };
+        let (line, col) = (self.line, self.col);
+        let mut text = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(LexerError::new(
+                    "unterminated f-string",
+                    start_line,
+                    start_col,
+                ));
+            };
+            match c {
+                '"' => {
+                    if text.is_empty() {
+                        self.advance();
+                        self.modes.pop();
+                        return Ok(self.token(TokenKind::FStringEnd, line, col));
+                    }
+                    return Ok(self.token(TokenKind::FStringText(text), line, col));
+                }
+                '\n' => {
+                    return Err(LexerError::new(
+                        "unterminated f-string",
+                        start_line,
+                        start_col,
+                    ));
+                }
+                '{' => {
+                    if self.peek_next() == Some('{') {
+                        text.push('{');
+                        self.advance();
+                        self.advance();
+                    } else if text.is_empty() {
+                        self.advance();
+                        self.modes.push(Mode::Expr { depth: 0 });
+                        return Ok(self.token(TokenKind::FStringExprStart, line, col));
+                    } else {
+                        return Ok(self.token(TokenKind::FStringText(text), line, col));
+                    }
+                }
+                '}' => {
+                    if self.peek_next() == Some('}') {
+                        text.push('}');
+                        self.advance();
+                        self.advance();
+                    } else if text.is_empty() {
+                        return Err(LexerError::new(
+                            "single '}' in f-string (use '}}' for a literal brace)",
+                            line,
+                            col,
+                        ));
+                    } else {
+                        return Ok(self.token(TokenKind::FStringText(text), line, col));
+                    }
+                }
+                '\\' => {
+                    self.advance();
+                    let Some(esc) = self.peek() else {
+                        return Err(LexerError::new(
+                            "unterminated f-string",
+                            start_line,
+                            start_col,
+                        ));
+                    };
+                    let decoded = match esc {
+                        '"' => '"',
+                        '\\' => '\\',
+                        'n' => '\n',
+                        't' => '\t',
+                        _ => {
+                            return Err(LexerError::new(
+                                format!("unknown escape sequence '\\{esc}'"),
+                                self.line,
+                                self.col,
+                            ));
+                        }
+                    };
+                    text.push(decoded);
+                    self.advance();
+                }
+                _ => {
+                    text.push(c);
+                    self.advance();
+                }
+            }
+        }
+    }
 }
 
 /// Tokenize a GG source string.
@@ -691,7 +891,7 @@ mod tests {
     fn keywords_are_not_identifiers_but_prefixes_are() {
         assert_eq!(
             kinds_no_eof(
-                "let letter endif endless truex not_now total selfish classy superb extends2 imported ash inizio inside"
+                "let letter endif endless truex not_now total selfish classy superb extends2 imported ash inizio inside tryout excepted finally2 raisable"
             ),
             vec![
                 TokenKind::Let,
@@ -709,6 +909,56 @@ mod tests {
                 TokenKind::Ident("ash".to_string()),
                 TokenKind::Ident("inizio".to_string()),
                 TokenKind::Ident("inside".to_string()),
+                TokenKind::Ident("tryout".to_string()),
+                TokenKind::Ident("excepted".to_string()),
+                TokenKind::Ident("finally2".to_string()),
+                TokenKind::Ident("raisable".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn try_except_finally_raise_are_keywords() {
+        assert_eq!(
+            kinds_no_eof("try then except e then finally then raise \"x\" end"),
+            vec![
+                TokenKind::Try,
+                TokenKind::Then,
+                TokenKind::Except,
+                TokenKind::Ident("e".to_string()),
+                TokenKind::Then,
+                TokenKind::Finally,
+                TokenKind::Then,
+                TokenKind::Raise,
+                TokenKind::Str("x".to_string()),
+                TokenKind::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn match_case_yield_are_keywords() {
+        assert_eq!(
+            kinds_no_eof("match x then case 1 then yield 2 end"),
+            vec![
+                TokenKind::Match,
+                TokenKind::Ident("x".to_string()),
+                TokenKind::Then,
+                TokenKind::Case,
+                TokenKind::Int(1),
+                TokenKind::Then,
+                TokenKind::Yield,
+                TokenKind::Int(2),
+                TokenKind::End,
+            ]
+        );
+        // Longer words stay identifiers.
+        assert_eq!(
+            kinds_no_eof("matching caseload yielding"),
+            vec![
+                TokenKind::Ident("matching".to_string()),
+                TokenKind::Ident("caseload".to_string()),
+                TokenKind::Ident("yielding".to_string()),
             ]
         );
     }
@@ -752,7 +1002,7 @@ mod tests {
     fn all_keywords() {
         assert_eq!(
             kinds_no_eof(
-                "let if then else end while for fn return print true false and or not to in class extends super self import as"
+                "let if then else end while for fn return print true false and or not to in class extends super self import as try except finally raise"
             ),
             vec![
                 TokenKind::Let,
@@ -778,6 +1028,10 @@ mod tests {
                 TokenKind::SelfKw,
                 TokenKind::Import,
                 TokenKind::As,
+                TokenKind::Try,
+                TokenKind::Except,
+                TokenKind::Finally,
+                TokenKind::Raise,
             ]
         );
     }
@@ -848,6 +1102,145 @@ mod tests {
                 TokenKind::Str("g\th".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn fstring_token_sequence() {
+        assert_eq!(
+            kinds_no_eof("f\"ciao {nome}, hai {eta} anni\""),
+            vec![
+                TokenKind::FStringStart,
+                TokenKind::FStringText("ciao ".to_string()),
+                TokenKind::FStringExprStart,
+                TokenKind::Ident("nome".to_string()),
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringText(", hai ".to_string()),
+                TokenKind::FStringExprStart,
+                TokenKind::Ident("eta".to_string()),
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringText(" anni".to_string()),
+                TokenKind::FStringEnd,
+            ]
+        );
+        // No placeholders, no text at the edges: no empty text tokens.
+        assert_eq!(
+            kinds_no_eof("f\"\" f\"testo\" f\"{x}\""),
+            vec![
+                TokenKind::FStringStart,
+                TokenKind::FStringEnd,
+                TokenKind::FStringStart,
+                TokenKind::FStringText("testo".to_string()),
+                TokenKind::FStringEnd,
+                TokenKind::FStringStart,
+                TokenKind::FStringExprStart,
+                TokenKind::Ident("x".to_string()),
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn fstring_double_braces_are_literal() {
+        assert_eq!(
+            kinds_no_eof("f\"{{x}} e {{}}\""),
+            vec![
+                TokenKind::FStringStart,
+                TokenKind::FStringText("{x} e {}".to_string()),
+                TokenKind::FStringEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn f_is_an_identifier_when_not_attached_to_a_quote() {
+        assert_eq!(
+            kinds_no_eof("f \"x\""),
+            vec![
+                TokenKind::Ident("f".to_string()),
+                TokenKind::Str("x".to_string()),
+            ]
+        );
+        // `foo"..."` is an identifier followed by a string.
+        assert_eq!(
+            kinds_no_eof("foo\"bar\""),
+            vec![
+                TokenKind::Ident("foo".to_string()),
+                TokenKind::Str("bar".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fstring_strings_and_dicts_inside_braces() {
+        // A string literal inside the braces lexes normally.
+        assert_eq!(
+            kinds_no_eof("f\"{greet(\"Bob\")}\""),
+            vec![
+                TokenKind::FStringStart,
+                TokenKind::FStringExprStart,
+                TokenKind::Ident("greet".to_string()),
+                TokenKind::LParen,
+                TokenKind::Str("Bob".to_string()),
+                TokenKind::RParen,
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringEnd,
+            ]
+        );
+        // A dict literal inside the braces: its braces are counted,
+        // so only the last `}` closes the interpolation.
+        assert_eq!(
+            kinds_no_eof("f\"{ {\"a\": 1}[\"a\"] }\""),
+            vec![
+                TokenKind::FStringStart,
+                TokenKind::FStringExprStart,
+                TokenKind::LBrace,
+                TokenKind::Str("a".to_string()),
+                TokenKind::Colon,
+                TokenKind::Int(1),
+                TokenKind::RBrace,
+                TokenKind::LBracket,
+                TokenKind::Str("a".to_string()),
+                TokenKind::RBracket,
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn fstring_nested() {
+        assert_eq!(
+            kinds_no_eof("f\"a {f\"b {x}\"} c\""),
+            vec![
+                TokenKind::FStringStart,
+                TokenKind::FStringText("a ".to_string()),
+                TokenKind::FStringExprStart,
+                TokenKind::FStringStart,
+                TokenKind::FStringText("b ".to_string()),
+                TokenKind::FStringExprStart,
+                TokenKind::Ident("x".to_string()),
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringEnd,
+                TokenKind::FStringExprEnd,
+                TokenKind::FStringText(" c".to_string()),
+                TokenKind::FStringEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn fstring_errors() {
+        let err = lex("f\"never closed").unwrap_err();
+        assert_eq!(err.message, "unterminated f-string");
+        assert_eq!((err.line, err.col), (1, 1));
+
+        let err = lex("f\"a } b\"").unwrap_err();
+        assert!(err.message.contains("single '}'"));
+        assert_eq!((err.line, err.col), (1, 5));
+
+        let err = lex("f\"bad \\q\"").unwrap_err();
+        assert!(err.message.contains("unknown escape sequence"));
     }
 
     #[test]

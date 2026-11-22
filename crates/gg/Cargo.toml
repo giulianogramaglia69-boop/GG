@@ -10,6 +10,7 @@ description = "GG programming language interpreter (tree-walking)"
 gg-lexer = { path = "../gg-lexer" }
 gg-parser = { path = "../gg-parser" }
 gg-interp = { path = "../gg-interp" }
+rustyline = "19"
 
 [[bin]]
 name = "gg"

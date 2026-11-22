@@ -26,7 +26,7 @@ use std::io::{BufRead, Write};
 pub use builtin::Builtin;
 pub use error::RuntimeError;
 pub use interp::Interpreter;
-pub use repl::{run_repl, run_repl_with_venv};
+pub use repl::{ReplSession, print_welcome, run_repl, run_repl_with_venv};
 pub use value::Value;
 pub use venv::{create_venv, venv_dirs_from_env, venv_lib_dir};
 
@@ -144,6 +144,64 @@ mod tests {
         assert_eq!(run_ok("print 10 - 4 - 3\n"), "3\n");
         assert_eq!(run_ok("print 2.5 + 1\n"), "3.5\n");
         assert_eq!(run_ok("print -5 + 2\n"), "-3\n");
+    }
+
+    #[test]
+    fn fstring_interpolation() {
+        assert_eq!(
+            run_ok(
+                "let nome = \"Giuliano\"\nlet eta = 14\nprint f\"ciao {nome}, hai {eta} anni\"\n"
+            ),
+            "ciao Giuliano, hai 14 anni\n"
+        );
+        // Expressions, not just variables.
+        assert_eq!(run_ok("print f\"{1 + 2} x {3 * 4}\"\n"), "3 x 12\n");
+        // Calls and indexing inside the braces.
+        assert_eq!(
+            run_ok("let xs = [10, 20]\nprint f\"{xs[1]} e {len(xs)}\"\n"),
+            "20 e 2\n"
+        );
+        // No placeholder is just a string; an empty f-string is empty.
+        assert_eq!(run_ok("print f\"testo\"\nprint f\"\"\n"), "testo\n\n");
+        // Double braces are literal braces.
+        assert_eq!(run_ok("print f\"{{x}} vale {1}\"\n"), "{x} vale 1\n");
+        // A nested f-string, and a string literal inside the braces.
+        assert_eq!(
+            run_ok("let x = 5\nprint f\"fuori {f\"dentro {x}\"}\"\n"),
+            "fuori dentro 5\n"
+        );
+        assert_eq!(run_ok("print f\"{upper(\"ciao\")}\"\n"), "CIAO\n");
+        // A comprehension inside the braces.
+        assert_eq!(run_ok("print f\"{[x * 2 for x in [1, 2]]}\"\n"), "[2, 4]\n");
+    }
+
+    #[test]
+    fn fstring_errors_have_positions_and_are_catchable() {
+        // An undefined variable inside the braces points at the identifier.
+        assert_eq!(
+            run_err("print f\"ciao {inesistente}\"\n"),
+            "runtime error: 1:15: undefined variable 'inesistente'"
+        );
+        // A division by zero inside the braces points at the operator.
+        assert_eq!(
+            run_err("print f\"{1 / 0}\"\n"),
+            "runtime error: 1:12: division by zero"
+        );
+        // An error inside the braces can be caught by try/except.
+        let src =
+            "try then\n    print f\"{1 / 0}\"\nexcept e then\n    print f\"preso: {e}\"\nend\n";
+        assert_eq!(run_ok(src), "preso: division by zero\n");
+        // Lex/parse errors of the f-string itself.
+        assert!(
+            run_err("print f\"a {} b\"\n").contains("empty expression"),
+            "{}",
+            run_err("print f\"a {} b\"\n")
+        );
+        assert!(
+            run_err("print f\"mai chiusa\n").contains("unterminated f-string"),
+            "{}",
+            run_err("print f\"mai chiusa\n")
+        );
     }
 
     #[test]
@@ -298,6 +356,124 @@ mod tests {
     }
 
     #[test]
+    fn list_comprehensions() {
+        assert_eq!(run_ok("print [x * 2 for x in [1, 2, 3]]\n"), "[2, 4, 6]\n");
+        // With a filter.
+        assert_eq!(
+            run_ok("print [x for x in [1, 2, 3, 4] if x > 2]\n"),
+            "[3, 4]\n"
+        );
+        // Over a range and over a string (one character at a time).
+        assert_eq!(
+            run_ok("print [x * x for x in range(4)]\n"),
+            "[0, 1, 4, 9]\n"
+        );
+        assert_eq!(run_ok("print [c for c in \"ab\"]\n"), "[\"a\", \"b\"]\n");
+        // Over dict keys, like for-in.
+        assert_eq!(
+            run_ok("print [k for k in {\"a\": 1, \"b\": 2}]\n"),
+            "[\"a\", \"b\"]\n"
+        );
+        // Nested: the element is a comprehension too.
+        assert_eq!(
+            run_ok("print [[y * 10 for y in row] for row in [[1, 2], [3]]]\n"),
+            "[[10, 20], [30]]\n"
+        );
+        // The loop variable does not leak out, and an outer
+        // variable with the same name is untouched.
+        assert!(
+            run_err("print [x * 2 for x in [1, 2]]\nprint x\n").contains("undefined variable 'x'")
+        );
+        let src = "let x = 0\nprint [x for x in [7]]\nprint x\n";
+        assert_eq!(run_ok(src), "[7]\n0\n");
+        // A non-iterable is an error, at the iterable.
+        assert!(run_err("print [x for x in 5]\n").contains("Int is not iterable"));
+    }
+
+    #[test]
+    fn dict_comprehensions() {
+        // Unpacking pairs: two variables.
+        assert_eq!(
+            run_ok("print {k: v for k, v in [(\"a\", 1), (\"b\", 2)]}\n"),
+            "{\"a\": 1, \"b\": 2}\n"
+        );
+        // One variable, and a filter.
+        assert_eq!(
+            run_ok("print {x: x * x for x in [1, 2, 3]}\n"),
+            "{1: 1, 2: 4, 3: 9}\n"
+        );
+        assert_eq!(
+            run_ok("print {x: x for x in [1, 2, 3] if x > 1}\n"),
+            "{2: 2, 3: 3}\n"
+        );
+        // Duplicate keys: the last one wins (Python rule).
+        assert_eq!(
+            run_ok("print {x: x * 10 for x in [1, 2, 2, 1]}\n"),
+            "{1: 10, 2: 20}\n"
+        );
+        // Unpacking a non-pair is an error.
+        assert!(
+            run_err("print {k: v for k, v in [1, 2]}\n")
+                .contains("cannot unpack Int into 2 variables")
+        );
+        // A non-hashable key is an error.
+        assert!(
+            run_err("print {[1]: 2 for x in [1]}\n")
+                .contains("dict key must be Int, Float, Str or Bool")
+        );
+    }
+
+    #[test]
+    fn set_comprehensions() {
+        assert_eq!(
+            run_ok("print {x for x in [1, 1, 2, 3, 3]}\n"),
+            "{1, 2, 3}\n"
+        );
+        assert_eq!(
+            run_ok("print {x * x for x in [1, 2, 3] if x > 1}\n"),
+            "{4, 9}\n"
+        );
+        // A non-hashable element is an error.
+        assert!(
+            run_err("print {[x] for x in [1]}\n")
+                .contains("set element must be Int, Float, Str or Bool")
+        );
+    }
+
+    #[test]
+    fn lambdas_are_values() {
+        // Assigned to a variable and called.
+        assert_eq!(
+            run_ok("let doppia = fn(x) x * 2 end\nprint doppia(21)\n"),
+            "42\n"
+        );
+        // Zero parameters, and more than one.
+        assert_eq!(run_ok("let g = fn() 42 end\nprint g()\n"), "42\n");
+        assert_eq!(
+            run_ok("let somma = fn(a, b) a + b end\nprint somma(2, 3)\n"),
+            "5\n"
+        );
+        // Called on the spot, without a name.
+        assert_eq!(run_ok("print fn(x) x + 1 end(41)\n"), "42\n");
+        // Passed as an argument to a user function.
+        let src = "fn applica(f, v)\n    return f(v)\nend\nprint applica(fn(x) x * 3 end, 5)\n";
+        assert_eq!(run_ok(src), "15\n");
+        // A lambda is a closure: it captures the defining env.
+        let src = "let base = 10\nlet somma = fn(x) x + base end\nprint somma(5)\n";
+        assert_eq!(run_ok(src), "15\n");
+        // Wrong arity is an error, like a named function.
+        assert!(
+            run_err("let f = fn(x) x end\nprint f(1, 2)\n")
+                .contains("expected 1 argument(s) but got 2")
+        );
+        // `type` and `str` see a function.
+        assert_eq!(
+            run_ok("let f = fn(x) x end\nprint type(f)\nprint f\n"),
+            "fn\n<fn>\n"
+        );
+    }
+
+    #[test]
     fn let_inside_a_block_is_not_visible_outside() {
         let src = "if true then\n    let y = 1\nend\nprint y\n";
         assert!(run_err(src).contains("undefined variable 'y'"));
@@ -402,6 +578,154 @@ mod tests {
         assert!(run_err(src).contains("expected 1 argument(s) but got 2"));
     }
 
+    // ---- Phase 21: defaults, keyword arguments, *args, spread ----
+
+    #[test]
+    fn default_arguments_are_used_and_can_be_overridden() {
+        let src = "fn saluta(nome, saluto = \"ciao\")\n    return saluto + \" \" + nome\nend\nprint saluta(\"Giuliano\")\nprint saluta(\"Giuliano\", \"buongiorno\")\nprint saluta(\"Giuliano\", saluto = \"hey\")\n";
+        assert_eq!(
+            run_ok(src),
+            "ciao Giuliano\nbuongiorno Giuliano\nhey Giuliano\n"
+        );
+        // A default may be any expression.
+        assert_eq!(
+            run_ok("fn f(x = 1 + 2)\n    return x\nend\nprint f()\n"),
+            "3\n"
+        );
+    }
+
+    #[test]
+    fn defaults_are_evaluated_at_definition_time() {
+        // Like Python: the default is frozen when the function is
+        // defined, so a later change of the variable is invisible.
+        let src = "let d = 1\nfn f(x = d)\n    return x\nend\nd = 2\nprint f()\n";
+        assert_eq!(run_ok(src), "1\n");
+        // ... and a mutable default is shared between calls.
+        let src = "fn f(xs = [])\n    push(xs, 1)\n    return len(xs)\nend\nprint f()\nprint f()\n";
+        assert_eq!(run_ok(src), "1\n2\n");
+    }
+
+    #[test]
+    fn keyword_arguments_match_by_name_in_any_order() {
+        let src = "fn punto(x, y)\n    return [x, y]\nend\nprint punto(y = 2, x = 1)\nprint punto(1, y = 2)\n";
+        assert_eq!(run_ok(src), "[1, 2]\n[1, 2]\n");
+    }
+
+    #[test]
+    fn rest_parameter_collects_extra_positionals() {
+        let src = "fn somma(*numeri)\n    let totale = 0\n    for n in numeri then\n        totale = totale + n\n    end\n    return totale\nend\nprint somma()\nprint somma(5)\nprint somma(1, 2, 3, 4)\n";
+        assert_eq!(run_ok(src), "0\n5\n10\n");
+        // *args with required parameters before it.
+        let src = "fn primo_e_resto(primo, *resto)\n    return [primo, resto]\nend\nprint primo_e_resto(1)\nprint primo_e_resto(1, 2, 3)\n";
+        assert_eq!(run_ok(src), "[1, []]\n[1, [2, 3]]\n");
+    }
+
+    #[test]
+    fn spread_expands_lists_tuples_and_ranges() {
+        let src = "fn somma(a, b, c)\n    return a + b + c\nend\nprint somma(*[1, 2, 3])\nprint somma(*(1, 2, 3))\nprint somma(*range(3))\nprint somma(1, *[2, 3])\nprint somma(*[1, 2], *[3])\n";
+        assert_eq!(run_ok(src), "6\n6\n3\n6\n6\n");
+    }
+
+    #[test]
+    fn keyword_and_spread_errors_are_clear_and_positioned() {
+        // Unknown keyword: the error points at the keyword name.
+        assert_eq!(
+            run_err("fn f(a)\n    return a\nend\nprint f(b = 1)\n"),
+            "runtime error: 4:9: unknown keyword argument 'b'"
+        );
+        // Duplicate: positional then keyword for the same parameter.
+        assert_eq!(
+            run_err("fn f(a)\n    return a\nend\nprint f(1, a = 2)\n"),
+            "runtime error: 4:12: got multiple values for argument 'a'"
+        );
+        // The same keyword twice.
+        assert!(
+            run_err("fn f(a)\n    return a\nend\nprint f(a = 1, a = 2)\n")
+                .contains("got multiple values for argument 'a'")
+        );
+        // A missing required argument (one parameter has a default).
+        assert!(
+            run_err("fn f(a, b = 1)\n    return a\nend\nprint f()\n")
+                .contains("missing required argument 'a'")
+        );
+        // Too many positionals when a default exists.
+        assert!(
+            run_err("fn f(a, b = 1)\n    return a\nend\nprint f(1, 2, 3)\n")
+                .contains("takes at most 2 positional argument(s) but got 3")
+        );
+        // Spreading something that is not a list/tuple/array:
+        // the error points at the `*`.
+        assert_eq!(
+            run_err("fn f(a, b)\n    return a + b\nend\nprint f(*5)\n"),
+            "runtime error: 4:9: cannot spread Int (only lists, tuples and arrays can be spread)"
+        );
+        assert!(
+            run_err("fn f(a, b)\n    return a + b\nend\nprint f(*\"ab\")\n")
+                .contains("cannot spread Str")
+        );
+        // A builtin with a keyword argument is a clear error.
+        assert!(
+            run_err("print len(x = [1])\n")
+                .contains("builtin 'len' does not accept keyword arguments")
+        );
+    }
+
+    #[test]
+    fn argument_syntax_errors_are_parse_errors() {
+        // A parameter without a default after one with a default.
+        assert!(
+            run_err("fn f(a = 1, b)\n    return a\nend\n")
+                .contains("without a default follows a parameter with a default")
+        );
+        // A rest parameter that is not last.
+        assert!(
+            run_err("fn f(*resto, a)\n    return a\nend\n").contains("must be the last parameter")
+        );
+        // A positional after a keyword.
+        assert!(
+            run_err("fn f(a, b)\n    return a\nend\nprint f(a = 1, 2)\n")
+                .contains("positional argument follows a keyword argument")
+        );
+        // A spread after a keyword.
+        assert!(
+            run_err("fn f(a, b)\n    return a\nend\nprint f(a = 1, *[2])\n")
+                .contains("cannot use '*' after a keyword argument")
+        );
+        // A duplicate parameter name.
+        assert!(
+            run_err("fn f(a, a)\n    return a\nend\n").contains("duplicate parameter name 'a'")
+        );
+        // **kwargs are not supported.
+        assert!(
+            run_err("fn f(a)\n    return a\nend\nprint f(**d)\n").contains("'**' is not supported")
+        );
+    }
+
+    #[test]
+    fn methods_and_lambdas_support_defaults_and_kwargs() {
+        // A method with a default and a keyword call.
+        let src = "class Persona\n    fn init(self, nome, saluto = \"ciao\")\n        self.nome = nome\n        self.saluto = saluto\n    end\n    fn presenta(self)\n        return self.saluto + \" \" + self.nome\n    end\nend\nlet p = Persona(\"Giuliano\")\nprint p.presenta()\nlet q = Persona(\"Giuliano\", saluto = \"hey\")\nprint q.presenta()\n";
+        assert_eq!(run_ok(src), "ciao Giuliano\nhey Giuliano\n");
+        // Keyword arguments reach `init` through the constructor.
+        let src = "class P\n    fn init(self, nome, eta = 0)\n        self.nome = nome\n        self.eta = eta\n    end\nend\nlet p = P(nome = \"Giuliano\", eta = 14)\nprint p.nome\nprint p.eta\n";
+        assert_eq!(run_ok(src), "Giuliano\n14\n");
+        // A method with *args.
+        let src = "class Somma\n    fn init(self, *numeri)\n        self.numeri = numeri\n    end\nend\nlet s = Somma(1, 2, 3)\nprint s.numeri\n";
+        assert_eq!(run_ok(src), "[1, 2, 3]\n");
+        // `super` with a keyword argument.
+        let src = "class A\n    fn saluta(self, nome, saluto = \"ciao\")\n        return saluto + \" \" + nome\n    end\nend\nclass B extends A\n    fn saluta(self, nome)\n        return super.saluta(nome, saluto = \"hey\")\n    end\nend\nlet b = B()\nprint b.saluta(\"Giuliano\")\n";
+        assert_eq!(run_ok(src), "hey Giuliano\n");
+        // A lambda with a default.
+        assert_eq!(
+            run_ok(
+                "let saluta = fn(nome, saluto = \"ciao\") saluto + \" \" + nome end\nprint saluta(\"x\")\nprint saluta(\"x\", saluto = \"hey\")\n"
+            ),
+            "ciao x\nhey x\n"
+        );
+        // A lambda with *args, called on the spot.
+        assert_eq!(run_ok("print fn(*xs) len(xs) end(1, 2, 3)\n"), "3\n");
+    }
+
     #[test]
     fn return_outside_a_function_is_an_error() {
         assert!(run_err("return 1\n").contains("return outside function"));
@@ -493,6 +817,297 @@ mod tests {
             run_err(&format!("import linalg\nprint linalg.inv({singular})\n")),
             "runtime error: 2:14: linalg.inv(): singular matrix (determinant is zero)"
         );
+    }
+
+    // ---- Phase 19: try/except/raise ----
+
+    /// Run `source` and return (printed output, error text) — for
+    /// cases where both matter (e.g. `finally` printing before an
+    /// uncaught error escapes).
+    fn run_out_err(source: &str) -> (String, String) {
+        let mut input = std::io::Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        let err = run_source(source, &mut input, &mut out).unwrap_err();
+        (String::from_utf8(out).unwrap(), err.to_string())
+    }
+
+    #[test]
+    fn try_catches_a_runtime_error() {
+        let src = "try then\n    print 1 / 0\nexcept e then\n    print \"preso: \" + e\nend\nprint \"dopo\"\n";
+        assert_eq!(run_ok(src), "preso: division by zero\ndopo\n");
+        // The handler is skipped when nothing fails.
+        let src = "try then\n    print \"ok\"\nexcept e then\n    print \"mai\"\nend\n";
+        assert_eq!(run_ok(src), "ok\n");
+        // `except` without a binding works too.
+        let src = "try then\n    print 1 / 0\nexcept then\n    print \"preso\"\nend\n";
+        assert_eq!(run_ok(src), "preso\n");
+    }
+
+    #[test]
+    fn builtin_and_linalg_errors_are_catchable() {
+        // Index out of range.
+        let src = "let xs = [1]\ntry then\n    print xs[5]\nexcept e then\n    print e\nend\n";
+        assert_eq!(run_ok(src), "list index out of range\n");
+        // A singular linalg solve.
+        let src = "import linalg\nlet a = reshape(array([1, 2, 2, 4]), [2, 2])\ntry then\n    print linalg.solve(a, array([3, 6]))\nexcept e then\n    print e\nend\n";
+        assert_eq!(
+            run_ok(src),
+            "linalg.solve(): singular matrix (determinant is zero)\n"
+        );
+    }
+
+    #[test]
+    fn uncaught_error_propagates_with_position() {
+        // No `except`: the error escapes, after `finally` runs.
+        let src = "try then\n    print 1 / 0\nfinally then\n    print \"pulizia\"\nend\n";
+        assert_eq!(
+            run_out_err(src),
+            (
+                "pulizia\n".to_string(),
+                "runtime error: 2:13: division by zero".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn raise_is_caught_and_reports_the_raise_site() {
+        let src = "try then\n    raise \"boom\"\nexcept e then\n    print \"preso: \" + e\nend\n";
+        assert_eq!(run_ok(src), "preso: boom\n");
+        // Uncaught, the error points at the `raise` itself.
+        assert_eq!(run_err("raise \"boom\"\n"), "runtime error: 1:1: boom");
+        // ...even across a function call.
+        assert_eq!(
+            run_err("fn boom()\n    raise \"dal profondo\"\nend\nboom()\n"),
+            "runtime error: 2:5: dal profondo"
+        );
+    }
+
+    #[test]
+    fn raise_requires_a_str_message() {
+        assert_eq!(
+            run_err("raise 42\n"),
+            "runtime error: 1:7: raise requires a Str message"
+        );
+    }
+
+    #[test]
+    fn nested_try_and_error_inside_the_handler() {
+        // The inner handler catches first.
+        let src = "try then\n    try then\n        print 1 / 0\n    except e then\n        print \"dentro: \" + e\n    end\n    raise \"fuori\"\nexcept e then\n    print \"fuori: \" + e\nend\n";
+        assert_eq!(run_ok(src), "dentro: division by zero\nfuori: fuori\n");
+        // An error inside the handler itself propagates out.
+        let src = "try then\n    print 1 / 0\nexcept e then\n    print 1 / 0\nend\n";
+        assert_eq!(run_err(src), "runtime error: 4:13: division by zero");
+    }
+
+    #[test]
+    fn try_unwinds_through_function_calls() {
+        let src = "fn boom()\n    raise \"dal profondo\"\nend\ntry then\n    boom()\nexcept e then\n    print \"preso: \" + e\nend\n";
+        assert_eq!(run_ok(src), "preso: dal profondo\n");
+    }
+
+    #[test]
+    fn return_inside_try_works() {
+        let src = "fn f(x)\n    try then\n        if x > 0 then\n            return \"positivo\"\n        end\n        raise \"non positivo\"\n    except e then\n        return e\n    end\nend\nprint f(1)\nprint f(0)\n";
+        assert_eq!(run_ok(src), "positivo\nnon positivo\n");
+    }
+
+    #[test]
+    fn finally_runs_on_every_exit() {
+        // Normal exit.
+        let src = "try then\n    print \"corpo\"\nfinally then\n    print \"pulizia\"\nend\n";
+        assert_eq!(run_ok(src), "corpo\npulizia\n");
+        // Caught error.
+        let src = "try then\n    print 1 / 0\nexcept e then\n    print \"preso\"\nfinally then\n    print \"pulizia\"\nend\n";
+        assert_eq!(run_ok(src), "preso\npulizia\n");
+        // `return`: the finally runs before the value comes out.
+        let src = "fn f(x)\n    try then\n        if x then\n            return \"ok\"\n        else\n            raise \"no\"\n        end\n    except e then\n        return \"preso \" + e\n    finally then\n        print \"pulizia\"\n    end\nend\nprint f(true)\nprint f(false)\n";
+        assert_eq!(run_ok(src), "pulizia\nok\npulizia\npreso no\n");
+    }
+
+    #[test]
+    fn finally_outcome_replaces_the_pending_one() {
+        // A `return` inside finally replaces the try's return.
+        let src = "fn f()\n    try then\n        return \"dentro\"\n    finally then\n        return \"fuori\"\n    end\nend\nprint f()\n";
+        assert_eq!(run_ok(src), "fuori\n");
+        // An error inside finally replaces the try's return too.
+        let src = "fn f()\n    try then\n        return \"dentro\"\n    finally then\n        print 1 / 0\n    end\nend\nprint f()\n";
+        assert_eq!(run_err(src), "runtime error: 5:17: division by zero");
+    }
+
+    #[test]
+    fn except_variable_is_scoped_to_the_handler() {
+        let src = "try then\n    print 1 / 0\nexcept e then\n    print e\nend\nprint e\n";
+        assert_eq!(run_err(src), "runtime error: 6:7: undefined variable 'e'");
+    }
+
+    #[test]
+    fn lex_and_parse_errors_are_not_catchable() {
+        // These happen before any code runs, so no handler can
+        // catch them.
+        assert!(
+            run_err("try then\nprint \"oops\nexcept e then\nprint e\nend\n")
+                .starts_with("lex error:")
+        );
+        assert!(
+            run_err("try then\nlet = 5\nexcept e then\nprint e\nend\n").starts_with("parse error:")
+        );
+    }
+
+    // ---- Phase 23: match and generators ----
+
+    #[test]
+    fn match_literal_wildcard_and_binding() {
+        let src = "fn descrivi(x)\n    match x then\n    case 0 then\n        return \"zero\"\n    case 1 then\n        return \"uno\"\n    case n then\n        return f\"altro: {n}\"\n    end\nend\nprint descrivi(0)\nprint descrivi(1)\nprint descrivi(42)\n";
+        assert_eq!(run_ok(src), "zero\nuno\naltro: 42\n");
+        // A string literal and a negative literal match too.
+        let src = "match \"ciao\" then\ncase \"ciao\" then\n    print \"saluto\"\ncase _ then\n    print \"altro\"\nend\nmatch -3 then\ncase -3 then\n    print \"meno tre\"\nend\n";
+        assert_eq!(run_ok(src), "saluto\nmeno tre\n");
+    }
+
+    #[test]
+    fn match_first_case_wins_and_a_false_guard_skips() {
+        // Two cases could match: the first one wins.
+        let src = "match 5 then\ncase n then\n    print \"primo\"\ncase 5 then\n    print \"secondo\"\nend\n";
+        assert_eq!(run_ok(src), "primo\n");
+        // A guard that fails moves on to the next case.
+        let src = "match 7 then\ncase n if n > 10 then\n    print \"grande\"\ncase n if n > 5 then\n    print \"medio\"\ncase _ then\n    print \"piccolo\"\nend\n";
+        assert_eq!(run_ok(src), "medio\n");
+        // A guard sees the pattern's bindings.
+        let src = "match [3, 4] then\ncase [a, b] if a + b > 10 then\n    print \"somma grande\"\ncase [a, b] then\n    print a + b\nend\n";
+        assert_eq!(run_ok(src), "7\n");
+    }
+
+    #[test]
+    fn match_list_and_tuple_patterns_nested() {
+        let src = "match [1, [2, 3]] then\ncase [a, [b, c]] then\n    print a + b + c\ncase _ then\n    print \"no\"\nend\nmatch (1, 2) then\ncase (x, y) then\n    print x * y\nend\n";
+        assert_eq!(run_ok(src), "6\n2\n");
+        // A list pattern does not match a tuple (and vice versa),
+        // and a length mismatch is simply no match.
+        let src = "match (1, 2) then\ncase [a, b] then\n    print \"lista\"\ncase _ then\n    print \"non lista\"\nend\nmatch [1, 2, 3] then\ncase [a, b] then\n    print \"due\"\ncase _ then\n    print \"non due\"\nend\n";
+        assert_eq!(run_ok(src), "non lista\nnon due\n");
+    }
+
+    #[test]
+    fn match_no_case_matches_does_nothing() {
+        let src = "match 99 then\ncase 1 then\n    print \"uno\"\ncase 2 then\n    print \"due\"\nend\nprint \"dopo\"\n";
+        assert_eq!(run_ok(src), "dopo\n");
+    }
+
+    #[test]
+    fn match_bindings_are_scoped_to_the_case() {
+        let src = "match 5 then\ncase n then\n    print n\nend\nprint n\n";
+        assert_eq!(run_err(src), "runtime error: 5:7: undefined variable 'n'");
+        // A binding does not leak into the guard of the next case
+        // either: the second guard sees its own binding.
+        let src = "match 5 then\ncase a if a > 10 then\n    print \"grande\"\ncase b then\n    print b\nend\n";
+        assert_eq!(run_ok(src), "5\n");
+    }
+
+    #[test]
+    fn match_return_inside_a_case_returns_from_the_function() {
+        let src = "fn f(x)\n    match x then\n    case 0 then\n        return \"zero\"\n    case _ then\n        return \"altro\"\n    end\nend\nprint f(0)\nprint f(9)\n";
+        assert_eq!(run_ok(src), "zero\naltro\n");
+    }
+
+    #[test]
+    fn generator_next_sequence_type_and_display() {
+        let src = "fn conta(n)\n    let i = 1\n    while i <= n then\n        yield i * 10\n        i = i + 1\n    end\nend\nlet g = conta(3)\nprint type(g)\nprint g\nprint next(g)\nprint next(g)\nprint next(g)\n";
+        assert_eq!(run_ok(src), "generator\n<generator>\n10\n20\n30\n");
+        // Calling the function does not run the body: no output
+        // before the first `next()`.
+        let src = "fn f()\n    print \"corpo\"\n    yield 1\nend\nlet g = f()\nprint \"creato\"\nprint next(g)\n";
+        assert_eq!(run_ok(src), "creato\ncorpo\n1\n");
+    }
+
+    #[test]
+    fn generator_exhaustion_is_an_error_catchable_with_try() {
+        let src = "fn uno()\n    yield 1\nend\nlet g = uno()\nprint next(g)\nprint next(g)\n";
+        assert_eq!(run_err(src), "runtime error: 6:7: generator exhausted");
+        let src = "fn uno()\n    yield 1\nend\nlet g = uno()\ntry then\n    print next(g)\n    print next(g)\nexcept e then\n    print \"finito: \" + e\nend\n";
+        assert_eq!(run_ok(src), "1\nfinito: generator exhausted\n");
+        // `return` ends the generator the same way.
+        let src = "fn f()\n    yield 1\n    return 99\n    yield 2\nend\nlet g = f()\nprint next(g)\ntry then\n    print next(g)\nexcept e then\n    print e\nend\n";
+        assert_eq!(run_ok(src), "1\ngenerator exhausted\n");
+    }
+
+    #[test]
+    fn generator_for_in_pulls_lazily() {
+        let src = "fn conta(n)\n    let i = 1\n    while i <= n then\n        yield i\n        i = i + 1\n    end\nend\nfor x in conta(3) then\n    print x\nend\n";
+        assert_eq!(run_ok(src), "1\n2\n3\n");
+        // `next()` and `for-in` share the same generator: the loop
+        // resumes where `next()` stopped.
+        let src = "fn conta(n)\n    let i = 1\n    while i <= n then\n        yield i\n        i = i + 1\n    end\nend\nlet g = conta(3)\nprint next(g)\nfor x in g then\n    print x\nend\n";
+        assert_eq!(run_ok(src), "1\n2\n3\n");
+        // An infinite generator works with `for-in` only when the
+        // body returns early: here the loop stops by `return`.
+        let src = "fn inf()\n    let i = 0\n    while true then\n        yield i\n        i = i + 1\n    end\nend\nfn primi(n)\n    for x in inf() then\n        if x >= n then\n            return x\n        end\n        print x\n    end\nend\nprint primi(3)\n";
+        assert_eq!(run_ok(src), "0\n1\n2\n3\n");
+    }
+
+    #[test]
+    fn generator_infinite_with_next_only() {
+        let src = "fn inf()\n    let i = 0\n    while true then\n        yield i\n        i = i + 1\n    end\nend\nlet g = inf()\nprint next(g)\nprint next(g)\nprint next(g)\n";
+        assert_eq!(run_ok(src), "0\n1\n2\n");
+    }
+
+    #[test]
+    fn two_generators_from_one_function_are_independent() {
+        let src = "fn conta()\n    yield 1\n    yield 2\nend\nlet a = conta()\nlet b = conta()\nprint next(a)\nprint next(b)\nprint next(a)\nprint next(b)\nprint a == b\n";
+        assert_eq!(run_ok(src), "1\n1\n2\n2\nfalse\n");
+    }
+
+    #[test]
+    fn generator_yield_in_nested_loops_and_match() {
+        let src = "fn coppie()\n    for i = 1 to 2 then\n        for j = 1 to 2 then\n            yield [i, j]\n        end\n    end\nend\nfor p in coppie() then\n    print p\nend\n";
+        assert_eq!(run_ok(src), "[1, 1]\n[1, 2]\n[2, 1]\n[2, 2]\n");
+        let src = "fn f(x)\n    match x then\n    case 1 then\n        yield \"uno\"\n    case _ then\n        yield \"altro\"\n    end\nend\nlet g = f(1)\nprint next(g)\n";
+        assert_eq!(run_ok(src), "uno\n");
+    }
+
+    #[test]
+    fn generator_captures_outer_variables_and_arguments() {
+        let src = "let base = 100\nfn scala(fattore)\n    yield base + fattore\n    yield base + fattore * 2\nend\nlet g = scala(5)\nprint next(g)\nprint next(g)\n";
+        assert_eq!(run_ok(src), "105\n110\n");
+        // A wrong call fails when the generator is created, not
+        // at the first `next()`.
+        let src = "fn f(a, b)\n    yield a\nend\nlet g = f(1)\n";
+        assert_eq!(
+            run_err(src),
+            "runtime error: 4:9: expected 2 argument(s) but got 1"
+        );
+    }
+
+    #[test]
+    fn generator_method_with_yield() {
+        let src = "class Contatore\n    fn init(self, n)\n        self.n = n\n    end\n    fn conta(self)\n        let i = 1\n        while i <= self.n then\n            yield i\n            i = i + 1\n        end\n    end\nend\nlet c = Contatore(2)\nfor x in c.conta() then\n    print x\nend\n";
+        assert_eq!(run_ok(src), "1\n2\n");
+    }
+
+    #[test]
+    fn generator_replay_repeats_side_effects() {
+        // The replay design, documented in the README: every
+        // `next()` replays the body from the start, so a `print`
+        // before the target `yield` runs again.
+        let src = "fn f()\n    print \"corpo\"\n    yield 1\n    print \"ancora\"\n    yield 2\nend\nlet g = f()\nprint next(g)\nprint next(g)\n";
+        assert_eq!(run_ok(src), "corpo\n1\ncorpo\nancora\n2\n");
+    }
+
+    #[test]
+    fn next_on_a_non_generator_is_an_error() {
+        assert_eq!(
+            run_err("print next(42)\n"),
+            "runtime error: 1:7: next() expects a generator, not Int"
+        );
+        assert_eq!(
+            run_err("print next([1, 2])\n"),
+            "runtime error: 1:7: next() expects a generator, not List"
+        );
+    }
+
+    #[test]
+    fn yield_outside_a_function_is_a_parse_error() {
+        assert!(run_err("yield 1\n").starts_with("parse error:"));
     }
 
     // ---- Phase 4: builtins ----

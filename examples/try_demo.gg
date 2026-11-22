@@ -1,0 +1,42 @@
+# Error handling (Phase 19): `try`/`except` catches runtime
+# errors, `raise` throws one with a message, `finally` always
+# runs. The bound variable holds the error's message as a Str.
+# The program stops at the first *uncaught* error, so the
+# uncaught case at the bottom is commented out (uncomment it to
+# see it fail with the expected output).
+
+# 1. A division by zero, caught: the handler gets the message.
+try then
+    print 10 / 0
+except e then
+    print "preso: " + e
+end
+
+# 2. A custom error with `raise`, caught by the caller.
+fn controlla(x)
+    if x < 0 then
+        raise "negativo non ammesso"
+    end
+    return x * 2
+end
+
+try then
+    print controlla(-3)
+except e then
+    print "errore: " + e
+end
+print controlla(21)
+
+# 3. `finally` runs on every exit — here after a caught error.
+try then
+    print 1 / 0
+except e then
+    print "preso anche qui"
+finally then
+    print "pulizia"
+end
+
+# 4. Uncaught: the error escapes and the program stops.
+#    (Uncomment to try it; expected output:)
+#    runtime error: 42:1: boom
+# raise "boom"
