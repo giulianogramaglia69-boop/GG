@@ -181,6 +181,14 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_for_in_uses_the_continuation_prompt() {
+        assert_eq!(
+            session("for x in [1, 2] then\nprint x\nend\nexit\n"),
+            format!("{WELCOME}gg> ... ... 1\n2\ngg> ")
+        );
+    }
+
+    #[test]
     fn fn_defined_across_lines_then_called() {
         assert_eq!(
             session("fn add(a, b)\nreturn a + b\nend\nadd(2, 3)\nexit\n"),

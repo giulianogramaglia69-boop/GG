@@ -1,0 +1,25 @@
+# for-in (Phase 15): iterate over lists, dict keys, string
+# characters, rows of a 2D array, and range() — no index needed.
+
+let xs = [10, 20, 30]
+for x in xs then
+    print x
+end
+
+let voti = {"matematica": 8, "inglese": 9}
+for materia in voti then
+    print materia + ": " + str(voti[materia])
+end
+
+for c in "GG" then
+    print c
+end
+
+let m = reshape(array([1, 2, 3, 4]), [2, 2])
+for riga in m then
+    print riga
+end
+
+for i in range(3) then
+    print i
+end

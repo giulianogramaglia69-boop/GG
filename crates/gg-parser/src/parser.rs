@@ -264,7 +264,16 @@ impl<'a> Parser<'a> {
     fn parse_for(&mut self) -> Result<Stmt, ParserError> {
         self.advance(); // for
         let var = self.expect_ident("variable name after 'for'")?;
-        self.expect(&TokenKind::Eq, "'=' in for loop")?;
+        if self.check(&TokenKind::In) {
+            // for-in: `for x in xs then ... end`.
+            self.advance(); // in
+            let iter = self.parse_expr()?;
+            self.expect(&TokenKind::Then, "'then' after for-in iterable")?;
+            let body = self.parse_block()?;
+            self.expect(&TokenKind::End, "'end' to close 'for' block")?;
+            return Ok(Stmt::ForIn { var, iter, body });
+        }
+        self.expect(&TokenKind::Eq, "'=' or 'in' in for loop")?;
         let from = self.parse_expr()?;
         self.expect(&TokenKind::To, "'to' in for loop")?;
         let to = self.parse_expr()?;
@@ -1015,6 +1024,67 @@ mod tests {
                 body: vec![],
             }]
         );
+    }
+
+    #[test]
+    fn for_in_loop() {
+        assert_eq!(
+            parse_ok("for x in xs then\n    print x\nend").stmts,
+            vec![Stmt::ForIn {
+                var: "x".to_string(),
+                iter: ident("xs"),
+                body: vec![Stmt::Print { expr: ident("x") }],
+            }]
+        );
+        // The iterable may be any expression, and the Display
+        // prints back in canonical form (round-trip).
+        for source in [
+            "for x in xs then\n    print x\nend",
+            "for x in range(5) then\n    print x\nend",
+            "for x in [1, 2] then\nend",
+            "for k in d then\n    print k\nend",
+        ] {
+            let prog = parse_ok(source);
+            assert_eq!(prog.to_string(), source);
+            assert_eq!(parse_ok(&prog.to_string()), prog);
+        }
+        // Nested for-in loops.
+        assert_eq!(
+            parse_ok("for x in xs then\n    for y in ys then\n        print x\n    end\nend").stmts,
+            vec![Stmt::ForIn {
+                var: "x".to_string(),
+                iter: ident("xs"),
+                body: vec![Stmt::ForIn {
+                    var: "y".to_string(),
+                    iter: ident("ys"),
+                    body: vec![Stmt::Print { expr: ident("x") }],
+                }],
+            }]
+        );
+        // The numeric for is untouched by the new form.
+        assert_eq!(
+            parse_ok("for i = 1 to 3 then\n    print i\nend").stmts,
+            vec![Stmt::For {
+                var: "i".to_string(),
+                from: int(1),
+                to: int(3),
+                body: vec![Stmt::Print { expr: ident("i") }],
+            }]
+        );
+    }
+
+    #[test]
+    fn for_needs_equals_or_in() {
+        let err = parse_err("for x then\nend");
+        assert!(
+            err.message.contains("expected '=' or 'in'"),
+            "{}",
+            err.message
+        );
+        // A missing `end` on a for-in is incomplete, like any block.
+        let err = parse_err("for x in xs then\n    print x\n");
+        assert!(err.message.contains("expected 'end'"), "{}", err.message);
+        assert!(err.is_incomplete());
     }
 
     #[test]

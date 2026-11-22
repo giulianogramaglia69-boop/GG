@@ -58,6 +58,7 @@ pub enum TokenKind {
     Or,
     Not,
     To,
+    In,
     Class,
     Extends,
     Super,
@@ -118,6 +119,7 @@ impl TokenKind {
             TokenKind::Or => "Or",
             TokenKind::Not => "Not",
             TokenKind::To => "To",
+            TokenKind::In => "In",
             TokenKind::Class => "Class",
             TokenKind::Extends => "Extends",
             TokenKind::Super => "Super",
@@ -173,6 +175,7 @@ impl TokenKind {
             TokenKind::Or => "or".to_string(),
             TokenKind::Not => "not".to_string(),
             TokenKind::To => "to".to_string(),
+            TokenKind::In => "in".to_string(),
             TokenKind::Class => "class".to_string(),
             TokenKind::Extends => "extends".to_string(),
             TokenKind::Super => "super".to_string(),
@@ -253,6 +256,7 @@ fn keyword_or_ident(word: &str) -> TokenKind {
         "or" => TokenKind::Or,
         "not" => TokenKind::Not,
         "to" => TokenKind::To,
+        "in" => TokenKind::In,
         "class" => TokenKind::Class,
         "extends" => TokenKind::Extends,
         "super" => TokenKind::Super,
@@ -645,7 +649,7 @@ mod tests {
     fn keywords_are_not_identifiers_but_prefixes_are() {
         assert_eq!(
             kinds_no_eof(
-                "let letter endif endless truex not_now total selfish classy superb extends2 imported ash"
+                "let letter endif endless truex not_now total selfish classy superb extends2 imported ash inizio inside"
             ),
             vec![
                 TokenKind::Let,
@@ -661,6 +665,25 @@ mod tests {
                 TokenKind::Ident("extends2".to_string()),
                 TokenKind::Ident("imported".to_string()),
                 TokenKind::Ident("ash".to_string()),
+                TokenKind::Ident("inizio".to_string()),
+                TokenKind::Ident("inside".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn in_is_a_keyword() {
+        assert_eq!(kinds_no_eof("in"), vec![TokenKind::In]);
+        // `in` inside a for-in loop lexes as the keyword, while
+        // longer words stay identifiers (see the test above).
+        assert_eq!(
+            kinds_no_eof("for x in xs then"),
+            vec![
+                TokenKind::For,
+                TokenKind::Ident("x".to_string()),
+                TokenKind::In,
+                TokenKind::Ident("xs".to_string()),
+                TokenKind::Then,
             ]
         );
     }
@@ -687,7 +710,7 @@ mod tests {
     fn all_keywords() {
         assert_eq!(
             kinds_no_eof(
-                "let if then else end while for fn return print true false and or not to class extends super self import as"
+                "let if then else end while for fn return print true false and or not to in class extends super self import as"
             ),
             vec![
                 TokenKind::Let,
@@ -706,6 +729,7 @@ mod tests {
                 TokenKind::Or,
                 TokenKind::Not,
                 TokenKind::To,
+                TokenKind::In,
                 TokenKind::Class,
                 TokenKind::Extends,
                 TokenKind::Super,

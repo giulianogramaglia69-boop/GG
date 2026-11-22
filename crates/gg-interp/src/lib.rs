@@ -12,6 +12,7 @@ pub mod error;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod interp;
+pub mod linalg;
 pub mod native;
 pub mod repl;
 pub mod slice;
@@ -186,6 +187,114 @@ mod tests {
         );
         // A single value still runs once.
         assert_eq!(run_ok("for i = 5 to 5 then\n    print i\nend\n"), "5\n");
+    }
+
+    #[test]
+    fn for_in_over_a_list_and_range() {
+        assert_eq!(
+            run_ok("let xs = [1, 2, 3]\nfor x in xs then\n    print x\nend\n"),
+            "1\n2\n3\n"
+        );
+        // `range()` returns a list, so it works directly.
+        assert_eq!(
+            run_ok("for x in range(3) then\n    print x\nend\n"),
+            "0\n1\n2\n"
+        );
+        // An empty list runs zero times.
+        assert_eq!(
+            run_ok("for x in [] then\n    print x\nend\nprint \"done\"\n"),
+            "done\n"
+        );
+        // The iterable is evaluated once: reassigning the name
+        // inside the body does not change what the loop visits.
+        assert_eq!(
+            run_ok("let xs = [1, 2]\nfor x in xs then\n    print x\n    xs = [9]\nend\n"),
+            "1\n2\n"
+        );
+    }
+
+    #[test]
+    fn for_in_over_tuples_strings_dicts_and_sets() {
+        assert_eq!(
+            run_ok("for x in (10, \"a\") then\n    print x\nend\n"),
+            "10\na\n"
+        );
+        // Strings iterate one character at a time (Unicode).
+        assert_eq!(run_ok("for c in \"aè\" then\n    print c\nend\n"), "a\nè\n");
+        // Dicts iterate their keys, in insertion order.
+        assert_eq!(
+            run_ok("let d = {\"a\": 1, \"b\": 2}\nfor k in d then\n    print k\nend\n"),
+            "a\nb\n"
+        );
+        // Sets iterate in insertion order, duplicates dropped.
+        assert_eq!(
+            run_ok("for x in {3, 1, 2, 2} then\n    print x\nend\n"),
+            "3\n1\n2\n"
+        );
+    }
+
+    #[test]
+    fn for_in_over_arrays() {
+        // A 1D array iterates its elements.
+        assert_eq!(
+            run_ok("let a = array([10, 20])\nfor x in a then\n    print x\nend\n"),
+            "10\n20\n"
+        );
+        // A 2D array iterates its rows (1D arrays).
+        assert_eq!(
+            run_ok(
+                "let m = reshape(array([1, 2, 3, 4]), [2, 2])\nfor r in m then\n    print r[0] + r[1]\nend\n"
+            ),
+            "3\n7\n"
+        );
+    }
+
+    #[test]
+    fn for_in_does_not_consume_queues_and_stacks() {
+        // Iterating a queue or stack only snapshots it: the
+        // collection is unchanged afterwards, and pushes inside
+        // the body do not extend the loop.
+        assert_eq!(
+            run_ok(
+                "let q = queue([1, 2])\nfor x in q then\n    print x\n    enqueue(q, 99)\nend\nprint q\n"
+            ),
+            "1\n2\nqueue([1, 2, 99, 99])\n"
+        );
+        assert_eq!(
+            run_ok("let s = stack([1, 2])\nfor x in s then\n    print x\nend\nprint s\n"),
+            "1\n2\nstack([1, 2])\n"
+        );
+    }
+
+    #[test]
+    fn for_in_nests_and_works_inside_functions() {
+        assert_eq!(
+            run_ok(
+                "for x in [1, 2] then\n    for y in [10, 20] then\n        print x * 10 + y\n    end\nend\n"
+            ),
+            "20\n30\n30\n40\n"
+        );
+        let src = "fn somma(xs)\n    let tot = 0\n    for x in xs then\n        tot = tot + x\n    end\n    return tot\nend\nprint somma([1, 2, 3])\n";
+        assert_eq!(run_ok(src), "6\n");
+    }
+
+    #[test]
+    fn for_in_loop_variable_is_scoped_to_the_body() {
+        let src = "for x in [1] then\n    print x\nend\nprint x\n";
+        assert!(run_err(src).contains("undefined variable 'x'"));
+        // An outer variable with the same name is untouched.
+        let src = "let x = 0\nfor x in [7] then\n    print x\nend\nprint x\n";
+        assert_eq!(run_ok(src), "7\n0\n");
+    }
+
+    #[test]
+    fn for_in_over_a_non_iterable_is_an_error() {
+        assert!(run_err("for x in 5 then\n    print x\nend\n").contains("Int is not iterable"));
+        // A builtin function is a value too — and not iterable.
+        assert!(
+            run_err("for x in len then\n    print x\nend\n").contains("Function is not iterable")
+        );
+        assert!(run_err("for x in true then\n    print x\nend\n").contains("Bool is not iterable"));
     }
 
     #[test]
@@ -2275,5 +2384,111 @@ mod tests {
             run_err("import gui\nfn f()\nend\ngui.horizontal(f)\n")
                 .contains("inside a frame function")
         );
+    }
+
+    // ---- Phase 14: linalg ----
+
+    #[test]
+    fn linalg_solve_det_inv() {
+        // 2x + y = 5, x + 3y = 10 -> x = 1, y = 3.
+        let src = "import linalg\nlet a = reshape(array([2, 1, 1, 3]), [2, 2])\nprint linalg.solve(a, array([5, 10]))\n";
+        assert_eq!(run_ok(src), "array([1, 3])\n");
+        // A 3x3 triangular system, exact in binary: x + 2y = 5,
+        // y + 3z = 7, z = 2 -> x = 3, y = 1, z = 2. (The classic
+        // 3x3 from the textbooks gives 3.0000000000000004 for y:
+        // Gaussian elimination in f64 rounds a little, like
+        // NumPy — the demo shows that instead of hiding it.)
+        let src = "import linalg\nlet a = reshape(array([1, 2, 0, 0, 1, 3, 0, 0, 1]), [3, 3])\nprint linalg.solve(a, array([5, 7, 2]))\n";
+        assert_eq!(run_ok(src), "array([3, 1, 2])\n");
+        // Solving and multiplying back gives b (element-wise ==).
+        let src = "import linalg\nlet a = reshape(array([2, 1, 1, 3]), [2, 2])\nlet b = array([5, 10])\nprint matmul(a, linalg.solve(a, b)) == b\n";
+        assert_eq!(run_ok(src), "array([true, true])\n");
+        // Determinants, including a singular one (det = 0).
+        let src = "import linalg\nprint linalg.det(reshape(array([1, 2, 3, 4]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "-2\n");
+        // A triangular 3x3: the determinant is the product of
+        // the diagonal, exactly. (The classic textbook 3x3 gives
+        // -0.9999999999999993: partial pivoting divides by 3,
+        // which is not exact in binary — same rounding as above.)
+        let src = "import linalg\nprint linalg.det(reshape(array([2, 1, -1, 0, -1, 2, 0, 0, 2]), [3, 3]))\n";
+        assert_eq!(run_ok(src), "-4\n");
+        let src = "import linalg\nprint linalg.det(reshape(array([1, 2, 2, 4]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "0\n");
+        // Inverses: a diagonal one is exact, and so is a
+        // triangular one. (The inverse of [[1, 2], [3, 4]] is
+        // [[-2, 1], [1.5, -0.5]] in exact arithmetic, but partial
+        // pivoting divides by 3, which is not exact in binary —
+        // the round-trip test below checks it within 1e-9.)
+        let src = "import linalg\nprint linalg.inv(reshape(array([2, 0, 0, 2]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "array([[0.5, 0], [0, 0.5]])\n");
+        let src = "import linalg\nprint linalg.inv(reshape(array([1, 2, 0, 1]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "array([[1, -2], [0, 1]])\n");
+        // A singular matrix has no solution and no inverse:
+        //  x + 2y = 3, 2x + 4y = 6 is indeterminate, and
+        //  x + 2y = 3, 2x + 4y = 7 is impossible — both are
+        // the same runtime error, as in GG's other builtins.
+        let singular = "reshape(array([1, 2, 2, 4]), [2, 2])";
+        assert!(
+            run_err(&format!(
+                "import linalg\nprint linalg.solve({singular}, array([3, 6]))\n"
+            ))
+            .contains("singular matrix")
+        );
+        assert!(
+            run_err(&format!("import linalg\nprint linalg.inv({singular})\n"))
+                .contains("singular matrix")
+        );
+        // Shape and type errors.
+        assert!(
+            run_err(
+                "import linalg\nprint linalg.det(reshape(array([1, 2, 3, 4, 5, 6]), [2, 3]))\n"
+            )
+            .contains("expects a square 2D Array")
+        );
+        assert!(
+            run_err(
+                "import linalg\nprint linalg.solve(reshape(array([2, 1, 1, 3]), [2, 2]), array([5, 10, 1]))\n"
+            )
+            .contains("expects a vector of length 2")
+        );
+        assert!(
+            run_err(
+                "import linalg\nprint linalg.det(reshape(array([\"a\", \"b\", \"c\", \"d\"]), [2, 2]))\n"
+            )
+            .contains("expects numbers, not array of Str")
+        );
+    }
+
+    #[test]
+    fn linalg_inverse_roundtrip_within_tolerance() {
+        // inv([[1, 2], [3, 4]]) times the matrix is the
+        // identity, up to f64 rounding (checked here in Rust,
+        // where a tolerance is possible — GG `print` has none).
+        use crate::array::{make_array, matmul};
+        use crate::linalg::inverse;
+        use crate::value::ElemType;
+        let a = make_array(
+            ElemType::Int,
+            vec![2, 2],
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+        );
+        let Value::Array(a_data) = &a else {
+            unreachable!()
+        };
+        let inv = inverse(&a_data.borrow()).unwrap();
+        let Value::Array(inv_data) = &inv else {
+            unreachable!()
+        };
+        let prod = matmul(&inv_data.borrow(), &a_data.borrow()).unwrap();
+        let Value::Array(prod_data) = prod else {
+            unreachable!()
+        };
+        let items = &prod_data.borrow().items;
+        for (got, want) in items.iter().zip([1.0, 0.0, 0.0, 1.0]) {
+            let Value::Float(x) = got else {
+                panic!("not a float: {got}")
+            };
+            assert!((x - want).abs() < 1e-9, "{x} vs {want}");
+        }
     }
 }

@@ -63,7 +63,15 @@ the GG frame function once per frame until it returns `false`;
 widgets (`heading`, `label`, `separator`, `button`,
 `text_input`, `slider`, `checkbox`, `horizontal`) are called
 inside the frame function (see the Graphical interfaces section
-below).
+below). **Phase 14 — linear algebra: done.** A native
+`linalg` module (`solve`/`det`/`inv`, Gaussian elimination
+with partial pivoting; a singular matrix is a runtime error,
+never a silent `nil`) — see the Standard library section
+below. **Phase 15 — for-in iteration: done.** `for x in xs
+then ... end` iterates over lists, tuples, arrays (rows on
+2D+), sets, dict keys, string characters, queues and stacks;
+the iterable is evaluated once and snapshotted, and the loop
+variable is scoped to the body (see the Loops section below).
 
 ## The REPL
 
@@ -126,6 +134,16 @@ works.
 - **`for i = a to b then ... end`** includes both ends and steps +1
   if `a <= b`, -1 otherwise. The loop variable exists only inside
   the loop body.
+- **`for x in xs then ... end`** iterates over a collection (Phase
+  15): lists and tuples (the elements, in order), arrays (the
+  elements of a 1D array, the rows of a 2D+ array), sets (insertion
+  order), dicts (the keys, in insertion order), strings (one
+  character at a time), queues and stacks (a snapshot — iterating
+  does not consume them). The iterable is evaluated once before
+  the loop starts, so mutations inside the body do not change what
+  the loop visits. Anything else is a runtime error (`Int is not
+  iterable`). The loop variable exists only inside the loop body,
+  like the numeric `for`.
 - **Scopes:** every block (`if`/`while`/`for`/function body) runs in
   its own child scope. `let` inside a block is invisible outside;
   assignment updates the variable where it was defined.
@@ -141,8 +159,9 @@ works.
   than recursing forever. Printing a list shows its elements, with
   strings quoted (`[1, "ciao"]`); past 16 levels of nesting it
   prints `...`, so a list containing itself cannot blow the stack.
-  There is no `for x in xs` yet (it would need an `in` keyword):
-  loop by index, `for i = 0 to len(xs) - 1 then print xs[i] end`.
+  To visit every element, `for x in xs then print x end` (Phase 15);
+  the index loop `for i = 0 to len(xs) - 1 then print xs[i] end`
+  still works too.
 
 ```gg
 let xs = [10, 20, 30]
@@ -618,6 +637,27 @@ different sequence.
 | `random.random()` | A random float in [0, 1) | `random.random()` → `0.37...` |
 | `random.choice(list)` | A random element of the list; an error on an empty list | `random.choice([10, 20])` → `20` |
 | `random.shuffle(list)` | Shuffle the list in place (Fisher-Yates), return `nil` | `random.shuffle(xs)` |
+
+**`linalg`** — native, in Rust (Phase 14). Gaussian elimination
+with partial pivoting over the N-d numeric arrays: `solve` and
+`inv` return Float arrays, `det` a Float. A singular matrix —
+determinant zero, i.e. an impossible or indeterminate system —
+is a runtime error for `solve` and `inv` (the GG convention:
+`matmul` on incompatible shapes is an error too, never a
+silent `nil`); `det` of a singular matrix is `0`. Results are
+f64, so a system like the classic 3x3 can print
+`3.0000000000000004` instead of `3`: elimination divides by
+numbers with no exact binary form, and a little rounding is
+normal — the same happens in NumPy.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `linalg.solve(A, b)` | The solution `x` of `A x = b`: `A` square 2D, `b` a 1D vector of the same length | `linalg.solve(reshape(array([2, 1, 1, 3]), [2, 2]), array([5, 10]))` → `array([1, 3])` |
+| `linalg.det(A)` | The determinant of a square 2D matrix | `linalg.det(reshape(array([1, 2, 3, 4]), [2, 2]))` → `-2` |
+| `linalg.inv(A)` | The inverse matrix | `linalg.inv(reshape(array([1, 2, 0, 1]), [2, 2]))` → `array([[1, -2], [0, 1]])` |
+
+Full example: `examples/linalg_demo.gg` — the systems from the
+maths ripasso, plus the classic 3x3 with its f64 rounding.
 
 **`stats`** — written in pure GG (`stdlib/stats.gg` in the
 repo), embedded in the binary with `include_str!`, so it works
@@ -1097,8 +1137,15 @@ exit with code 1.
     widgets `heading`/`label`/`separator`/`button`/`text_input`/
     `slider`/`checkbox`/`horizontal`, called inside the frame
     function in order, vertical layout by default
+14. **Linear algebra** ✅ — native `linalg` module
+    (`import linalg`): `solve(A, b)` / `det(A)` / `inv(A)` over
+    2D square numeric arrays, Gaussian elimination with partial
+    pivoting; a singular matrix is a runtime error for `solve`
+    and `inv`, `det` of one is `0`; results are Float, with the
+    usual f64 rounding (see the `linalg` table above)
 
-Next: a `linalg` module (`solve`/`det`/`inv`).
+Next: not decided yet — Fase 14 is done; the GUI's first real
+interactive test on the laptop is still open.
 
 Long term: more data libraries in the spirit of Pandas, and a
 web framework in the spirit of Django — each is a large project

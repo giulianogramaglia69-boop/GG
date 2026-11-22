@@ -35,6 +35,7 @@ pub fn build(name: &str) -> Option<Value> {
             }
         }
         "random" => define_functions(&env, RANDOM_FUNCTIONS),
+        "linalg" => define_functions(&env, LINALG_FUNCTIONS),
         // The GUI module lives in `gui.rs`: it needs the
         // interpreter to call frame functions back, so its
         // functions are `WithInterp` builtins, not plain ones.
@@ -85,6 +86,12 @@ const RANDOM_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
     ("random", Arity::Exact(0), random),
     ("choice", Arity::Exact(1), choice),
     ("shuffle", Arity::Exact(1), shuffle),
+];
+
+const LINALG_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("solve", Arity::Exact(2), crate::linalg::solve),
+    ("det", Arity::Exact(1), crate::linalg::det),
+    ("inv", Arity::Exact(1), crate::linalg::inv),
 ];
 
 /// A number as an f64, or a clear error naming the function.

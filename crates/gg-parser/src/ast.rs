@@ -61,6 +61,14 @@ pub enum Stmt {
         to: Expr,
         body: Vec<Stmt>,
     },
+    /// Iteration over a collection: `for x in xs then ... end`.
+    /// The iterable is evaluated once; the loop variable is scoped
+    /// to the body, like the numeric `for`.
+    ForIn {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
     Fn {
         name: String,
         params: Vec<String>,
@@ -469,6 +477,11 @@ impl Stmt {
                 body,
             } => {
                 write!(f, "{pad}for {var} = {from} to {to} then")?;
+                write_block(f, body, indent + 1)?;
+                write!(f, "{pad}end")
+            }
+            Stmt::ForIn { var, iter, body } => {
+                write!(f, "{pad}for {var} in {iter} then")?;
                 write_block(f, body, indent + 1)?;
                 write!(f, "{pad}end")
             }

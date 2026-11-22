@@ -35,6 +35,53 @@ enum Flow {
     Return(Value),
 }
 
+/// The items of a value a `for x in ...` loop iterates over, as a
+/// snapshot taken once before the loop starts — mutations of the
+/// collection inside the body do not change what the loop visits,
+/// and a queue or stack is not consumed by iterating it.
+/// - List, Tuple: the elements, in order.
+/// - Array: the elements of a 1D array; the rows (1D arrays) of
+///   a 2D+ array, first axis first.
+/// - Set: the elements, in insertion order.
+/// - Dict: the keys, in insertion order.
+/// - Str: one-character strings, in order (Unicode characters,
+///   so `"aè"` gives `"a"` then `"è"`).
+/// - Queue, Stack: the elements, front to back / bottom to top.
+///
+/// Anything else is a runtime error: `Int is not iterable`.
+fn iterable_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
+    match value {
+        Value::List(list) => Ok(list.borrow().clone()),
+        Value::Tuple(items) => Ok(items.as_ref().clone()),
+        Value::Array(array) => {
+            let data = array.borrow();
+            if data.shape.is_empty() {
+                Ok(vec![])
+            } else if data.shape.len() == 1 {
+                Ok(data.items.clone())
+            } else {
+                (0..data.shape[0])
+                    .map(|i| subarray(&data, Value::Int(i as i64)))
+                    .collect()
+            }
+        }
+        Value::Set(set) => Ok(set.borrow().iter().map(|k| k.to_value()).collect()),
+        Value::Dict(dict) => Ok(dict
+            .borrow()
+            .keys()
+            .into_iter()
+            .map(|k| k.to_value())
+            .collect()),
+        Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
+        Value::Queue(queue) => Ok(queue.borrow().iter().cloned().collect()),
+        Value::Stack(stack) => Ok(stack.borrow().clone()),
+        other => Err(RuntimeError::new(format!(
+            "{} is not iterable",
+            other.type_name()
+        ))),
+    }
+}
+
 /// The interpreter. One instance keeps a global environment across
 /// `run` calls, so a REPL can reuse it later.
 ///
@@ -331,6 +378,24 @@ impl Interpreter {
                         flow @ Flow::Return(_) => return Ok(flow),
                     }
                     i += if from <= to { 1 } else { -1 };
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::ForIn { var, iter, body } => {
+                // The iterable is evaluated once, then snapshotted:
+                // the loop visits exactly those items, in order.
+                let value = self.eval_expr(iter, env, input, out)?;
+                let items = iterable_items(&value)?;
+                // Same scoping as the numeric for: the loop variable
+                // lives in its own scope, visible only to the body.
+                let loop_env = Environment::child(env);
+                for item in items {
+                    loop_env.define(var, item);
+                    let child = Environment::child(&loop_env);
+                    match self.exec_block(body, &child, input, out)? {
+                        Flow::Normal => {}
+                        flow @ Flow::Return(_) => return Ok(flow),
+                    }
                 }
                 Ok(Flow::Normal)
             }
