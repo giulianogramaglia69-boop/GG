@@ -120,7 +120,7 @@ fn run_chunk(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), RuntimeError> {
-    if let [Stmt::ExprStmt { expr }] = program.stmts.as_slice() {
+    if let [Stmt::ExprStmt { expr, .. }] = program.stmts.as_slice() {
         let value = interp.eval(expr, input, out)?;
         if !matches!(value, Value::Nil) {
             writeln!(out, "{value}")
@@ -208,10 +208,28 @@ mod tests {
 
     #[test]
     fn runtime_error_does_not_clear_state() {
-        // `x` is 1 here, to make the check unambiguous.
+        // `x` is 1 here, to make the check unambiguous. The error
+        // carries the position of `y` (line 1, col 7).
         assert_eq!(
             session("let x = 1\nprint y\nx\nexit\n"),
-            format!("{WELCOME}gg> gg> runtime error: undefined variable 'y'\ngg> 1\ngg> ")
+            format!("{WELCOME}gg> gg> runtime error: 1:7: undefined variable 'y'\ngg> 1\ngg> ")
+        );
+    }
+
+    #[test]
+    fn runtime_error_position_is_relative_to_the_lines_typed() {
+        // A multi-line block: the error is on the second line of the
+        // block, at the position of `y` in that line.
+        assert_eq!(
+            session("if true then\nprint y\nend\nexit\n"),
+            format!("{WELCOME}gg> ... ... runtime error: 2:7: undefined variable 'y'\ngg> ")
+        );
+        // Each line typed on its own is its own chunk, so a
+        // single-line statement reports line 1 — even when it is
+        // not the first line of the session.
+        assert_eq!(
+            session("let x = 1\nprint x / 0\nexit\n"),
+            format!("{WELCOME}gg> gg> runtime error: 1:9: division by zero\ngg> ")
         );
     }
 

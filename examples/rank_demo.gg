@@ -1,0 +1,50 @@
+# `linalg.rank`: telling an indeterminate system from an
+# impossible one.
+#
+# `linalg.solve` fails the same way on both — a singular
+# matrix is a runtime error — because in both cases the
+# determinant is zero. The rank is what tells them apart,
+# comparing the matrix A with the augmented matrix [A|b]
+# (n = number of unknowns):
+#
+#   rank(A) == rank([A|b]) < n  -> indeterminate (infinite solutions)
+#   rank(A) < rank([A|b])       -> impossible (no solution)
+#   rank(A) == rank([A|b]) == n -> one solution (solve works)
+import linalg
+
+# Indeterminate: x + y = 2, 2x + 2y = 4 (the second equation
+# is just twice the first: any x with y = 2 - x works).
+let a = reshape(array([1, 1, 2, 2]), [2, 2])
+let aug_ind = reshape(array([1, 1, 2, 2, 2, 4]), [2, 3])
+print "Sistema indeterminato: x + y = 2, 2x + 2y = 4"
+print "rango di A:"
+print linalg.rank(a)
+print "rango di [A|b]:"
+print linalg.rank(aug_ind)
+print "1 == 1 < 2: indeterminato (infinite soluzioni)"
+
+# Impossible: x + y = 2, 2x + 2y = 5 (the second equation
+# asks 2x + 2y to be 5 while the first says it is 4).
+let aug_imp = reshape(array([1, 1, 2, 2, 2, 5]), [2, 3])
+print "Sistema impossibile: x + y = 2, 2x + 2y = 5"
+print "rango di A:"
+print linalg.rank(a)
+print "rango di [A|b]:"
+print linalg.rank(aug_imp)
+print "1 < 2: impossibile (nessuna soluzione)"
+
+# Determined, for contrast: x + y = 2, x - y = 0 has the
+# single solution x = 1, y = 1.
+let c = reshape(array([1, 1, 1, -1]), [2, 2])
+print "Sistema determinato: x + y = 2, x - y = 0"
+print "rango di A:"
+print linalg.rank(c)
+print "soluzione:"
+print linalg.solve(c, array([2, 0]))
+
+# Rank also works on rectangular matrices: at most
+# min(rows, cols), and a zero matrix has rank 0.
+print "Rango di una 2x3:"
+print linalg.rank(reshape(array([1, 2, 3, 4, 5, 6]), [2, 3]))
+print "Rango della matrice zero:"
+print linalg.rank(reshape(array([0, 0, 0, 0]), [2, 2]))

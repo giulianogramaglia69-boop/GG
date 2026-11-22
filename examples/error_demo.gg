@@ -1,0 +1,21 @@
+# errors with line and column (Phase 16): a runtime error says
+# where it failed — `runtime error: <line>:<col>: <message>`.
+# The program stops at the first runtime error, so only one of
+# the three cases below is active at a time: comment out the
+# active one and uncomment another to see its error (the line
+# numbers in the expected outputs do not change — a commented
+# line is still a line).
+
+# 1. Division by zero: the error points at the `/` operator.
+print 10 / 0
+
+# 2. Undefined variable: the error points at the identifier.
+#    (Uncomment to try it; expected output:)
+#    runtime error: 15:7: undefined variable 'inesistente'
+# print inesistente
+
+# 3. Index out of range: the error points at the index.
+#    (Uncomment to try it; expected output:)
+#    runtime error: 21:10: list index out of range
+# let xs = [1, 2, 3]
+# print xs[9]

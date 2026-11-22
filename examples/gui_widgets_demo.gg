@@ -1,0 +1,52 @@
+# Demo dei nuovi widget GUI (Fase 17): radio, combo, progress e
+# vertical, insieme ad alcuni widget vecchi. La finestra si
+# chiude da sola dopo 60 frame.
+import gui
+
+let frame = 0
+let scelta = 0
+let lingua = 1
+let lingue = ["Italiano", "English", "Русский"]
+let fatto = 0.0
+let loud = false
+
+fn riga_lingua()
+    gui.label("Lingua:")
+    lingua = gui.combo("lingua", lingue, lingua)
+end
+
+fn colonna()
+    gui.label("Avanzamento:")
+    gui.progress(fatto)
+    gui.label("Oltre il massimo (clamp a 1):")
+    gui.progress(1.5)
+end
+
+fn draw()
+    frame = frame + 1
+    fatto = fatto + 0.02
+    gui.heading("Widget GG")
+    gui.label("Scegli un'opzione:")
+    if gui.radio("a", "Opzione A", scelta == 0) then
+        scelta = 0
+    end
+    if gui.radio("b", "Opzione B", scelta == 1) then
+        scelta = 1
+    end
+    if gui.radio("c", "Opzione C", scelta == 2) then
+        scelta = 2
+    end
+    gui.label("Scelta: " + str(scelta))
+    gui.separator()
+    gui.horizontal(riga_lingua)
+    gui.label("Lingua: " + lingue[lingua])
+    gui.separator()
+    gui.vertical(colonna)
+    loud = gui.checkbox("loud", "Forte", loud)
+    if frame >= 60 then
+        return false
+    end
+end
+
+gui.run("Demo widget GG", draw)
+print "finestra chiusa dopo " + str(frame) + " frame, scelta " + str(scelta) + ", lingua " + lingue[lingua]

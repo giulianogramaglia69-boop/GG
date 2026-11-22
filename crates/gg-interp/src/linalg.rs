@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Linear algebra (Phase 14): the native `linalg` module.
+//! Linear algebra (Phase 14, `rank` in Phase 18): the native `linalg` module.
 //!
-//! `import linalg` gives `solve`/`det`/`inv` over the N-d
+//! `import linalg` gives `solve`/`det`/`inv`/`rank` over the N-d
 //! numeric arrays of Phase 11. Only 2D square matrices of
 //! numbers are accepted for `det`/`inv`; `solve(A, b)` takes
 //! a square matrix `A` and a 1D vector `b` of the same length
 //! and returns the solution `x` of `A x = b` as a Float vector.
+//! `rank(A)` accepts any 2D numeric matrix, square or
+//! rectangular, and returns its rank as an Int.
 //!
 //! The solver is Gaussian elimination with partial pivoting.
 //! A singular matrix — determinant zero, i.e. the system is
@@ -14,6 +16,9 @@
 //! GG convention: `matmul` on incompatible shapes and
 //! `math.sqrt` of a negative number are errors too, never
 //! silent `nil`). `det` of a singular matrix is simply `0`.
+//! `rank` is what tells the two apart: a system is
+//! indeterminate when `rank(A) == rank([A|b]) < n`, and
+//! impossible when `rank(A) < rank([A|b])`.
 
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
@@ -38,37 +43,52 @@ fn to_f64(value: &Value) -> Option<f64> {
     }
 }
 
-/// A 2D array as a square matrix of f64, or a clear error
-/// naming the function.
-fn as_matrix(name: &str, data: &ArrayData) -> Result<(usize, Vec<Vec<f64>>), RuntimeError> {
-    match data.shape.as_slice() {
-        [n, m] if n == m => {}
+/// A 2D array as a matrix of f64 (any shape, square or
+/// rectangular), or a clear error naming the function.
+fn as_rect_matrix(
+    name: &str,
+    data: &ArrayData,
+) -> Result<(usize, usize, Vec<Vec<f64>>), RuntimeError> {
+    let (rows, cols) = match data.shape.as_slice() {
+        [r, c] => (*r, *c),
         _ => {
             return Err(RuntimeError::new(format!(
-                "{name}() expects a square 2D Array, not shape {}",
+                "{name}() expects a 2D Array, not shape {}",
                 fmt_shape(&data.shape)
             )));
         }
-    }
-    let n = data.shape[0];
+    };
     if !matches!(data.elem, ElemType::Int | ElemType::Float) {
         return Err(RuntimeError::new(format!(
             "{name}() expects numbers, not array of {}",
             data.elem.name()
         )));
     }
-    let mut rows = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut row = Vec::with_capacity(n);
-        for j in 0..n {
-            let Some(x) = to_f64(&data.items[i * n + j]) else {
+    let mut matrix = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let mut row = Vec::with_capacity(cols);
+        for j in 0..cols {
+            let Some(x) = to_f64(&data.items[i * cols + j]) else {
                 unreachable!()
             };
             row.push(x);
         }
-        rows.push(row);
+        matrix.push(row);
     }
-    Ok((n, rows))
+    Ok((rows, cols, matrix))
+}
+
+/// A 2D array as a square matrix of f64, or a clear error
+/// naming the function.
+fn as_matrix(name: &str, data: &ArrayData) -> Result<(usize, Vec<Vec<f64>>), RuntimeError> {
+    let (rows, cols, matrix) = as_rect_matrix(name, data)?;
+    if rows != cols {
+        return Err(RuntimeError::new(format!(
+            "{name}() expects a square 2D Array, not shape {}",
+            fmt_shape(&data.shape)
+        )));
+    }
+    Ok((rows, matrix))
 }
 
 /// A 1D array of length `n` as a vector of f64, or a clear
@@ -177,6 +197,49 @@ pub fn determinant(data: &ArrayData) -> Result<f64, RuntimeError> {
     Ok(det)
 }
 
+/// The rank of a matrix, by Gaussian elimination with
+/// partial pivoting to row echelon form: the number of rows
+/// with a pivot. A pivot below `SINGULAR_TOL` counts as zero,
+/// like in `solve` — a row that is (numerically) a combination
+/// of the rows above it adds no rank. Works on rectangular
+/// matrices too; an empty matrix (0 rows or 0 columns) has
+/// rank 0.
+pub fn matrix_rank(data: &ArrayData) -> Result<i64, RuntimeError> {
+    let (rows, cols, mut a) = as_rect_matrix("linalg.rank", data)?;
+    if rows == 0 || cols == 0 {
+        return Ok(0);
+    }
+    let mut rank = 0;
+    let mut r = 0;
+    for col in 0..cols {
+        if r >= rows {
+            break;
+        }
+        // Partial pivoting: the largest remaining pivot in
+        // this column. A column whose best pivot is (numerically)
+        // zero has no pivot: the column is skipped, the rank
+        // does not grow, and later columns can still pivot.
+        let (pivot_row, _) = (r..rows)
+            .map(|i| (i, a[i][col].abs()))
+            .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+            .unwrap();
+        if a[pivot_row][col].abs() < SINGULAR_TOL {
+            continue;
+        }
+        a.swap(r, pivot_row);
+        // Eliminate this column from every row below.
+        for i in (r + 1)..rows {
+            let factor = a[i][col] / a[r][col];
+            for c in col..cols {
+                a[i][c] -= factor * a[r][c];
+            }
+        }
+        r += 1;
+        rank += 1;
+    }
+    Ok(rank)
+}
+
 /// `linalg.solve(A, b)` — the solution `x` of `A x = b` as a
 /// Float vector of length `n`. A singular `A` is an error.
 pub fn solve_system(a: &ArrayData, b: &ArrayData) -> Result<Value, RuntimeError> {
@@ -242,4 +305,14 @@ pub fn inv(
 ) -> Result<Value, RuntimeError> {
     let a = as_array("linalg.inv", &args[0])?;
     inverse(&a.borrow())
+}
+
+/// `linalg.rank(A)` — builtin wrapper (see `matrix_rank`).
+pub fn rank(
+    args: &[Value],
+    _input: &mut dyn BufRead,
+    _out: &mut dyn Write,
+) -> Result<Value, RuntimeError> {
+    let a = as_array("linalg.rank", &args[0])?;
+    Ok(Value::Int(matrix_rank(&a.borrow())?))
 }

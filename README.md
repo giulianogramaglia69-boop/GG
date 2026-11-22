@@ -64,14 +64,26 @@ widgets (`heading`, `label`, `separator`, `button`,
 `text_input`, `slider`, `checkbox`, `horizontal`) are called
 inside the frame function (see the Graphical interfaces section
 below). **Phase 14 — linear algebra: done.** A native
-`linalg` module (`solve`/`det`/`inv`, Gaussian elimination
+`linalg` module (`solve`/`det`/`inv`/`rank`, Gaussian elimination
 with partial pivoting; a singular matrix is a runtime error,
-never a silent `nil`) — see the Standard library section
+never a silent `nil`; `rank` tells an indeterminate system
+from an impossible one) — see the Standard library section
 below. **Phase 15 — for-in iteration: done.** `for x in xs
 then ... end` iterates over lists, tuples, arrays (rows on
 2D+), sets, dict keys, string characters, queues and stacks;
 the iterable is evaluated once and snapshotted, and the loop
 variable is scoped to the body (see the Loops section below).
+**Phase 16 — runtime errors with line and column: done.** Every
+runtime error reports where it failed — `runtime error:
+<line>:<col>: <message>` (1-based), pointing at the token that
+failed (the identifier, the operator, the index, the call — see
+the Errors bullet below and `examples/error_demo.gg`).
+**Phase 17 — more GUI widgets: done.** `radio` (true only when
+clicked, exclusive groups are the script's own logic),
+`combo` (dropdown over a List of Str, returns the selected
+index), `progress` (bar, value clamped to [0, 1]) and
+`vertical` (like `horizontal`, vertical layout) — see
+`examples/gui_widgets_demo.gg`.
 
 ## The REPL
 
@@ -339,12 +351,16 @@ true
 true
 ```
 
-- **Errors** are plain-English runtime errors (`undefined variable
-  'x'`, `cannot add Int and Str`, `division by zero`,
-  `cannot call Int`, `expected 1 argument(s) but got 2`,
-  `return outside function`). **Known limitation:** the Phase 2 AST
-  carries no source positions, so runtime errors have no line or
-  column yet — positions will arrive in a later phase.
+- **Errors** are plain-English runtime errors with the position
+  where they failed: `runtime error: <line>:<col>: <message>`
+  (1-based). The position is the token that failed — the
+  identifier for `undefined variable 'x'`, the operator for
+  `division by zero` and `cannot add Int and Str`, the function
+  name for `expected 1 argument(s) but got 2`, the index for an
+  out-of-range index, the `return` keyword for
+  `return outside function`. Example (`examples/error_demo.gg`):
+  `print 10 / 0` fails with
+  `runtime error: 10:10: division by zero`.
 
 ```gg
 fn fib(n)
@@ -638,13 +654,18 @@ different sequence.
 | `random.choice(list)` | A random element of the list; an error on an empty list | `random.choice([10, 20])` → `20` |
 | `random.shuffle(list)` | Shuffle the list in place (Fisher-Yates), return `nil` | `random.shuffle(xs)` |
 
-**`linalg`** — native, in Rust (Phase 14). Gaussian elimination
+**`linalg`** — native, in Rust (Phase 14, `rank` in Phase 18). Gaussian elimination
 with partial pivoting over the N-d numeric arrays: `solve` and
-`inv` return Float arrays, `det` a Float. A singular matrix —
+`inv` return Float arrays, `det` a Float, `rank` an Int. A singular matrix —
 determinant zero, i.e. an impossible or indeterminate system —
 is a runtime error for `solve` and `inv` (the GG convention:
 `matmul` on incompatible shapes is an error too, never a
-silent `nil`); `det` of a singular matrix is `0`. Results are
+silent `nil`); `det` of a singular matrix is `0`. `rank` is
+what tells the two apart: a system is indeterminate when
+`rank(A) == rank([A|b]) < n`, and impossible when
+`rank(A) < rank([A|b])` (n = number of unknowns); it works on
+rectangular matrices too, and an empty matrix has rank 0.
+Results are
 f64, so a system like the classic 3x3 can print
 `3.0000000000000004` instead of `3`: elimination divides by
 numbers with no exact binary form, and a little rounding is
@@ -655,9 +676,12 @@ normal — the same happens in NumPy.
 | `linalg.solve(A, b)` | The solution `x` of `A x = b`: `A` square 2D, `b` a 1D vector of the same length | `linalg.solve(reshape(array([2, 1, 1, 3]), [2, 2]), array([5, 10]))` → `array([1, 3])` |
 | `linalg.det(A)` | The determinant of a square 2D matrix | `linalg.det(reshape(array([1, 2, 3, 4]), [2, 2]))` → `-2` |
 | `linalg.inv(A)` | The inverse matrix | `linalg.inv(reshape(array([1, 2, 0, 1]), [2, 2]))` → `array([[1, -2], [0, 1]])` |
+| `linalg.rank(A)` | The rank of a 2D numeric matrix, square or rectangular: the number of independent rows (pivots in row echelon form, same 1e-12 tolerance as `solve`) | `linalg.rank(reshape(array([1, 2, 2, 4]), [2, 2]))` → `1` |
 
 Full example: `examples/linalg_demo.gg` — the systems from the
 maths ripasso, plus the classic 3x3 with its f64 rounding.
+`examples/rank_demo.gg` shows `rank` telling an indeterminate
+system from an impossible one.
 
 **`stats`** — written in pure GG (`stdlib/stats.gg` in the
 repo), embedded in the binary with `include_str!`, so it works
@@ -912,9 +936,13 @@ inside it: the frame function is an ordinary GG closure.
 | `gui.text_input(id, valore)` | A single-line text field; returns the text after this frame (reassign it to the variable) |
 | `gui.slider(id, valore, min, max)` | A numeric slider; returns the value after this frame (a Float) |
 | `gui.checkbox(id, testo, valore)` | A checkbox with a label; returns the state after this frame |
+| `gui.radio(id, testo, selezionato)` | A radio button (a circle); returns `true` only in the frame where it is clicked, like `button` — for an exclusive group, one `radio` per option, no implicit groups |
+| `gui.combo(id, opzioni, selezionato)` | A dropdown menu; `opzioni` is a List of Str, `selezionato` the current index (an Int); returns the selected index after this frame (empty list or out-of-range index is an error) |
+| `gui.progress(valore)` | A progress bar; `valore` is a number in 0..1, values outside are clamped to [0, 1] (not an error) |
 | `gui.horizontal(fn)` | Run the GG function `fn` laying out the widgets it creates horizontally instead of vertically |
+| `gui.vertical(fn)` | Like `horizontal`, but the widgets the function creates are laid out vertically (useful inside a `horizontal` block to nest a column in a row) |
 
-`text_input`, `slider` and `checkbox` take a stable string `id`:
+`text_input`, `slider`, `checkbox`, `radio` and `combo` take a stable string `id`:
 egui keeps the cursor, the edit state and the drag state under
 that id, so the widget keeps its state across frames even when
 the layout changes. Two widgets with the same `id` share state —
@@ -991,8 +1019,7 @@ with no display `gui.run` fails with a clear error (on Linux it
 checks `DISPLAY`/`WAYLAND_DISPLAY` first); on this VM the live
 test runs under Xvfb with the lavapipe software Vulkan driver,
 and the first real interactive test is on a laptop. One window
-only, no menus, no canvas/images, no themes, no multiple
-windows, and no frame-rate control yet.
+only, no canvas/images, no themes, no multiple windows, and no frame-rate control yet. (Phase 17 demo: `examples/gui_widgets_demo.gg` — radio, combo, progress and vertical; it closes by itself after about 60 frames.)
 
 ## Grammar
 
@@ -1137,14 +1164,40 @@ exit with code 1.
     widgets `heading`/`label`/`separator`/`button`/`text_input`/
     `slider`/`checkbox`/`horizontal`, called inside the frame
     function in order, vertical layout by default
+17. **More GUI widgets** ✅ — `radio(id, testo, selezionato)`
+    → Bool (true only when clicked; exclusive groups are the
+    script's own logic, no implicit groups),
+    `combo(id, opzioni, selezionato)` → Int (dropdown over a
+    List of Str; empty list or out-of-range index is an error),
+    `progress(valore)` → Nil (bar, value clamped to [0, 1]),
+    `vertical(fn)` (like `horizontal`, vertical layout); see
+    `examples/gui_widgets_demo.gg`
 14. **Linear algebra** ✅ — native `linalg` module
     (`import linalg`): `solve(A, b)` / `det(A)` / `inv(A)` over
-    2D square numeric arrays, Gaussian elimination with partial
-    pivoting; a singular matrix is a runtime error for `solve`
-    and `inv`, `det` of one is `0`; results are Float, with the
-    usual f64 rounding (see the `linalg` table above)
+    2D square numeric arrays, `rank(A)` over any 2D numeric
+    array (square or rectangular); Gaussian elimination with
+    partial pivoting; a singular matrix is a runtime error for
+    `solve` and `inv`, `det` of one is `0`; `rank` tells an
+    indeterminate system from an impossible one
+    (`rank(A) == rank([A|b]) < n` vs `rank(A) < rank([A|b])`);
+    results are Float, with the usual f64 rounding (see the
+    `linalg` table above)
+15. **For-in iteration** ✅ — `for x in xs then ... end` over
+    lists, tuples, arrays (rows on 2D+), sets, dict keys, string
+    characters, queues and stacks (see the Loops section below)
+16. **Runtime errors with line and column** ✅ — every runtime
+    error reports `runtime error: <line>:<col>: <message>`
+    (1-based), pointing at the failing token (identifier,
+    operator, index, call); see `examples/error_demo.gg`
+18. **`linalg.rank`** ✅ — `rank(A)` → Int: the rank of a 2D
+    numeric matrix, square or rectangular, by Gaussian
+    elimination to row echelon form with partial pivoting
+    (same 1e-12 tolerance as `solve`); an empty matrix has
+    rank 0. With it, an indeterminate system is told from an
+    impossible one: `rank(A) == rank([A|b]) < n` vs
+    `rank(A) < rank([A|b])`; see `examples/rank_demo.gg`
 
-Next: not decided yet — Fase 14 is done; the GUI's first real
+Next: not decided yet — Fase 18 is done; the GUI's first real
 interactive test on the laptop is still open.
 
 Long term: more data libraries in the spirit of Pandas, and a

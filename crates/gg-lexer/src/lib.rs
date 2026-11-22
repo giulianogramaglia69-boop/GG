@@ -16,12 +16,54 @@
 
 use std::fmt;
 
+/// A 1-based source position: the line and column where a token
+/// starts. Phase 16: spans travel with AST nodes (the span of the
+/// token that opens or identifies the node), so runtime errors can
+/// say where they happened. A span is metadata, not semantics:
+/// AST equality ignores it (see `gg-parser`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl Span {
+    pub fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+
+    /// A placeholder for AST nodes built by hand (tests): never
+    /// produced by the parser, and never a real position — line 0
+    /// does not exist in a source file.
+    pub fn dummy() -> Self {
+        Self { line: 0, col: 0 }
+    }
+
+    /// True for the placeholder from `dummy`.
+    pub fn is_dummy(self) -> bool {
+        self.line == 0
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// A single token, with its 1-based start position.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
     pub line: usize,
     pub col: usize,
+}
+
+impl Token {
+    /// The token's start position, as a `Span`.
+    pub fn span(&self) -> Span {
+        Span::new(self.line, self.col)
+    }
 }
 
 impl Token {

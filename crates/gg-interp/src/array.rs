@@ -12,6 +12,8 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+use gg_lexer::Span;
+
 use crate::error::RuntimeError;
 use crate::value::{ArrayData, ElemType, Value, values_equal};
 
@@ -51,8 +53,10 @@ pub fn resolve_axis(len: usize, index: Value, kind: &str) -> Result<usize, Runti
 
 /// The flat (row-major) offset of a multi-dimensional index: one
 /// integer per axis, negative from the end of its axis. The number
-/// of indices must match the number of dimensions.
-pub fn flat_index(shape: &[usize], indices: &[Value]) -> Result<usize, RuntimeError> {
+/// of indices must match the number of dimensions. Each index
+/// carries its span, so an out-of-range index on one axis points
+/// at that index expression.
+pub fn flat_index(shape: &[usize], indices: &[(Value, Span)]) -> Result<usize, RuntimeError> {
     if indices.len() != shape.len() {
         return Err(RuntimeError::new(format!(
             "array has {} dimensions but got {} indices",
@@ -65,8 +69,8 @@ pub fn flat_index(shape: &[usize], indices: &[Value]) -> Result<usize, RuntimeEr
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     let mut offset = 0;
-    for (axis, index) in indices.iter().enumerate() {
-        let pos = resolve_axis(shape[axis], index.clone(), "array")?;
+    for (axis, (index, span)) in indices.iter().enumerate() {
+        let pos = resolve_axis(shape[axis], index.clone(), "array").map_err(|e| e.at(*span))?;
         offset += pos * strides[axis];
     }
     Ok(offset)

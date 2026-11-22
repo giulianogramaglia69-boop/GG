@@ -7,7 +7,7 @@
 //! branch of an `if`.
 
 use crate::ast::{BinaryOp, Expr, MethodDef, Program, Stmt, UnaryOp};
-use gg_lexer::{Token, TokenKind};
+use gg_lexer::{Span, Token, TokenKind};
 use std::fmt;
 
 /// A parse error: a plain-English message plus the 1-based
@@ -130,6 +130,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Like `expect_ident`, but also returns the identifier's span:
+    /// field and method names carry the span of the name itself.
+    fn expect_ident_span(&mut self, what: &str) -> Result<(String, Span), ParserError> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                let span = self.advance().span();
+                Ok((name, span))
+            }
+            _ => Err(self.error_here(format!(
+                "expected {what} but found {}",
+                describe(self.peek())
+            ))),
+        }
+    }
+
     fn skip_separators(&mut self) {
         while matches!(self.peek_kind(), TokenKind::Newline | TokenKind::Semicolon) {
             self.advance();
@@ -200,41 +216,48 @@ impl<'a> Parser<'a> {
                 if self.check(&TokenKind::Eq) {
                     self.advance(); // =
                     let value = self.parse_expr()?;
+                    // The statement starts where its target starts:
+                    // the variable name, the `[` of an index, the
+                    // field name of a field assignment.
+                    let span = expr.span();
                     match expr {
-                        Expr::Ident(name) => Ok(Stmt::Assign { name, value }),
+                        Expr::Ident { name, .. } => Ok(Stmt::Assign { name, value, span }),
                         Expr::Index { .. } => Ok(Stmt::IndexAssign {
                             target: expr,
                             value,
+                            span,
                         }),
                         Expr::Field { .. } => Ok(Stmt::FieldAssign {
                             target: expr,
                             value,
+                            span,
                         }),
                         _ => Err(self.error_here("invalid assignment target")),
                     }
                 } else {
-                    Ok(Stmt::ExprStmt { expr })
+                    let span = expr.span();
+                    Ok(Stmt::ExprStmt { expr, span })
                 }
             }
         }
     }
 
     fn parse_let(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // let
+        let span = self.advance().span(); // let
         let name = self.expect_ident("variable name after 'let'")?;
         self.expect(&TokenKind::Eq, "'=' after variable name")?;
         let value = self.parse_expr()?;
-        Ok(Stmt::Let { name, value })
+        Ok(Stmt::Let { name, value, span })
     }
 
     fn parse_print(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // print
+        let span = self.advance().span(); // print
         let expr = self.parse_expr()?;
-        Ok(Stmt::Print { expr })
+        Ok(Stmt::Print { expr, span })
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // if
+        let span = self.advance().span(); // if
         let cond = self.parse_expr()?;
         self.expect(&TokenKind::Then, "'then' after if condition")?;
         let then_block = self.parse_block()?;
@@ -249,20 +272,21 @@ impl<'a> Parser<'a> {
             cond,
             then_block,
             else_block,
+            span,
         })
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // while
+        let span = self.advance().span(); // while
         let cond = self.parse_expr()?;
         self.expect(&TokenKind::Then, "'then' after while condition")?;
         let body = self.parse_block()?;
         self.expect(&TokenKind::End, "'end' to close 'while' block")?;
-        Ok(Stmt::While { cond, body })
+        Ok(Stmt::While { cond, body, span })
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // for
+        let span = self.advance().span(); // for
         let var = self.expect_ident("variable name after 'for'")?;
         if self.check(&TokenKind::In) {
             // for-in: `for x in xs then ... end`.
@@ -271,7 +295,12 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Then, "'then' after for-in iterable")?;
             let body = self.parse_block()?;
             self.expect(&TokenKind::End, "'end' to close 'for' block")?;
-            return Ok(Stmt::ForIn { var, iter, body });
+            return Ok(Stmt::ForIn {
+                var,
+                iter,
+                body,
+                span,
+            });
         }
         self.expect(&TokenKind::Eq, "'=' or 'in' in for loop")?;
         let from = self.parse_expr()?;
@@ -285,11 +314,12 @@ impl<'a> Parser<'a> {
             from,
             to,
             body,
+            span,
         })
     }
 
     fn parse_fn(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // fn
+        let span = self.advance().span(); // fn
         let name = self.expect_ident("function name after 'fn'")?;
         self.expect(&TokenKind::LParen, "'(' after function name")?;
         let mut params = Vec::new();
@@ -303,7 +333,12 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::RParen, "')' after parameter list")?;
         let body = self.parse_block()?;
         self.expect(&TokenKind::End, "'end' to close function body")?;
-        Ok(Stmt::Fn { name, params, body })
+        Ok(Stmt::Fn {
+            name,
+            params,
+            body,
+            span,
+        })
     }
 
     /// A parameter name: a plain identifier, or `self` (methods
@@ -327,7 +362,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_class(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // class
+        let span = self.advance().span(); // class
         let name = self.expect_ident("class name after 'class'")?;
         let parent = if self.check(&TokenKind::Extends) {
             self.advance(); // extends
@@ -353,6 +388,7 @@ impl<'a> Parser<'a> {
                         name: method_name,
                         params,
                         body,
+                        ..
                     } = self.parse_fn()?
                     else {
                         unreachable!("parse_fn always returns Stmt::Fn")
@@ -382,11 +418,12 @@ impl<'a> Parser<'a> {
             name,
             parent,
             methods,
+            span,
         })
     }
 
     fn parse_import(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // import
+        let span = self.advance().span(); // import
         let name = self.expect_ident("module name after 'import'")?;
         let alias = if self.check(&TokenKind::As) {
             self.advance(); // as
@@ -394,11 +431,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Stmt::Import { name, alias })
+        Ok(Stmt::Import { name, alias, span })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParserError> {
-        self.advance(); // return
+        let span = self.advance().span(); // return
         let expr = match self.peek_kind() {
             TokenKind::Newline
             | TokenKind::Semicolon
@@ -407,7 +444,7 @@ impl<'a> Parser<'a> {
             | TokenKind::Eof => None,
             _ => Some(self.parse_expr()?),
         };
-        Ok(Stmt::Return { expr })
+        Ok(Stmt::Return { expr, span })
     }
 
     // ----- expressions (lowest precedence first) -----
@@ -419,12 +456,13 @@ impl<'a> Parser<'a> {
     fn parse_or(&mut self) -> Result<Expr, ParserError> {
         let mut expr = self.parse_and()?;
         while self.check(&TokenKind::Or) {
-            self.advance();
+            let span = self.advance().span();
             let right = self.parse_and()?;
             expr = Expr::Binary {
                 op: BinaryOp::Or,
                 left: Box::new(expr),
                 right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -433,12 +471,13 @@ impl<'a> Parser<'a> {
     fn parse_and(&mut self) -> Result<Expr, ParserError> {
         let mut expr = self.parse_equality()?;
         while self.check(&TokenKind::And) {
-            self.advance();
+            let span = self.advance().span();
             let right = self.parse_equality()?;
             expr = Expr::Binary {
                 op: BinaryOp::And,
                 left: Box::new(expr),
                 right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -452,12 +491,13 @@ impl<'a> Parser<'a> {
                 TokenKind::NotEq => BinaryOp::NotEq,
                 _ => break,
             };
-            self.advance();
+            let span = self.advance().span();
             let right = self.parse_comparison()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
                 right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -473,12 +513,13 @@ impl<'a> Parser<'a> {
                 TokenKind::GtEq => BinaryOp::GtEq,
                 _ => break,
             };
-            self.advance();
+            let span = self.advance().span();
             let right = self.parse_term()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
                 right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -492,12 +533,13 @@ impl<'a> Parser<'a> {
                 TokenKind::Minus => BinaryOp::Sub,
                 _ => break,
             };
-            self.advance();
+            let span = self.advance().span();
             let right = self.parse_factor()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
                 right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -512,12 +554,13 @@ impl<'a> Parser<'a> {
                 TokenKind::Percent => BinaryOp::Mod,
                 _ => break,
             };
-            self.advance();
+            let span = self.advance().span();
             let right = self.parse_unary()?;
             expr = Expr::Binary {
                 op,
                 left: Box::new(expr),
                 right: Box::new(right),
+                span,
             };
         }
         Ok(expr)
@@ -526,19 +569,21 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) -> Result<Expr, ParserError> {
         match self.peek_kind() {
             TokenKind::Minus => {
-                self.advance();
+                let span = self.advance().span();
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Neg,
                     expr: Box::new(expr),
+                    span,
                 })
             }
             TokenKind::Not => {
-                self.advance();
+                let span = self.advance().span();
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Not,
                     expr: Box::new(expr),
+                    span,
                 })
             }
             _ => self.parse_postfix(),
@@ -552,7 +597,7 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         loop {
             if self.check(&TokenKind::LBracket) {
-                self.advance(); // [
+                let span = self.advance().span(); // [
                 let mut indices = vec![self.parse_index_item()?];
                 while self.check(&TokenKind::Comma) {
                     self.advance(); // ,
@@ -562,10 +607,11 @@ impl<'a> Parser<'a> {
                 expr = Expr::Index {
                     target: Box::new(expr),
                     indices,
+                    span,
                 };
             } else if self.check(&TokenKind::Dot) {
                 self.advance(); // .
-                let name = self.expect_ident("field name after '.'")?;
+                let (name, span) = self.expect_ident_span("field name after '.'")?;
                 if self.check(&TokenKind::LParen) {
                     self.advance(); // (
                     let mut args = Vec::new();
@@ -581,11 +627,13 @@ impl<'a> Parser<'a> {
                         target: Box::new(expr),
                         name,
                         args,
+                        span,
                     };
                 } else {
                     expr = Expr::Field {
                         target: Box::new(expr),
                         name,
+                        span,
                     };
                 }
             } else {
@@ -615,7 +663,7 @@ impl<'a> Parser<'a> {
     /// (or is `None` when the slice starts with `:`). A bound is
     /// missing when the next token is `:`, `,` or `]`.
     fn parse_slice(&mut self, start: Option<Expr>) -> Result<Expr, ParserError> {
-        self.expect(&TokenKind::Colon, "':' in slice")?;
+        let span = self.expect(&TokenKind::Colon, "':' in slice")?.span();
         let stop = if self.at_slice_bound_end() {
             None
         } else {
@@ -635,6 +683,7 @@ impl<'a> Parser<'a> {
             start: start.map(Box::new),
             stop: stop.map(Box::new),
             step: step.map(Box::new),
+            span,
         })
     }
 
@@ -650,33 +699,33 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Expr, ParserError> {
         match self.peek_kind().clone() {
             TokenKind::Int(n) => {
-                self.advance();
-                Ok(Expr::Int(n))
+                let span = self.advance().span();
+                Ok(Expr::Int { value: n, span })
             }
             TokenKind::Float(x) => {
-                self.advance();
-                Ok(Expr::Float(x))
+                let span = self.advance().span();
+                Ok(Expr::Float { value: x, span })
             }
             TokenKind::Str(s) => {
-                self.advance();
-                Ok(Expr::Str(s))
+                let span = self.advance().span();
+                Ok(Expr::Str { value: s, span })
             }
             TokenKind::True => {
-                self.advance();
-                Ok(Expr::Bool(true))
+                let span = self.advance().span();
+                Ok(Expr::Bool { value: true, span })
             }
             TokenKind::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
+                let span = self.advance().span();
+                Ok(Expr::Bool { value: false, span })
             }
             TokenKind::SelfKw => {
-                self.advance();
-                Ok(Expr::SelfExpr)
+                let span = self.advance().span();
+                Ok(Expr::SelfExpr { span })
             }
             TokenKind::Super => {
                 self.advance(); // super
                 self.expect(&TokenKind::Dot, "'.' after 'super'")?;
-                let name = self.expect_ident("method name after 'super.'")?;
+                let (name, span) = self.expect_ident_span("method name after 'super.'")?;
                 self.expect(&TokenKind::LParen, "'(' after super method name")?;
                 let mut args = Vec::new();
                 if !self.check(&TokenKind::RParen) {
@@ -687,10 +736,10 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(&TokenKind::RParen, "')' after super method arguments")?;
-                Ok(Expr::SuperCall { name, args })
+                Ok(Expr::SuperCall { name, args, span })
             }
             TokenKind::Ident(name) => {
-                self.advance();
+                let span = self.advance().span();
                 if self.check(&TokenKind::LParen) {
                     self.advance(); // (
                     let mut args = Vec::new();
@@ -702,16 +751,19 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&TokenKind::RParen, "')' after call arguments")?;
-                    Ok(Expr::Call { name, args })
+                    Ok(Expr::Call { name, args, span })
                 } else {
-                    Ok(Expr::Ident(name))
+                    Ok(Expr::Ident { name, span })
                 }
             }
             TokenKind::LParen => {
-                self.advance(); // (
+                let span = self.advance().span(); // (
                 if self.check(&TokenKind::RParen) {
                     self.advance(); // )
-                    return Ok(Expr::Tuple(vec![]));
+                    return Ok(Expr::Tuple {
+                        elements: vec![],
+                        span,
+                    });
                 }
                 let first = self.parse_expr()?;
                 if self.check(&TokenKind::Comma) {
@@ -726,7 +778,7 @@ impl<'a> Parser<'a> {
                         elements.push(self.parse_expr()?);
                     }
                     self.expect(&TokenKind::RParen, "')' after tuple elements")?;
-                    Ok(Expr::Tuple(elements))
+                    Ok(Expr::Tuple { elements, span })
                 } else {
                     self.expect(&TokenKind::RParen, "')' after expression")?;
                     Ok(first)
@@ -734,7 +786,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LBrace => self.parse_brace(),
             TokenKind::LBracket => {
-                self.advance(); // [
+                let span = self.advance().span(); // [
                 let mut elements = Vec::new();
                 if !self.check(&TokenKind::RBracket) {
                     elements.push(self.parse_expr()?);
@@ -744,7 +796,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(&TokenKind::RBracket, "']' after list elements")?;
-                Ok(Expr::List(elements))
+                Ok(Expr::List { elements, span })
             }
             _ => Err(self.error_here(format!(
                 "expected expression but found {}",
@@ -756,10 +808,13 @@ impl<'a> Parser<'a> {
     /// `{...}`: a dict when the entries have `:`, a set otherwise.
     /// `{}` is the empty dict (Python convention).
     fn parse_brace(&mut self) -> Result<Expr, ParserError> {
-        self.advance(); // {
+        let span = self.advance().span(); // {
         if self.check(&TokenKind::RBrace) {
             self.advance(); // }
-            return Ok(Expr::Dict(vec![]));
+            return Ok(Expr::Dict {
+                entries: vec![],
+                span,
+            });
         }
         let first = self.parse_expr()?;
         if self.check(&TokenKind::Colon) {
@@ -779,7 +834,7 @@ impl<'a> Parser<'a> {
                 entries.push((key, value));
             }
             self.expect(&TokenKind::RBrace, "'}' after dict entries")?;
-            Ok(Expr::Dict(entries))
+            Ok(Expr::Dict { entries, span })
         } else {
             // Set: elements separated by commas (trailing comma ok).
             let mut elements = vec![first];
@@ -791,7 +846,7 @@ impl<'a> Parser<'a> {
                 elements.push(self.parse_expr()?);
             }
             self.expect(&TokenKind::RBrace, "'}' after set elements")?;
-            Ok(Expr::Set(elements))
+            Ok(Expr::Set { elements, span })
         }
     }
 }
@@ -824,15 +879,22 @@ mod tests {
     }
 
     fn ident(name: &str) -> Expr {
-        Expr::Ident(name.to_string())
+        Expr::Ident {
+            name: name.to_string(),
+            span: Span::dummy(),
+        }
     }
 
     fn int(n: i64) -> Expr {
-        Expr::Int(n)
+        Expr::Int {
+            value: n,
+            span: Span::dummy(),
+        }
     }
 
     fn bin(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         Expr::Binary {
+            span: Span::dummy(),
             op,
             left: Box::new(left),
             right: Box::new(right),
@@ -849,16 +911,26 @@ mod tests {
             Program {
                 stmts: vec![
                     Stmt::Let {
+                        span: Span::dummy(),
                         name: "x".to_string(),
                         value: int(10),
                     },
                     Stmt::If {
+                        span: Span::dummy(),
                         cond: bin(Gt, ident("x"), int(5)),
                         then_block: vec![Stmt::Print {
-                            expr: Expr::Str("big".to_string()),
+                            span: Span::dummy(),
+                            expr: Expr::Str {
+                                value: "big".to_string(),
+                                span: Span::dummy()
+                            },
                         }],
                         else_block: Some(vec![Stmt::Print {
-                            expr: Expr::Str("small".to_string()),
+                            span: Span::dummy(),
+                            expr: Expr::Str {
+                                value: "small".to_string(),
+                                span: Span::dummy()
+                            },
                         }]),
                     },
                 ]
@@ -872,6 +944,7 @@ mod tests {
         assert_eq!(
             parse_ok("print 1 + 2 * 3").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(Add, int(1), bin(Mul, int(2), int(3))),
             }]
         );
@@ -879,9 +952,11 @@ mod tests {
         assert_eq!(
             parse_ok("print not a and b").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(
                     And,
                     Expr::Unary {
+                        span: Span::dummy(),
                         op: UnaryOp::Not,
                         expr: Box::new(ident("a")),
                     },
@@ -893,6 +968,7 @@ mod tests {
         assert_eq!(
             parse_ok("print a == b and c").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(And, bin(Eq, ident("a"), ident("b")), ident("c")),
             }]
         );
@@ -900,6 +976,7 @@ mod tests {
         assert_eq!(
             parse_ok("print a or b and c").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(Or, ident("a"), bin(And, ident("b"), ident("c"))),
             }]
         );
@@ -907,9 +984,11 @@ mod tests {
         assert_eq!(
             parse_ok("print -x * y").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(
                     Mul,
                     Expr::Unary {
+                        span: Span::dummy(),
                         op: UnaryOp::Neg,
                         expr: Box::new(ident("x")),
                     },
@@ -921,6 +1000,7 @@ mod tests {
         assert_eq!(
             parse_ok("print a - b - c").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(Sub, bin(Sub, ident("a"), ident("b")), ident("c")),
             }]
         );
@@ -931,6 +1011,7 @@ mod tests {
         assert_eq!(
             parse_ok("print (1 + 2) * 3").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(Mul, bin(Add, int(1), int(2)), int(3)),
             }]
         );
@@ -945,13 +1026,24 @@ mod tests {
             prog,
             Program {
                 stmts: vec![Stmt::If {
+                    span: Span::dummy(),
                     cond: ident("a"),
                     then_block: vec![Stmt::If {
+                        span: Span::dummy(),
                         cond: ident("b"),
-                        then_block: vec![Stmt::Print { expr: int(1) }],
-                        else_block: Some(vec![Stmt::Print { expr: int(2) }]),
+                        then_block: vec![Stmt::Print {
+                            span: Span::dummy(),
+                            expr: int(1)
+                        }],
+                        else_block: Some(vec![Stmt::Print {
+                            span: Span::dummy(),
+                            expr: int(2)
+                        }]),
                     }],
-                    else_block: Some(vec![Stmt::Print { expr: int(3) }]),
+                    else_block: Some(vec![Stmt::Print {
+                        span: Span::dummy(),
+                        expr: int(3)
+                    }]),
                 }],
             }
         );
@@ -962,8 +1054,10 @@ mod tests {
         assert_eq!(
             parse_ok("while x < 10 then\n    x = x + 1\nend").stmts,
             vec![Stmt::While {
+                span: Span::dummy(),
                 cond: bin(Lt, ident("x"), int(10)),
                 body: vec![Stmt::Assign {
+                    span: Span::dummy(),
                     name: "x".to_string(),
                     value: bin(Add, ident("x"), int(1)),
                 }],
@@ -976,19 +1070,26 @@ mod tests {
         assert_eq!(
             parse_ok("fn greet()\n    print \"hi\"\nend").stmts,
             vec![Stmt::Fn {
+                span: Span::dummy(),
                 name: "greet".to_string(),
                 params: vec![],
                 body: vec![Stmt::Print {
-                    expr: Expr::Str("hi".to_string()),
+                    span: Span::dummy(),
+                    expr: Expr::Str {
+                        value: "hi".to_string(),
+                        span: Span::dummy()
+                    },
                 }],
             }]
         );
         assert_eq!(
             parse_ok("fn add(a, b)\n    return a + b\nend").stmts,
             vec![Stmt::Fn {
+                span: Span::dummy(),
                 name: "add".to_string(),
                 params: vec!["a".to_string(), "b".to_string()],
                 body: vec![Stmt::Return {
+                    span: Span::dummy(),
                     expr: Some(bin(Add, ident("a"), ident("b"))),
                 }],
             }]
@@ -996,9 +1097,13 @@ mod tests {
         assert_eq!(
             parse_ok("fn f()\n    return\nend").stmts,
             vec![Stmt::Fn {
+                span: Span::dummy(),
                 name: "f".to_string(),
                 params: vec![],
-                body: vec![Stmt::Return { expr: None }],
+                body: vec![Stmt::Return {
+                    span: Span::dummy(),
+                    expr: None
+                }],
             }]
         );
     }
@@ -1008,16 +1113,21 @@ mod tests {
         assert_eq!(
             parse_ok("for i = 1 to 10 then\n    print i\nend").stmts,
             vec![Stmt::For {
+                span: Span::dummy(),
                 var: "i".to_string(),
                 from: int(1),
                 to: int(10),
-                body: vec![Stmt::Print { expr: ident("i") }],
+                body: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: ident("i")
+                }],
             }]
         );
         // Bounds may be expressions.
         assert_eq!(
             parse_ok("for i = 1 + 1 to n * 2 then\nend").stmts,
             vec![Stmt::For {
+                span: Span::dummy(),
                 var: "i".to_string(),
                 from: bin(Add, int(1), int(1)),
                 to: bin(Mul, ident("n"), int(2)),
@@ -1031,9 +1141,13 @@ mod tests {
         assert_eq!(
             parse_ok("for x in xs then\n    print x\nend").stmts,
             vec![Stmt::ForIn {
+                span: Span::dummy(),
                 var: "x".to_string(),
                 iter: ident("xs"),
-                body: vec![Stmt::Print { expr: ident("x") }],
+                body: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: ident("x")
+                }],
             }]
         );
         // The iterable may be any expression, and the Display
@@ -1052,12 +1166,17 @@ mod tests {
         assert_eq!(
             parse_ok("for x in xs then\n    for y in ys then\n        print x\n    end\nend").stmts,
             vec![Stmt::ForIn {
+                span: Span::dummy(),
                 var: "x".to_string(),
                 iter: ident("xs"),
                 body: vec![Stmt::ForIn {
+                    span: Span::dummy(),
                     var: "y".to_string(),
                     iter: ident("ys"),
-                    body: vec![Stmt::Print { expr: ident("x") }],
+                    body: vec![Stmt::Print {
+                        span: Span::dummy(),
+                        expr: ident("x")
+                    }],
                 }],
             }]
         );
@@ -1065,10 +1184,14 @@ mod tests {
         assert_eq!(
             parse_ok("for i = 1 to 3 then\n    print i\nend").stmts,
             vec![Stmt::For {
+                span: Span::dummy(),
                 var: "i".to_string(),
                 from: int(1),
                 to: int(3),
-                body: vec![Stmt::Print { expr: ident("i") }],
+                body: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: ident("i")
+                }],
             }]
         );
     }
@@ -1092,7 +1215,9 @@ mod tests {
         assert_eq!(
             parse_ok("f()").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: Expr::Call {
+                    span: Span::dummy(),
                     name: "f".to_string(),
                     args: vec![],
                 },
@@ -1101,9 +1226,18 @@ mod tests {
         assert_eq!(
             parse_ok("f(1, x, \"s\")").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: Expr::Call {
+                    span: Span::dummy(),
                     name: "f".to_string(),
-                    args: vec![int(1), ident("x"), Expr::Str("s".to_string()),],
+                    args: vec![
+                        int(1),
+                        ident("x"),
+                        Expr::Str {
+                            value: "s".to_string(),
+                            span: Span::dummy()
+                        },
+                    ],
                 },
             }]
         );
@@ -1114,6 +1248,7 @@ mod tests {
         assert_eq!(
             parse_ok("x = 1 + 2").stmts,
             vec![Stmt::Assign {
+                span: Span::dummy(),
                 name: "x".to_string(),
                 value: bin(Add, int(1), int(2)),
             }]
@@ -1122,6 +1257,7 @@ mod tests {
         assert_eq!(
             parse_ok("x == 1").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: bin(Eq, ident("x"), int(1)),
             }]
         );
@@ -1135,14 +1271,17 @@ mod tests {
             parse_ok("let a = 1; let b = 2\nlet c = 3").stmts,
             vec![
                 Stmt::Let {
+                    span: Span::dummy(),
                     name: "a".to_string(),
                     value: int(1),
                 },
                 Stmt::Let {
+                    span: Span::dummy(),
                     name: "b".to_string(),
                     value: int(2),
                 },
                 Stmt::Let {
+                    span: Span::dummy(),
                     name: "c".to_string(),
                     value: int(3),
                 },
@@ -1152,8 +1291,12 @@ mod tests {
         assert_eq!(
             parse_ok("if x then print 1 end").stmts,
             vec![Stmt::If {
+                span: Span::dummy(),
                 cond: ident("x"),
-                then_block: vec![Stmt::Print { expr: int(1) }],
+                then_block: vec![Stmt::Print {
+                    span: Span::dummy(),
+                    expr: int(1)
+                }],
                 else_block: None,
             }]
         );
@@ -1165,19 +1308,39 @@ mod tests {
             parse_ok("print 42\nprint 3.15\nprint \"s\"\nprint true\nprint false").stmts,
             vec![
                 Stmt::Print {
-                    expr: Expr::Int(42),
+                    span: Span::dummy(),
+                    expr: Expr::Int {
+                        value: 42,
+                        span: Span::dummy()
+                    },
                 },
                 Stmt::Print {
-                    expr: Expr::Float(3.15),
+                    span: Span::dummy(),
+                    expr: Expr::Float {
+                        value: 3.15,
+                        span: Span::dummy()
+                    },
                 },
                 Stmt::Print {
-                    expr: Expr::Str("s".to_string()),
+                    span: Span::dummy(),
+                    expr: Expr::Str {
+                        value: "s".to_string(),
+                        span: Span::dummy()
+                    },
                 },
                 Stmt::Print {
-                    expr: Expr::Bool(true),
+                    span: Span::dummy(),
+                    expr: Expr::Bool {
+                        value: true,
+                        span: Span::dummy()
+                    },
                 },
                 Stmt::Print {
-                    expr: Expr::Bool(false),
+                    span: Span::dummy(),
+                    expr: Expr::Bool {
+                        value: false,
+                        span: Span::dummy()
+                    },
                 },
             ]
         );
@@ -1267,46 +1430,79 @@ mod tests {
         assert_eq!(
             parse_ok("print [1, 2, 3]").stmts,
             vec![Stmt::Print {
-                expr: Expr::List(vec![int(1), int(2), int(3)]),
+                span: Span::dummy(),
+                expr: Expr::List {
+                    elements: vec![int(1), int(2), int(3)],
+                    span: Span::dummy()
+                },
             }]
         );
         // Empty, mixed and nested lists.
         assert_eq!(
             parse_ok("print []").stmts,
             vec![Stmt::Print {
-                expr: Expr::List(vec![]),
+                span: Span::dummy(),
+                expr: Expr::List {
+                    elements: vec![],
+                    span: Span::dummy()
+                },
             }]
         );
         assert_eq!(
             parse_ok("print [1, \"ciao\", true]").stmts,
             vec![Stmt::Print {
-                expr: Expr::List(vec![
-                    int(1),
-                    Expr::Str("ciao".to_string()),
-                    Expr::Bool(true),
-                ]),
+                span: Span::dummy(),
+                expr: Expr::List {
+                    elements: vec![
+                        int(1),
+                        Expr::Str {
+                            value: "ciao".to_string(),
+                            span: Span::dummy()
+                        },
+                        Expr::Bool {
+                            value: true,
+                            span: Span::dummy()
+                        },
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
         assert_eq!(
             parse_ok("print [[1, 2], [3]]").stmts,
             vec![Stmt::Print {
-                expr: Expr::List(vec![
-                    Expr::List(vec![int(1), int(2)]),
-                    Expr::List(vec![int(3)]),
-                ]),
+                span: Span::dummy(),
+                expr: Expr::List {
+                    elements: vec![
+                        Expr::List {
+                            elements: vec![int(1), int(2)],
+                            span: Span::dummy()
+                        },
+                        Expr::List {
+                            elements: vec![int(3)],
+                            span: Span::dummy()
+                        },
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
         // Elements may be any expression.
         assert_eq!(
             parse_ok("print [1 + 2, f(3)]").stmts,
             vec![Stmt::Print {
-                expr: Expr::List(vec![
-                    bin(Add, int(1), int(2)),
-                    Expr::Call {
-                        name: "f".to_string(),
-                        args: vec![int(3)],
-                    },
-                ]),
+                span: Span::dummy(),
+                expr: Expr::List {
+                    elements: vec![
+                        bin(Add, int(1), int(2)),
+                        Expr::Call {
+                            span: Span::dummy(),
+                            name: "f".to_string(),
+                            args: vec![int(3)],
+                        },
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
     }
@@ -1317,7 +1513,9 @@ mod tests {
         assert_eq!(
             parse_ok("print xs[0]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("xs")),
                     indices: vec![int(0)],
                 },
@@ -1327,9 +1525,12 @@ mod tests {
         assert_eq!(
             parse_ok("print xs[-1]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("xs")),
                     indices: vec![Expr::Unary {
+                        span: Span::dummy(),
                         op: UnaryOp::Neg,
                         expr: Box::new(int(1)),
                     }],
@@ -1340,8 +1541,11 @@ mod tests {
         assert_eq!(
             parse_ok("print xs[0][1]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(Expr::Index {
+                        span: Span::dummy(),
                         target: Box::new(ident("xs")),
                         indices: vec![int(0)],
                     }),
@@ -1352,8 +1556,11 @@ mod tests {
         assert_eq!(
             parse_ok("print f()[0]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(Expr::Call {
+                        span: Span::dummy(),
                         name: "f".to_string(),
                         args: vec![],
                     }),
@@ -1365,9 +1572,11 @@ mod tests {
         assert_eq!(
             parse_ok("print xs[0] + 1").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(
                     Add,
                     Expr::Index {
+                        span: Span::dummy(),
                         target: Box::new(ident("xs")),
                         indices: vec![int(0)],
                     },
@@ -1380,7 +1589,9 @@ mod tests {
         assert_eq!(
             parse_ok("print a[0, 1]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("a")),
                     indices: vec![int(0), int(1)],
                 },
@@ -1390,14 +1601,18 @@ mod tests {
         assert_eq!(
             parse_ok("print a[-1, -2]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("a")),
                     indices: vec![
                         Expr::Unary {
+                            span: Span::dummy(),
                             op: UnaryOp::Neg,
                             expr: Box::new(int(1)),
                         },
                         Expr::Unary {
+                            span: Span::dummy(),
                             op: UnaryOp::Neg,
                             expr: Box::new(int(2)),
                         },
@@ -1413,9 +1628,12 @@ mod tests {
         assert_eq!(
             parse_ok("print xs[1:4]").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("xs")),
                     indices: vec![Expr::Slice {
+                        span: Span::dummy(),
                         start: Some(Box::new(int(1))),
                         stop: Some(Box::new(int(4))),
                         step: None,
@@ -1452,15 +1670,21 @@ mod tests {
         assert_eq!(
             parse_ok("xs[1:3] = [9, 9]").stmts,
             vec![Stmt::IndexAssign {
+                span: Span::dummy(),
                 target: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("xs")),
                     indices: vec![Expr::Slice {
+                        span: Span::dummy(),
                         start: Some(Box::new(int(1))),
                         stop: Some(Box::new(int(3))),
                         step: None,
                     }],
                 },
-                value: Expr::List(vec![int(9), int(9)]),
+                value: Expr::List {
+                    elements: vec![int(9), int(9)],
+                    span: Span::dummy()
+                },
             }]
         );
     }
@@ -1470,7 +1694,9 @@ mod tests {
         assert_eq!(
             parse_ok("xs[0] = 99").stmts,
             vec![Stmt::IndexAssign {
+                span: Span::dummy(),
                 target: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(ident("xs")),
                     indices: vec![int(0)],
                 },
@@ -1481,8 +1707,11 @@ mod tests {
         assert_eq!(
             parse_ok("m[0][1] = 1 + 2").stmts,
             vec![Stmt::IndexAssign {
+                span: Span::dummy(),
                 target: Expr::Index {
+                    span: Span::dummy(),
                     target: Box::new(Expr::Index {
+                        span: Span::dummy(),
                         target: Box::new(ident("m")),
                         indices: vec![int(0)],
                     }),
@@ -1503,6 +1732,7 @@ mod tests {
         assert_eq!(
             parse_ok("x = 5").stmts,
             vec![Stmt::Assign {
+                span: Span::dummy(),
                 name: "x".to_string(),
                 value: int(5),
             }]
@@ -1510,9 +1740,11 @@ mod tests {
         assert_eq!(
             parse_ok("xs[0] == 5").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: bin(
                     Eq,
                     Expr::Index {
+                        span: Span::dummy(),
                         target: Box::new(ident("xs")),
                         indices: vec![int(0)],
                     },
@@ -1540,31 +1772,53 @@ mod tests {
         assert_eq!(
             parse_ok("print (1, \"a\")").stmts,
             vec![Stmt::Print {
-                expr: Expr::Tuple(vec![int(1), Expr::Str("a".to_string())]),
+                span: Span::dummy(),
+                expr: Expr::Tuple {
+                    elements: vec![
+                        int(1),
+                        Expr::Str {
+                            value: "a".to_string(),
+                            span: Span::dummy()
+                        }
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
         // The empty tuple.
         assert_eq!(
             parse_ok("print ()").stmts,
             vec![Stmt::Print {
-                expr: Expr::Tuple(vec![]),
+                span: Span::dummy(),
+                expr: Expr::Tuple {
+                    elements: vec![],
+                    span: Span::dummy()
+                },
             }]
         );
         // One element with a trailing comma is a tuple...
         assert_eq!(
             parse_ok("print (1,)").stmts,
             vec![Stmt::Print {
-                expr: Expr::Tuple(vec![int(1)]),
+                span: Span::dummy(),
+                expr: Expr::Tuple {
+                    elements: vec![int(1)],
+                    span: Span::dummy()
+                },
             }]
         );
         // ...but without the comma it is just grouping.
         assert_eq!(
             parse_ok("print (1)").stmts,
-            vec![Stmt::Print { expr: int(1) }]
+            vec![Stmt::Print {
+                span: Span::dummy(),
+                expr: int(1)
+            }]
         );
         assert_eq!(
             parse_ok("print (1 + 2)").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(Add, int(1), int(2)),
             }]
         );
@@ -1572,20 +1826,32 @@ mod tests {
         assert_eq!(
             parse_ok("print (1, 2,)").stmts,
             vec![Stmt::Print {
-                expr: Expr::Tuple(vec![int(1), int(2)]),
+                span: Span::dummy(),
+                expr: Expr::Tuple {
+                    elements: vec![int(1), int(2)],
+                    span: Span::dummy()
+                },
             }]
         );
         // Elements may be any expression, including nested tuples.
         assert_eq!(
             parse_ok("print ((1, 2), f(3))").stmts,
             vec![Stmt::Print {
-                expr: Expr::Tuple(vec![
-                    Expr::Tuple(vec![int(1), int(2)]),
-                    Expr::Call {
-                        name: "f".to_string(),
-                        args: vec![int(3)],
-                    },
-                ]),
+                span: Span::dummy(),
+                expr: Expr::Tuple {
+                    elements: vec![
+                        Expr::Tuple {
+                            elements: vec![int(1), int(2)],
+                            span: Span::dummy()
+                        },
+                        Expr::Call {
+                            span: Span::dummy(),
+                            name: "f".to_string(),
+                            args: vec![int(3)],
+                        },
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
     }
@@ -1595,37 +1861,83 @@ mod tests {
         assert_eq!(
             parse_ok("print {\"nome\": \"Giuliano\", \"eta\": 14}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Dict(vec![
-                    (
-                        Expr::Str("nome".to_string()),
-                        Expr::Str("Giuliano".to_string())
-                    ),
-                    (Expr::Str("eta".to_string()), int(14)),
-                ]),
+                span: Span::dummy(),
+                expr: Expr::Dict {
+                    entries: vec![
+                        (
+                            Expr::Str {
+                                value: "nome".to_string(),
+                                span: Span::dummy()
+                            },
+                            Expr::Str {
+                                value: "Giuliano".to_string(),
+                                span: Span::dummy()
+                            }
+                        ),
+                        (
+                            Expr::Str {
+                                value: "eta".to_string(),
+                                span: Span::dummy()
+                            },
+                            int(14)
+                        ),
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
         // The empty braces are the empty dict.
         assert_eq!(
             parse_ok("print {}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Dict(vec![]),
+                span: Span::dummy(),
+                expr: Expr::Dict {
+                    entries: vec![],
+                    span: Span::dummy()
+                },
             }]
         );
         // Keys may be any expression (validated at runtime).
         assert_eq!(
             parse_ok("print {1: \"a\", true: 2}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Dict(vec![
-                    (int(1), Expr::Str("a".to_string())),
-                    (Expr::Bool(true), int(2)),
-                ]),
+                span: Span::dummy(),
+                expr: Expr::Dict {
+                    entries: vec![
+                        (
+                            int(1),
+                            Expr::Str {
+                                value: "a".to_string(),
+                                span: Span::dummy()
+                            }
+                        ),
+                        (
+                            Expr::Bool {
+                                value: true,
+                                span: Span::dummy()
+                            },
+                            int(2)
+                        ),
+                    ],
+                    span: Span::dummy()
+                },
             }]
         );
         // A trailing comma is fine.
         assert_eq!(
             parse_ok("print {\"a\": 1,}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Dict(vec![(Expr::Str("a".to_string()), int(1))]),
+                span: Span::dummy(),
+                expr: Expr::Dict {
+                    entries: vec![(
+                        Expr::Str {
+                            value: "a".to_string(),
+                            span: Span::dummy()
+                        },
+                        int(1)
+                    )],
+                    span: Span::dummy()
+                },
             }]
         );
     }
@@ -1635,20 +1947,35 @@ mod tests {
         assert_eq!(
             parse_ok("print {1, 2, 3}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Set(vec![int(1), int(2), int(3)]),
+                span: Span::dummy(),
+                expr: Expr::Set {
+                    elements: vec![int(1), int(2), int(3)],
+                    span: Span::dummy()
+                },
             }]
         );
         assert_eq!(
             parse_ok("print {\"a\"}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Set(vec![Expr::Str("a".to_string())]),
+                span: Span::dummy(),
+                expr: Expr::Set {
+                    elements: vec![Expr::Str {
+                        value: "a".to_string(),
+                        span: Span::dummy()
+                    }],
+                    span: Span::dummy()
+                },
             }]
         );
         // A trailing comma is fine.
         assert_eq!(
             parse_ok("print {1,}").stmts,
             vec![Stmt::Print {
-                expr: Expr::Set(vec![int(1)]),
+                span: Span::dummy(),
+                expr: Expr::Set {
+                    elements: vec![int(1)],
+                    span: Span::dummy()
+                },
             }]
         );
         // A missing colon in a dict entry is an error...
@@ -1687,6 +2014,7 @@ mod tests {
         assert_eq!(
             parse_ok(src).stmts,
             vec![Stmt::Class {
+                span: Span::dummy(),
                 name: "Persona".to_string(),
                 parent: None,
                 methods: vec![
@@ -1695,15 +2023,23 @@ mod tests {
                         params: vec!["self".to_string(), "nome".to_string(), "eta".to_string()],
                         body: vec![
                             Stmt::FieldAssign {
+                                span: Span::dummy(),
                                 target: Expr::Field {
-                                    target: Box::new(Expr::SelfExpr),
+                                    span: Span::dummy(),
+                                    target: Box::new(Expr::SelfExpr {
+                                        span: Span::dummy()
+                                    }),
                                     name: "nome".to_string(),
                                 },
                                 value: ident("nome"),
                             },
                             Stmt::FieldAssign {
+                                span: Span::dummy(),
                                 target: Expr::Field {
-                                    target: Box::new(Expr::SelfExpr),
+                                    span: Span::dummy(),
+                                    target: Box::new(Expr::SelfExpr {
+                                        span: Span::dummy()
+                                    }),
                                     name: "eta".to_string(),
                                 },
                                 value: ident("eta"),
@@ -1714,8 +2050,12 @@ mod tests {
                         name: "saluta".to_string(),
                         params: vec!["self".to_string()],
                         body: vec![Stmt::Print {
+                            span: Span::dummy(),
                             expr: Expr::Field {
-                                target: Box::new(Expr::SelfExpr),
+                                span: Span::dummy(),
+                                target: Box::new(Expr::SelfExpr {
+                                    span: Span::dummy()
+                                }),
                                 name: "nome".to_string(),
                             },
                         }],
@@ -1730,6 +2070,7 @@ mod tests {
         assert_eq!(
             parse_ok("class Studente extends Persona\nend").stmts,
             vec![Stmt::Class {
+                span: Span::dummy(),
                 name: "Studente".to_string(),
                 parent: Some("Persona".to_string()),
                 methods: vec![],
@@ -1738,6 +2079,7 @@ mod tests {
         assert_eq!(
             parse_ok("class Vuota\nend").stmts,
             vec![Stmt::Class {
+                span: Span::dummy(),
                 name: "Vuota".to_string(),
                 parent: None,
                 methods: vec![],
@@ -1751,7 +2093,9 @@ mod tests {
         assert_eq!(
             parse_ok("print p.nome").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Field {
+                    span: Span::dummy(),
                     target: Box::new(ident("p")),
                     name: "nome".to_string(),
                 },
@@ -1761,10 +2105,15 @@ mod tests {
         assert_eq!(
             parse_ok("print p.saluta(\"ciao\")").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::MethodCall {
+                    span: Span::dummy(),
                     target: Box::new(ident("p")),
                     name: "saluta".to_string(),
-                    args: vec![Expr::Str("ciao".to_string())],
+                    args: vec![Expr::Str {
+                        value: "ciao".to_string(),
+                        span: Span::dummy()
+                    }],
                 },
             }]
         );
@@ -1772,9 +2121,14 @@ mod tests {
         assert_eq!(
             parse_ok("print self.amico.nome").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: Expr::Field {
+                    span: Span::dummy(),
                     target: Box::new(Expr::Field {
-                        target: Box::new(Expr::SelfExpr),
+                        span: Span::dummy(),
+                        target: Box::new(Expr::SelfExpr {
+                            span: Span::dummy()
+                        }),
                         name: "amico".to_string(),
                     }),
                     name: "nome".to_string(),
@@ -1784,8 +2138,11 @@ mod tests {
         assert_eq!(
             parse_ok("a.b.c()").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: Expr::MethodCall {
+                    span: Span::dummy(),
                     target: Box::new(Expr::Field {
+                        span: Span::dummy(),
                         target: Box::new(ident("a")),
                         name: "b".to_string(),
                     }),
@@ -1798,7 +2155,9 @@ mod tests {
         assert_eq!(
             parse_ok("super.init(nome, eta)").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: Expr::SuperCall {
+                    span: Span::dummy(),
                     name: "init".to_string(),
                     args: vec![ident("nome"), ident("eta")],
                 },
@@ -1808,9 +2167,11 @@ mod tests {
         assert_eq!(
             parse_ok("print p.nome + 1").stmts,
             vec![Stmt::Print {
+                span: Span::dummy(),
                 expr: bin(
                     Add,
                     Expr::Field {
+                        span: Span::dummy(),
                         target: Box::new(ident("p")),
                         name: "nome".to_string(),
                     },
@@ -1825,18 +2186,27 @@ mod tests {
         assert_eq!(
             parse_ok("p.nome = \"Giuliano\"").stmts,
             vec![Stmt::FieldAssign {
+                span: Span::dummy(),
                 target: Expr::Field {
+                    span: Span::dummy(),
                     target: Box::new(ident("p")),
                     name: "nome".to_string(),
                 },
-                value: Expr::Str("Giuliano".to_string()),
+                value: Expr::Str {
+                    value: "Giuliano".to_string(),
+                    span: Span::dummy()
+                },
             }]
         );
         assert_eq!(
             parse_ok("self.eta = eta + 1").stmts,
             vec![Stmt::FieldAssign {
+                span: Span::dummy(),
                 target: Expr::Field {
-                    target: Box::new(Expr::SelfExpr),
+                    span: Span::dummy(),
+                    target: Box::new(Expr::SelfExpr {
+                        span: Span::dummy()
+                    }),
                     name: "eta".to_string(),
                 },
                 value: bin(Add, ident("eta"), int(1)),
@@ -1846,13 +2216,18 @@ mod tests {
         assert_eq!(
             parse_ok("p.nome == \"x\"").stmts,
             vec![Stmt::ExprStmt {
+                span: Span::dummy(),
                 expr: bin(
                     Eq,
                     Expr::Field {
+                        span: Span::dummy(),
                         target: Box::new(ident("p")),
                         name: "nome".to_string(),
                     },
-                    Expr::Str("x".to_string()),
+                    Expr::Str {
+                        value: "x".to_string(),
+                        span: Span::dummy()
+                    },
                 ),
             }]
         );
@@ -1861,8 +2236,11 @@ mod tests {
         assert_eq!(
             parse_ok("f().nome = 1").stmts,
             vec![Stmt::FieldAssign {
+                span: Span::dummy(),
                 target: Expr::Field {
+                    span: Span::dummy(),
                     target: Box::new(Expr::Call {
+                        span: Span::dummy(),
                         name: "f".to_string(),
                         args: vec![],
                     }),
@@ -1964,6 +2342,7 @@ mod tests {
         assert_eq!(
             parse_ok("import math").stmts,
             vec![Stmt::Import {
+                span: Span::dummy(),
                 name: "math".to_string(),
                 alias: None,
             }]
@@ -1971,6 +2350,7 @@ mod tests {
         assert_eq!(
             parse_ok("import math as m").stmts,
             vec![Stmt::Import {
+                span: Span::dummy(),
                 name: "math".to_string(),
                 alias: Some("m".to_string()),
             }]
@@ -1981,14 +2361,17 @@ mod tests {
             parse_ok("let x = 1; import a\nimport b as c").stmts,
             vec![
                 Stmt::Let {
+                    span: Span::dummy(),
                     name: "x".to_string(),
                     value: int(1),
                 },
                 Stmt::Import {
+                    span: Span::dummy(),
                     name: "a".to_string(),
                     alias: None,
                 },
                 Stmt::Import {
+                    span: Span::dummy(),
                     name: "b".to_string(),
                     alias: Some("c".to_string()),
                 },
@@ -2059,5 +2442,112 @@ mod tests {
         assert!(!parse_err("let = 5").is_incomplete());
         assert!(!parse_err("end").is_incomplete());
         assert!(!parse_err("let x = 1 let y = 2").is_incomplete());
+    }
+
+    // ----- Phase 16: spans -----
+
+    #[test]
+    fn spans_point_at_the_opening_token() {
+        let prog = parse_ok("let x = 10\nif x > 5 then\n    print \"big\"\nend\n");
+        let [let_stmt, if_stmt] = prog.stmts.as_slice() else {
+            panic!("expected two statements");
+        };
+        let Stmt::Let { span, value, .. } = let_stmt else {
+            panic!("expected a let");
+        };
+        assert_eq!(*span, Span::new(1, 1));
+        assert_eq!(value.span(), Span::new(1, 9));
+        let Stmt::If {
+            span,
+            cond,
+            then_block,
+            ..
+        } = if_stmt
+        else {
+            panic!("expected an if");
+        };
+        assert_eq!(*span, Span::new(2, 1));
+        // The `>` operator, not the `if`.
+        assert_eq!(cond.span(), Span::new(2, 6));
+        let [Stmt::Print { span, expr, .. }] = then_block.as_slice() else {
+            panic!("expected one print");
+        };
+        assert_eq!(*span, Span::new(3, 5));
+        assert_eq!(expr.span(), Span::new(3, 11));
+    }
+
+    #[test]
+    fn binary_and_unary_spans_are_the_operator() {
+        let prog = parse_ok("print 1 + 2\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 9));
+        let prog = parse_ok("print -x\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 7));
+        // A nested binary: the outer `*` is at col 15, the inner `+` at 10.
+        let prog = parse_ok("print (1 + 2) * 3\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 15));
+        let Expr::Binary { left, .. } = expr else {
+            panic!("expected a binary");
+        };
+        assert_eq!(left.span(), Span::new(1, 10));
+    }
+
+    #[test]
+    fn call_index_field_and_method_spans() {
+        let prog = parse_ok("print f(1)\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 7));
+        let prog = parse_ok("print xs[0]\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 9));
+        let prog = parse_ok("print p.nome\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 9));
+        let prog = parse_ok("print p.saluta()\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 9));
+        // A slice's span is its first `:`.
+        let prog = parse_ok("print a[1:3]\n");
+        let [Stmt::Print { expr, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a print");
+        };
+        assert_eq!(expr.span(), Span::new(1, 8));
+        let Expr::Index { indices, .. } = expr else {
+            panic!("expected an index");
+        };
+        assert_eq!(indices[0].span(), Span::new(1, 10));
+    }
+
+    #[test]
+    fn spans_follow_the_source_lines() {
+        let prog = parse_ok("fn f(a)\n    return a + 1\nend\n");
+        let [Stmt::Fn { span, body, .. }] = prog.stmts.as_slice() else {
+            panic!("expected a fn");
+        };
+        assert_eq!(*span, Span::new(1, 1));
+        let [Stmt::Return { span, expr, .. }] = body.as_slice() else {
+            panic!("expected a return");
+        };
+        assert_eq!(*span, Span::new(2, 5));
+        let Some(expr) = expr else {
+            panic!("expected a return value");
+        };
+        assert_eq!(expr.span(), Span::new(2, 14));
     }
 }

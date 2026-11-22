@@ -92,6 +92,7 @@ const LINALG_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
     ("solve", Arity::Exact(2), crate::linalg::solve),
     ("det", Arity::Exact(1), crate::linalg::det),
     ("inv", Arity::Exact(1), crate::linalg::inv),
+    ("rank", Arity::Exact(1), crate::linalg::rank),
 ];
 
 /// A number as an f64, or a clear error naming the function.

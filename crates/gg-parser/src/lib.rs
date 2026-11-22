@@ -32,4 +32,5 @@ pub mod ast;
 mod parser;
 
 pub use ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+pub use gg_lexer::Span;
 pub use parser::{ParserError, parse};

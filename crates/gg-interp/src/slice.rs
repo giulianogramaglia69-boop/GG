@@ -11,6 +11,8 @@
 //! sub-array. Boolean indexing `a[mask]` keeps the elements where
 //! the mask (same shape, Bool elements) is true, flattened to 1D.
 
+use gg_lexer::Span;
+
 use crate::array::{fmt_shape, make_array, resolve_axis};
 use crate::error::RuntimeError;
 use crate::value::{ArrayData, Value};
@@ -37,20 +39,23 @@ impl SliceSpec {
 }
 
 /// One axis of an array selection: a single index, or a slice.
+/// The span is the position of the index expression (or slice)
+/// on that axis, so an out-of-range index points at it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AxisSelector {
-    Index(Value),
-    Slice(SliceSpec),
+    Index(Value, Span),
+    Slice(SliceSpec, Span),
 }
 
 /// One evaluated index argument: a plain value, or a slice with
 /// its bounds already evaluated to integers (or `None` for the
 /// default). The interpreter builds these from an `Index` node's
-/// index expressions.
+/// index expressions; the span is the position of that index
+/// expression, so an out-of-range index points at it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexArg {
-    Value(Value),
-    Slice(SliceSpec),
+    Value(Value, Span),
+    Slice(SliceSpec, Span),
 }
 
 /// The positions a slice selects in a collection of `len`
@@ -121,12 +126,13 @@ pub fn slice_array(data: &ArrayData, selectors: &[AxisSelector]) -> Result<Value
     let mut out_shape: Vec<usize> = Vec::new();
     for (axis, selector) in selectors.iter().enumerate() {
         match selector {
-            AxisSelector::Index(index) => {
-                let pos = resolve_axis(data.shape[axis], index.clone(), "array")?;
+            AxisSelector::Index(index, span) => {
+                let pos = resolve_axis(data.shape[axis], index.clone(), "array")
+                    .map_err(|e| e.at(*span))?;
                 positions_per_axis.push(vec![pos]);
             }
-            AxisSelector::Slice(spec) => {
-                let positions = slice_positions(data.shape[axis], spec)?;
+            AxisSelector::Slice(spec, span) => {
+                let positions = slice_positions(data.shape[axis], spec).map_err(|e| e.at(*span))?;
                 out_shape.push(positions.len());
                 positions_per_axis.push(positions);
             }

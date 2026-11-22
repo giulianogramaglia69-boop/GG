@@ -414,6 +414,87 @@ mod tests {
         assert!(run_err("print z\n").starts_with("runtime error:"));
     }
 
+    // ---- Phase 16: runtime errors carry line and column ----
+
+    #[test]
+    fn runtime_errors_carry_line_and_column() {
+        // Undefined variable: the identifier's position.
+        assert_eq!(
+            run_err("print z\n"),
+            "runtime error: 1:7: undefined variable 'z'"
+        );
+        // Assignment to an undefined variable: the variable's position.
+        assert_eq!(
+            run_err("x = 5\n"),
+            "runtime error: 1:1: undefined variable 'x'"
+        );
+        // Division by zero: the `/` operator's position.
+        assert_eq!(
+            run_err("print 1 / 0\n"),
+            "runtime error: 1:9: division by zero"
+        );
+        // A type error: the operator's position.
+        assert_eq!(
+            run_err("print 1 + \"a\"\n"),
+            "runtime error: 1:9: cannot add Int and Str"
+        );
+        // A wrong call: the function name's position.
+        assert_eq!(
+            run_err("fn f(a)\n    return a\nend\nprint f(1, 2)\n"),
+            "runtime error: 4:7: expected 1 argument(s) but got 2"
+        );
+        // Return outside a function: the `return` keyword's position.
+        assert_eq!(
+            run_err("return 1\n"),
+            "runtime error: 1:1: return outside function"
+        );
+    }
+
+    #[test]
+    fn runtime_error_positions_follow_the_failing_line() {
+        // Index out of range: the index expression's position.
+        assert_eq!(
+            run_err("let xs = [1]\nprint xs[5]\n"),
+            "runtime error: 2:10: list index out of range"
+        );
+        // An index assignment out of range: the same index.
+        assert_eq!(
+            run_err("let xs = [1]\nxs[5] = 2\n"),
+            "runtime error: 2:4: list index out of range"
+        );
+        // for-in over a non-iterable: the iterable's position.
+        assert_eq!(
+            run_err("for x in 5 then\n    print x\nend\n"),
+            "runtime error: 1:10: Int is not iterable"
+        );
+        // An error inside a function points inside the function,
+        // not at the call site.
+        assert_eq!(
+            run_err("fn f()\n    return 1 / 0\nend\nf()\n"),
+            "runtime error: 2:14: division by zero"
+        );
+        // A wrong method call: the method name's position.
+        assert_eq!(
+            run_err("let xs = [1]\nprint xs.nope()\n"),
+            "runtime error: 2:10: cannot call method 'nope' on List"
+        );
+    }
+
+    #[test]
+    fn linalg_singular_error_points_at_the_call() {
+        let singular = "reshape(array([1, 2, 2, 4]), [2, 2])";
+        assert_eq!(
+            run_err(&format!(
+                "import linalg\nprint linalg.solve({singular}, array([3, 6]))\n"
+            )),
+            "runtime error: 2:14: linalg.solve(): singular matrix (determinant is zero)"
+        );
+        assert_eq!(
+            run_err(&format!("import linalg\nprint linalg.inv({singular})\n")),
+            "runtime error: 2:14: linalg.inv(): singular matrix (determinant is zero)"
+        );
+    }
+
     // ---- Phase 4: builtins ----
 
     #[test]
@@ -2102,11 +2183,13 @@ mod tests {
         write_module(&dir, "badlex", "print \"oops\n");
         let err = run_with_err("import badlex\n", Some(dir.clone()), vec![]);
         assert!(err.contains("module 'badlex': lex error:"), "{err}");
-        // A runtime error inside a module names it too.
+        // A runtime error inside a module names it too, with the
+        // position inside the module's source (`undefined_var` is
+        // at line 1, col 7 of badrt.gg).
         write_module(&dir, "badrt", "print undefined_var\n");
         let err = run_with_err("import badrt\n", Some(dir.clone()), vec![]);
         assert!(
-            err.contains("module 'badrt': undefined variable 'undefined_var'"),
+            err.contains("module 'badrt': 1:7: undefined variable 'undefined_var'"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2456,6 +2539,77 @@ mod tests {
                 "import linalg\nprint linalg.det(reshape(array([\"a\", \"b\", \"c\", \"d\"]), [2, 2]))\n"
             )
             .contains("expects numbers, not array of Str")
+        );
+    }
+
+    // ---- Phase 18: linalg.rank ----
+
+    #[test]
+    fn linalg_rank() {
+        // Identity 3x3: full rank. A zero matrix: rank 0.
+        let src = "import linalg\nprint linalg.rank(reshape(array([1, 0, 0, 0, 1, 0, 0, 0, 1]), [3, 3]))\n";
+        assert_eq!(run_ok(src), "3\n");
+        let src = "import linalg\nprint linalg.rank(reshape(array([0, 0, 0, 0]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "0\n");
+        // Dependent rows: [[1, 2], [2, 4]] has rank 1.
+        let src = "import linalg\nprint linalg.rank(reshape(array([1, 2, 2, 4]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "1\n");
+        // Rectangular matrices: rank is at most min(rows, cols).
+        // A 2x3 with independent rows has rank 2; a 3x2 with
+        // independent columns has rank 2; with a dependent row,
+        // rank 1.
+        let src = "import linalg\nprint linalg.rank(reshape(array([1, 2, 3, 4, 5, 6]), [2, 3]))\n";
+        assert_eq!(run_ok(src), "2\n");
+        let src = "import linalg\nprint linalg.rank(reshape(array([1, 2, 3, 4, 5, 6]), [3, 2]))\n";
+        assert_eq!(run_ok(src), "2\n");
+        let src = "import linalg\nprint linalg.rank(reshape(array([1, 2, 2, 4, 0, 1]), [3, 2]))\n";
+        assert_eq!(run_ok(src), "2\n");
+        let src = "import linalg\nprint linalg.rank(reshape(array([1, 2, 2, 4, 3, 6]), [3, 2]))\n";
+        assert_eq!(run_ok(src), "1\n");
+        // A pivot below the 1e-12 tolerance counts as zero:
+        // [[1e-13, 0], [0, 1]] has rank 1, not 2.
+        let src = "import linalg\nprint linalg.rank(reshape(array([0.0000000000001, 0.0, 0.0, 1.0]), [2, 2]))\n";
+        assert_eq!(run_ok(src), "1\n");
+        // An empty matrix (0 rows) has rank 0. GG cannot build
+        // one from `array([])` (no element type to infer), so
+        // this is checked on `matrix_rank` directly.
+        use crate::array::make_array;
+        use crate::linalg::matrix_rank;
+        use crate::value::ElemType;
+        let empty = make_array(ElemType::Int, vec![0, 3], vec![]);
+        let Value::Array(empty_data) = &empty else {
+            unreachable!()
+        };
+        assert_eq!(matrix_rank(&empty_data.borrow()).unwrap(), 0);
+        // Rank tells an indeterminate system from an impossible
+        // one: x + y = 2, 2x + 2y = 4 is indeterminate
+        // (rank(A) == rank([A|b]) == 1 < 2 unknowns), while
+        // x + y = 2, 2x + 2y = 5 is impossible
+        // (rank(A) == 1 < rank([A|b]) == 2).
+        let a = "reshape(array([1, 1, 2, 2]), [2, 2])";
+        let aug_ind = "reshape(array([1, 1, 2, 2, 2, 4]), [2, 3])";
+        let aug_imp = "reshape(array([1, 1, 2, 2, 2, 5]), [2, 3])";
+        let src = format!("import linalg\nprint linalg.rank({a})\nprint linalg.rank({aug_ind})\n");
+        assert_eq!(run_ok(&src), "1\n1\n");
+        let src = format!("import linalg\nprint linalg.rank({a})\nprint linalg.rank({aug_imp})\n");
+        assert_eq!(run_ok(&src), "1\n2\n");
+        // Errors: not 2D, not numbers, not an array.
+        assert!(
+            run_err("import linalg\nprint linalg.rank(array([1, 2, 3]))\n")
+                .contains("expects a 2D Array, not shape [3]")
+        );
+        assert!(
+            run_err(
+                "import linalg\nprint linalg.rank(reshape(array([\"a\", \"b\", \"c\", \"d\"]), [2, 2]))\n"
+            )
+            .contains("expects numbers, not array of Str")
+        );
+        assert!(
+            run_err("import linalg\nprint linalg.rank([1, 2])\n")
+                .contains("expects an Array, not List")
+        );
+        assert!(
+            run_err("import linalg\nprint linalg.rank(5)\n").contains("expects an Array, not Int")
         );
     }
 
