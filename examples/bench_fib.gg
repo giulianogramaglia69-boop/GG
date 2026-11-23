@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Benchmark: recursive function calls (fib), to compare the
+# tree-walking interpreter with the bytecode VM. Run with:
+#
+#   GG_BACKEND=tree time gg run examples/bench_fib.gg
+#   GG_BACKEND=vm   time gg run examples/bench_fib.gg
+#
+# (Use a release build for meaningful numbers: `cargo build --release`.)
+
+fn fib(n)
+    if n < 2 then
+        return n
+    end
+    return fib(n - 1) + fib(n - 2)
+end
+
+print fib(26)

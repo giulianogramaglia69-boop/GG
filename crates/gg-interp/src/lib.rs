@@ -19,6 +19,7 @@ pub mod slice;
 pub mod stdlib;
 pub mod value;
 pub mod venv;
+pub mod vm;
 
 use std::fmt;
 use std::io::{BufRead, Write};
@@ -29,6 +30,7 @@ pub use interp::Interpreter;
 pub use repl::{ReplSession, print_welcome, run_repl, run_repl_with_venv};
 pub use value::Value;
 pub use venv::{create_venv, venv_dirs_from_env, venv_lib_dir};
+pub use vm::Backend;
 
 use gg_lexer::LexerError;
 use gg_parser::ParserError;

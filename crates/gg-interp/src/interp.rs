@@ -28,6 +28,7 @@ use crate::value::{
     BoundMethod, ClassDef, DictData, Function, GeneratorData, InstanceData, ModuleData, Value,
     elem_type_of, lookup_method, values_equal,
 };
+use crate::vm::Backend;
 
 /// What executing a statement produced: either control flows on
 /// normally, or a `return` was hit with its value.
@@ -55,7 +56,7 @@ struct YieldMode {
 /// block, a loop, a `try`, a `match` case — but not inside a nested
 /// function or class: those are functions of their own, with
 /// their own generator status.
-fn body_contains_yield(stmts: &[Stmt]) -> bool {
+pub(crate) fn body_contains_yield(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
         Stmt::Yield { .. } => true,
         Stmt::If {
@@ -113,7 +114,7 @@ fn pattern_literal_value(expr: &Expr) -> Value {
 /// A structural mismatch (a list pattern against a list of a
 /// different length, a list pattern against a tuple) is simply
 /// no match, never an error — the next `case` is tried.
-fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
+pub(crate) fn match_pattern(pattern: &Pattern, value: &Value) -> Option<Vec<(String, Value)>> {
     match pattern {
         Pattern::Literal(expr) => {
             let literal = pattern_literal_value(expr);
@@ -189,7 +190,7 @@ impl CallArgs {
 /// - Queue, Stack: the elements, front to back / bottom to top.
 ///
 /// Anything else is a runtime error: `Int is not iterable`.
-fn iterable_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
+pub(crate) fn iterable_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
     match value {
         Value::List(list) => Ok(list.borrow().clone()),
         Value::Tuple(items) => Ok(items.as_ref().clone()),
@@ -227,7 +228,7 @@ fn iterable_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
 /// 1D array, the rows of a 2D+ array. Anything else — a set, a
 /// dict, a string, a number — is an error: only lists, tuples
 /// and arrays can be spread.
-fn spread_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
+pub(crate) fn spread_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
     match value {
         Value::List(_) | Value::Tuple(_) | Value::Array(_) => iterable_items(value),
         other => Err(RuntimeError::new(format!(
@@ -252,7 +253,7 @@ fn spread_items(value: &Value) -> Result<Vec<Value>, RuntimeError> {
 /// duplicate), then the total count for a function with neither
 /// defaults nor a rest parameter, then the missing required
 /// arguments (filled from defaults where there is one).
-fn bind_arguments(
+pub(crate) fn bind_arguments(
     params: &[String],
     defaults: &[Option<Value>],
     rest: Option<&str>,
@@ -359,7 +360,10 @@ fn bind_arguments(
 /// one variable takes the item itself; two variables unpack a
 /// 2-tuple, a 2-list, or a 2-element 1D array. The scope is fresh
 /// per item, so the variable never leaks out of the comprehension.
-fn bind_comp_vars(
+/// Bind comprehension variables in a fresh child scope: one
+/// variable takes the item whole, two unpack a 2-tuple / 2-list
+/// / 2-element array (the tree-walker's version).
+pub(crate) fn bind_comp_vars(
     vars: &[String],
     item: Value,
     env: &Rc<Environment>,
@@ -370,6 +374,31 @@ fn bind_comp_vars(
         child.define(&vars[0], item);
         return Ok(child);
     }
+    let pair = unpack_pair(item, span)?;
+    child.define(&vars[0], pair[0].clone());
+    child.define(&vars[1], pair[1].clone());
+    Ok(child)
+}
+
+/// Bind comprehension variables to slots (the VM's version of
+/// `bind_comp_vars`): one variable takes the item whole, two
+/// unpack a 2-tuple / 2-list / 2-element array. Returns the
+/// (slot, value) pairs, in variable order.
+pub(crate) fn bind_comp_slots(
+    vars: &[usize],
+    item: Value,
+    span: Span,
+) -> Result<Vec<(usize, Value)>, RuntimeError> {
+    if vars.len() == 1 {
+        return Ok(vec![(vars[0], item)]);
+    }
+    let pair = unpack_pair(item, span)?;
+    Ok(vec![(vars[0], pair[0].clone()), (vars[1], pair[1].clone())])
+}
+
+/// Unpack `item` into a 2-element pair (a 2-tuple, 2-list or
+/// 2-element array), or fail with the comprehension's error.
+fn unpack_pair(item: Value, span: Span) -> Result<Vec<Value>, RuntimeError> {
     let pair: Option<Vec<Value>> = match &item {
         Value::Tuple(items) if items.len() == 2 => Some(items.as_ref().clone()),
         Value::List(list) if list.borrow().len() == 2 => Some(list.borrow().clone()),
@@ -390,9 +419,7 @@ fn bind_comp_vars(
         ))
         .at(span));
     };
-    child.define(&vars[0], pair[0].clone());
-    child.define(&vars[1], pair[1].clone());
-    Ok(child)
+    Ok(pair)
 }
 
 /// The interpreter. One instance keeps a global environment across
@@ -422,8 +449,14 @@ fn bind_comp_vars(
 /// replay when it reaches it. It is `None` outside a replay, and
 /// saved/restored around a nested `next()` (a generator body
 /// pulling from another generator).
+///
+/// `backend` selects the execution engine: the bytecode VM
+/// (default) or the tree-walker. The tree-walker stays as a
+/// fallback, and every public entry point dispatches on it, so
+/// both engines run the same programs with the same results.
 pub struct Interpreter {
     globals: Rc<Environment>,
+    backend: Backend,
     super_stack: Vec<Rc<ClassDef>>,
     venv_dirs: Vec<PathBuf>,
     loading: Vec<PathBuf>,
@@ -448,6 +481,7 @@ impl Interpreter {
         builtin::define_all(&globals);
         Self {
             globals,
+            backend: Backend::from_env(),
             super_stack: Vec::new(),
             venv_dirs: Vec::new(),
             loading: Vec::new(),
@@ -459,6 +493,23 @@ impl Interpreter {
             #[cfg(feature = "gui")]
             gui_running: false,
         }
+    }
+
+    /// The execution engine in use (the bytecode VM by default;
+    /// see `Backend::from_env`).
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// The global scope (shared by the VM's top-level frames).
+    pub(crate) fn globals(&self) -> Rc<Environment> {
+        Rc::clone(&self.globals)
+    }
+
+    /// Switch the execution engine. The tree-walker stays as a
+    /// fallback: `GG_BACKEND=tree` (or this setter) selects it.
+    pub fn set_backend(&mut self, backend: Backend) {
+        self.backend = backend;
     }
 
     /// The `lib/` directories `import` searches (after the
@@ -511,20 +562,57 @@ impl Interpreter {
 
     /// Evaluate one expression in the global environment and return
     /// its value. Used by the REPL to echo expression results.
+    /// Dispatches on the backend: the VM compiles the expression,
+    /// the tree-walker evaluates it.
     pub fn eval(
         &mut self,
         expr: &Expr,
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
-        let globals = Rc::clone(&self.globals);
-        self.eval_expr(expr, &globals, input, out)
+        match self.backend {
+            Backend::Vm => self.eval_vm(expr, input, out),
+            Backend::Tree => {
+                let globals = Rc::clone(&self.globals);
+                self.eval_expr(expr, &globals, input, out)
+            }
+        }
     }
 
     /// Run a whole program. `print` output goes to `out`, `input`
     /// reads from `input`. A `return` at the top level is a runtime
-    /// error.
+    /// error. Dispatches on the backend: the VM compiles the
+    /// program first, the tree-walker executes the AST.
     pub fn run(
+        &mut self,
+        program: &Program,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.run_vm(program, input, out),
+            Backend::Tree => self.run_tree(program, input, out),
+        }
+    }
+
+    /// Run one REPL chunk. Like `run`, except the VM compiles
+    /// the chunk with its top level name-based: a `let` at the
+    /// top level defines a global in the environment, so the
+    /// next chunk still sees it.
+    pub fn run_repl_chunk(
+        &mut self,
+        program: &Program,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.run_repl_chunk_vm(program, input, out),
+            Backend::Tree => self.run(program, input, out),
+        }
+    }
+
+    /// The tree-walking half of `run`.
+    fn run_tree(
         &mut self,
         program: &Program,
         input: &mut dyn BufRead,
@@ -661,6 +749,11 @@ impl Interpreter {
                         // Methods get their `super` context from the
                         // call, not from where the class is defined.
                         super_class: None,
+                        // The VM compiles the method when it is
+                        // defined (see `MakeClass`); the tree
+                        // path leaves it uncompiled.
+                        code: None,
+                        upvalues: Vec::new(),
                     });
                     if let Some(slot) = def_methods.iter_mut().find(|(n, _)| *n == method.name) {
                         slot.1 = Rc::clone(&function);
@@ -818,6 +911,8 @@ impl Interpreter {
                     body: body.clone(),
                     env: Rc::clone(env),
                     super_class: self.super_stack.last().cloned(),
+                    code: None,
+                    upvalues: Vec::new(),
                 };
                 env.define(name, Value::Function(Rc::new(function)));
                 Ok(Flow::Normal)
@@ -1117,6 +1212,8 @@ impl Interpreter {
                     }],
                     env: Rc::clone(env),
                     super_class: self.super_stack.last().cloned(),
+                    code: None,
+                    upvalues: Vec::new(),
                 };
                 Ok(Value::Function(Rc::new(function)))
             }
@@ -1274,8 +1371,24 @@ impl Interpreter {
     /// (which creates an instance).
     /// Call any callable value (a GG function, a builtin, a bound
     /// method, a class): the single entry point the GUI module uses
-    /// to run frame functions and layout callbacks.
+    /// to run frame functions and layout callbacks. Dispatches on
+    /// the backend: user functions run on the VM or the
+    /// tree-walker, builtins and classes the same way in both.
     pub(crate) fn call_value(
+        &mut self,
+        callee: &Value,
+        args: CallArgs,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.call_value_vm(callee, args, input, out),
+            Backend::Tree => self.call_value_tree(callee, args, input, out),
+        }
+    }
+
+    /// The tree-walking half of `call_value`.
+    fn call_value_tree(
         &mut self,
         callee: &Value,
         args: CallArgs,
@@ -1284,40 +1397,7 @@ impl Interpreter {
     ) -> Result<Value, RuntimeError> {
         match callee {
             Value::Function(function) => self.call(function, args, input, out),
-            Value::Builtin(builtin) => {
-                // Builtins stay positional in this phase: a
-                // keyword argument is a clear error, not a
-                // silent ignore.
-                if !args.kwargs.is_empty() {
-                    return Err(RuntimeError::new(format!(
-                        "builtin '{}' does not accept keyword arguments",
-                        builtin.name
-                    )));
-                }
-                if !builtin.arity.accepts(args.positional.len()) {
-                    return Err(RuntimeError::new(format!(
-                        "{}() expects {} argument(s) but got {}",
-                        builtin.name,
-                        builtin.arity.describe(),
-                        args.positional.len()
-                    )));
-                }
-                // `str` on an instance with a custom `str` method
-                // uses it (see `display`); anything else goes to
-                // the builtin itself.
-                if builtin.name == "str"
-                    && matches!(args.positional.first(), Some(Value::Instance(_)))
-                {
-                    return Ok(Value::Str(self.display(&args.positional[0], input, out)?));
-                }
-                // Plain builtins are Rust functions; `WithInterp`
-                // builtins (the `gui` module) get the interpreter
-                // so they can call GG code back.
-                match &builtin.func {
-                    BuiltinFunc::Plain(func) => func(&args.positional, input, out),
-                    BuiltinFunc::WithInterp(func) => func(self, &args.positional, input, out),
-                }
-            }
+            Value::Builtin(builtin) => self.call_builtin(builtin, args, input, out),
             Value::BoundMethod(bound) => self.call_method(bound, args, input, out),
             Value::Class(class) => self.construct(class, args, input, out),
             other => Err(RuntimeError::new(format!(
@@ -1327,10 +1407,69 @@ impl Interpreter {
         }
     }
 
+    /// Call a builtin value: keyword arguments are an error
+    /// (builtins stay positional), then the arity check, then the
+    /// `str` special case (an instance with a custom `str` method
+    /// uses it — see `display`), then the Rust implementation.
+    /// Plain builtins are Rust functions; `WithInterp` builtins
+    /// (the `gui` module, `next`) get the interpreter so they can
+    /// call GG code back. Shared by both backends.
+    pub(crate) fn call_builtin(
+        &mut self,
+        builtin: &Rc<crate::builtin::Builtin>,
+        args: CallArgs,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        // Builtins stay positional in this phase: a keyword
+        // argument is a clear error, not a silent ignore.
+        if !args.kwargs.is_empty() {
+            return Err(RuntimeError::new(format!(
+                "builtin '{}' does not accept keyword arguments",
+                builtin.name
+            )));
+        }
+        if !builtin.arity.accepts(args.positional.len()) {
+            return Err(RuntimeError::new(format!(
+                "{}() expects {} argument(s) but got {}",
+                builtin.name,
+                builtin.arity.describe(),
+                args.positional.len()
+            )));
+        }
+        // `str` on an instance with a custom `str` method uses it
+        // (see `display`); anything else goes to the builtin itself.
+        if builtin.name == "str" && matches!(args.positional.first(), Some(Value::Instance(_))) {
+            return Ok(Value::Str(self.display(&args.positional[0], input, out)?));
+        }
+        match &builtin.func {
+            BuiltinFunc::Plain(func) => func(&args.positional, input, out),
+            BuiltinFunc::WithInterp(func) => func(self, &args.positional, input, out),
+        }
+    }
+
+    /// Call a user function on the active backend. The
+    /// tree-walker and the VM agree on arguments, defaults and
+    /// generator detection; only the body execution differs.
+    /// Used where a plain function value is called without going
+    /// through `call_value` (an unbound method call).
+    fn call_function(
+        &mut self,
+        function: &Rc<Function>,
+        args: CallArgs,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.call_vm(function, args, input, out),
+            Backend::Tree => self.call(function, args, input, out),
+        }
+    }
+
     /// Read a field or method from a value. On an instance, fields
     /// win over methods; on a class, a method is returned unbound
     /// (call it with the instance as its first argument).
-    fn get_field(&mut self, obj: &Value, name: &str) -> Result<Value, RuntimeError> {
+    pub(crate) fn get_field(&mut self, obj: &Value, name: &str) -> Result<Value, RuntimeError> {
         match obj {
             Value::Instance(inst) => {
                 if let Some(value) = inst.borrow().get_field(name) {
@@ -1379,7 +1518,7 @@ impl Interpreter {
     /// a field holding a function wins over a method (fields are
     /// checked first, like for plain field access); on a class the
     /// method is unbound, so the caller passes `self` explicitly.
-    fn call_method_on(
+    pub(crate) fn call_method_on(
         &mut self,
         obj: &Value,
         name: &str,
@@ -1429,7 +1568,7 @@ impl Interpreter {
                         };
                         self.call_method(&bound, rest, input, out)
                     } else {
-                        self.call(&function, args, input, out)
+                        self.call_function(&function, args, input, out)
                     }
                 }
                 None => Err(RuntimeError::new(format!(
@@ -1462,7 +1601,22 @@ impl Interpreter {
     /// defining class as the `super` context, so `super` works
     /// inside. The previous context is restored afterwards, so a
     /// plain function called from the method does not inherit it.
-    fn call_method(
+    /// Dispatches on the backend.
+    pub(crate) fn call_method(
+        &mut self,
+        bound: &BoundMethod,
+        args: CallArgs,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.call_method_vm(bound, args, input, out),
+            Backend::Tree => self.call_method_tree(bound, args, input, out),
+        }
+    }
+
+    /// The tree-walking half of `call_method`.
+    fn call_method_tree(
         &mut self,
         bound: &BoundMethod,
         args: CallArgs,
@@ -1510,7 +1664,22 @@ impl Interpreter {
     /// Create an instance of a class: run its `init` method (looked
     /// up the inheritance chain) with the given arguments, or fail
     /// when arguments are given but there is no `init`.
+    /// Dispatches on the backend.
     fn construct(
+        &mut self,
+        class: &Rc<ClassDef>,
+        args: CallArgs,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.construct_vm(class, args, input, out),
+            Backend::Tree => self.construct_tree(class, args, input, out),
+        }
+    }
+
+    /// The tree-walking half of `construct`.
+    fn construct_tree(
         &mut self,
         class: &Rc<ClassDef>,
         args: CallArgs,
@@ -1554,7 +1723,7 @@ impl Interpreter {
     /// Each module runs exactly once per process: the second import
     /// returns the cached value. A module that (directly or
     /// indirectly) imports itself is a circular import.
-    fn import_module(
+    pub(crate) fn import_module(
         &mut self,
         name: &str,
         env: &Rc<Environment>,
@@ -1690,8 +1859,23 @@ impl Interpreter {
     /// Run a module's source in `module_env` and wrap the result
     /// as a module value. Lex/parse/runtime errors are prefixed
     /// with the module name; a `return` at the top level is an
-    /// error.
+    /// error. Dispatches on the backend.
     fn run_module_source(
+        &mut self,
+        name: &str,
+        source: &str,
+        module_env: &Rc<Environment>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Value, RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.run_module_source_vm(name, source, module_env, input, out),
+            Backend::Tree => self.run_module_source_tree(name, source, module_env, input, out),
+        }
+    }
+
+    /// The tree-walking half of `run_module_source`.
+    fn run_module_source_tree(
         &mut self,
         name: &str,
         source: &str,
@@ -1807,43 +1991,7 @@ impl Interpreter {
             _ => {
                 let left = self.eval_expr(left, env, input, out)?;
                 let right = self.eval_expr(right, env, input, out)?;
-                // Comparisons with an array are element-wise
-                // (Phase 12): they return a Bool array, never a
-                // single Bool. `==`/`!=` against a List or a Dict
-                // still falls back to whole-value equality.
-                if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
-                    let op = match op {
-                        BinaryOp::Eq => Some(CompareOp::Eq),
-                        BinaryOp::NotEq => Some(CompareOp::NotEq),
-                        BinaryOp::Lt => Some(CompareOp::Lt),
-                        BinaryOp::LtEq => Some(CompareOp::LtEq),
-                        BinaryOp::Gt => Some(CompareOp::Gt),
-                        BinaryOp::GtEq => Some(CompareOp::GtEq),
-                        _ => None,
-                    };
-                    if let Some(op) = op {
-                        return array::compare_arrays(op, &left, &right).map_err(|e| e.at(span));
-                    }
-                }
-                let result = match op {
-                    BinaryOp::Eq => Ok(Value::Bool(values_equal(&left, &right))),
-                    BinaryOp::NotEq => Ok(Value::Bool(!values_equal(&left, &right))),
-                    BinaryOp::Add => add_values(&left, &right),
-                    BinaryOp::Sub => {
-                        numeric_op(&left, &right, "subtract", i64::checked_sub, |a, b| a - b)
-                    }
-                    BinaryOp::Mul => {
-                        numeric_op(&left, &right, "multiply", i64::checked_mul, |a, b| a * b)
-                    }
-                    BinaryOp::Div => divide_values(&left, &right),
-                    BinaryOp::Mod => modulo_values(&left, &right),
-                    BinaryOp::Lt => compare_values(&left, &right, Ordering::Less, false),
-                    BinaryOp::LtEq => compare_values(&left, &right, Ordering::Less, true),
-                    BinaryOp::Gt => compare_values(&left, &right, Ordering::Greater, false),
-                    BinaryOp::GtEq => compare_values(&left, &right, Ordering::Greater, true),
-                    BinaryOp::And | BinaryOp::Or => unreachable!(),
-                };
-                result.map_err(|e| e.at(span))
+                binary_values(op, &left, &right, span)
             }
         }
     }
@@ -1876,157 +2024,7 @@ impl Interpreter {
         };
         let container = self.eval_expr(target, env, input, out)?;
         let args = self.eval_indices(indices, env, input, out)?;
-        match container {
-            Value::List(list) => {
-                let arg = single_arg(args, "list").map_err(|e| e.at(node_span))?;
-                match arg {
-                    IndexArg::Value(index, span) => {
-                        let pos = resolve_index(list.borrow().len(), index, "list")
-                            .map_err(|e| e.at(span))?;
-                        list.borrow_mut()[pos] = value;
-                        Ok(())
-                    }
-                    IndexArg::Slice(spec, span) => {
-                        let Value::List(new_items) = value else {
-                            return Err(RuntimeError::new(format!(
-                                "slice assignment needs a List, not {}",
-                                value.type_name()
-                            ))
-                            .at(span));
-                        };
-                        let positions = crate::slice::slice_positions(list.borrow().len(), &spec)
-                            .map_err(|e| e.at(span))?;
-                        let new_items = new_items.borrow();
-                        if new_items.len() != positions.len() {
-                            return Err(RuntimeError::new(format!(
-                                "slice assignment: the slice has {} element(s) but the new list has {}",
-                                positions.len(),
-                                new_items.len()
-                            ))
-                            .at(span));
-                        }
-                        let mut borrowed = list.borrow_mut();
-                        for (pos, item) in positions.iter().zip(new_items.iter()) {
-                            borrowed[*pos] = item.clone();
-                        }
-                        Ok(())
-                    }
-                }
-            }
-            Value::Dict(dict) => {
-                let arg = single_arg(args, "dict").map_err(|e| e.at(node_span))?;
-                let (index, span) = match arg {
-                    IndexArg::Value(index, span) => (index, span),
-                    IndexArg::Slice(_, span) => {
-                        return Err(RuntimeError::with_span("cannot slice a dict", span));
-                    }
-                };
-                let Some(key) = index.to_key() else {
-                    return Err(RuntimeError::new(format!(
-                        "dict key must be Int, Float, Str or Bool, not {}",
-                        index.type_name()
-                    ))
-                    .at(span));
-                };
-                dict.borrow_mut().insert(key, value);
-                Ok(())
-            }
-            Value::Array(array) => {
-                // A slice anywhere in the index means slice
-                // assignment: 1D arrays only, same length required.
-                if args.iter().any(|a| matches!(a, IndexArg::Slice(..))) {
-                    if args.len() != 1 || array.borrow().ndim() != 1 {
-                        return Err(RuntimeError::with_span(
-                            "slice assignment works on 1D arrays only",
-                            node_span,
-                        ));
-                    }
-                    let IndexArg::Slice(spec, span) = args.into_iter().next().unwrap() else {
-                        unreachable!()
-                    };
-                    let Value::Array(new_arr) = value else {
-                        return Err(RuntimeError::new(format!(
-                            "slice assignment on an array needs an Array, not {}",
-                            value.type_name()
-                        ))
-                        .at(span));
-                    };
-                    let wanted = array.borrow().elem;
-                    let new_arr = new_arr.borrow();
-                    if new_arr.elem != wanted {
-                        return Err(RuntimeError::new(format!(
-                            "array element must be {}, not Array of {}",
-                            wanted.name(),
-                            new_arr.elem.name()
-                        ))
-                        .at(span));
-                    }
-                    let positions = crate::slice::slice_positions(array.borrow().size(), &spec)
-                        .map_err(|e| e.at(span))?;
-                    if new_arr.items.len() != positions.len() {
-                        return Err(RuntimeError::new(format!(
-                            "slice assignment: the slice has {} element(s) but the new array has {}",
-                            positions.len(),
-                            new_arr.items.len()
-                        ))
-                        .at(span));
-                    }
-                    let mut borrowed = array.borrow_mut();
-                    for (pos, item) in positions.iter().zip(new_arr.items.iter()) {
-                        borrowed.items[*pos] = item.clone();
-                    }
-                    return Ok(());
-                }
-                // A boolean mask cannot be assigned through.
-                if args.len() == 1
-                    && let IndexArg::Value(Value::Array(mask), span) = &args[0]
-                    && mask.borrow().elem == crate::value::ElemType::Bool
-                {
-                    return Err(RuntimeError::with_span(
-                        "cannot assign through a boolean mask (not supported yet)",
-                        *span,
-                    ));
-                }
-                let indices: Vec<(Value, Span)> = args
-                    .into_iter()
-                    .map(|arg| match arg {
-                        IndexArg::Value(value, span) => (value, span),
-                        IndexArg::Slice(..) => unreachable!(),
-                    })
-                    .collect();
-                let mut array = array.borrow_mut();
-                let pos = if indices.len() == 1 && array.ndim() == 1 {
-                    let (index, span) = indices.into_iter().next().unwrap();
-                    resolve_index(array.items.len(), index, "array").map_err(|e| e.at(span))?
-                } else {
-                    flat_index(&array.shape, &indices).map_err(|e| e.at(node_span))?
-                };
-                let wanted = array.elem;
-                match elem_type_of(&value) {
-                    Some(elem) if elem == wanted => {
-                        array.items[pos] = value;
-                        Ok(())
-                    }
-                    _ => Err(RuntimeError::new(format!(
-                        "array element must be {}, not {}",
-                        wanted.name(),
-                        value.type_name()
-                    ))),
-                }
-            }
-            Value::Tuple(_) => Err(RuntimeError::with_span(
-                "cannot assign to tuple (tuples are immutable)",
-                node_span,
-            )),
-            Value::Set(_) => Err(RuntimeError::with_span(
-                "cannot assign to set (sets have no indexes)",
-                node_span,
-            )),
-            other => Err(RuntimeError::with_span(
-                format!("cannot index {}", other.type_name()),
-                node_span,
-            )),
-        }
+        assign_index_value(container, args, value, node_span)
     }
 
     /// Call a user function: fresh scope under the captured environment,
@@ -2097,7 +2095,22 @@ impl Interpreter {
     /// every replay starts from the beginning, and the body's side
     /// effects repeat on each replay — the body must be
     /// deterministic for the values to be right (see the README).
+    /// Dispatches on the backend: the VM replays bytecode, the
+    /// tree-walker replays the AST.
     pub(crate) fn next_generator(
+        &mut self,
+        generator: &Rc<RefCell<GeneratorData>>,
+        input: &mut dyn BufRead,
+        out: &mut dyn Write,
+    ) -> Result<Option<Value>, RuntimeError> {
+        match self.backend {
+            Backend::Vm => self.next_generator_vm(generator, input, out),
+            Backend::Tree => self.next_generator_tree(generator, input, out),
+        }
+    }
+
+    /// The tree-walking half of `next_generator`.
+    fn next_generator_tree(
         &mut self,
         generator: &Rc<RefCell<GeneratorData>>,
         input: &mut dyn BufRead,
@@ -2192,6 +2205,214 @@ impl Interpreter {
     }
 }
 
+/// Assign through already-evaluated index arguments: the
+/// value-level half of `assign_index`, shared with the VM
+/// (`SetIndex` builds the same `IndexArg`s from bytecode).
+pub(crate) fn assign_index_value(
+    container: Value,
+    args: Vec<IndexArg>,
+    value: Value,
+    node_span: Span,
+) -> Result<(), RuntimeError> {
+    match container {
+        Value::List(list) => {
+            let arg = single_arg(args, "list").map_err(|e| e.at(node_span))?;
+            match arg {
+                IndexArg::Value(index, span) => {
+                    let pos = resolve_index(list.borrow().len(), index, "list")
+                        .map_err(|e| e.at(span))?;
+                    list.borrow_mut()[pos] = value;
+                    Ok(())
+                }
+                IndexArg::Slice(spec, span) => {
+                    let Value::List(new_items) = value else {
+                        return Err(RuntimeError::new(format!(
+                            "slice assignment needs a List, not {}",
+                            value.type_name()
+                        ))
+                        .at(span));
+                    };
+                    let positions = crate::slice::slice_positions(list.borrow().len(), &spec)
+                        .map_err(|e| e.at(span))?;
+                    let new_items = new_items.borrow();
+                    if new_items.len() != positions.len() {
+                        return Err(RuntimeError::new(format!(
+                            "slice assignment: the slice has {} element(s) but the new list has {}",
+                            positions.len(),
+                            new_items.len()
+                        ))
+                        .at(span));
+                    }
+                    let mut borrowed = list.borrow_mut();
+                    for (pos, item) in positions.iter().zip(new_items.iter()) {
+                        borrowed[*pos] = item.clone();
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Value::Dict(dict) => {
+            let arg = single_arg(args, "dict").map_err(|e| e.at(node_span))?;
+            let (index, span) = match arg {
+                IndexArg::Value(index, span) => (index, span),
+                IndexArg::Slice(_, span) => {
+                    return Err(RuntimeError::with_span("cannot slice a dict", span));
+                }
+            };
+            let Some(key) = index.to_key() else {
+                return Err(RuntimeError::new(format!(
+                    "dict key must be Int, Float, Str or Bool, not {}",
+                    index.type_name()
+                ))
+                .at(span));
+            };
+            dict.borrow_mut().insert(key, value);
+            Ok(())
+        }
+        Value::Array(array) => {
+            // A slice anywhere in the index means slice
+            // assignment: 1D arrays only, same length required.
+            if args.iter().any(|a| matches!(a, IndexArg::Slice(..))) {
+                if args.len() != 1 || array.borrow().ndim() != 1 {
+                    return Err(RuntimeError::with_span(
+                        "slice assignment works on 1D arrays only",
+                        node_span,
+                    ));
+                }
+                let IndexArg::Slice(spec, span) = args.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                let Value::Array(new_arr) = value else {
+                    return Err(RuntimeError::new(format!(
+                        "slice assignment on an array needs an Array, not {}",
+                        value.type_name()
+                    ))
+                    .at(span));
+                };
+                let wanted = array.borrow().elem;
+                let new_arr = new_arr.borrow();
+                if new_arr.elem != wanted {
+                    return Err(RuntimeError::new(format!(
+                        "array element must be {}, not Array of {}",
+                        wanted.name(),
+                        new_arr.elem.name()
+                    ))
+                    .at(span));
+                }
+                let positions = crate::slice::slice_positions(array.borrow().size(), &spec)
+                    .map_err(|e| e.at(span))?;
+                if new_arr.items.len() != positions.len() {
+                    return Err(RuntimeError::new(format!(
+                        "slice assignment: the slice has {} element(s) but the new array has {}",
+                        positions.len(),
+                        new_arr.items.len()
+                    ))
+                    .at(span));
+                }
+                let mut borrowed = array.borrow_mut();
+                for (pos, item) in positions.iter().zip(new_arr.items.iter()) {
+                    borrowed.items[*pos] = item.clone();
+                }
+                return Ok(());
+            }
+            // A boolean mask cannot be assigned through.
+            if args.len() == 1
+                && let IndexArg::Value(Value::Array(mask), span) = &args[0]
+                && mask.borrow().elem == crate::value::ElemType::Bool
+            {
+                return Err(RuntimeError::with_span(
+                    "cannot assign through a boolean mask (not supported yet)",
+                    *span,
+                ));
+            }
+            let indices: Vec<(Value, Span)> = args
+                .into_iter()
+                .map(|arg| match arg {
+                    IndexArg::Value(value, span) => (value, span),
+                    IndexArg::Slice(..) => unreachable!(),
+                })
+                .collect();
+            let mut array = array.borrow_mut();
+            let pos = if indices.len() == 1 && array.ndim() == 1 {
+                let (index, span) = indices.into_iter().next().unwrap();
+                resolve_index(array.items.len(), index, "array").map_err(|e| e.at(span))?
+            } else {
+                flat_index(&array.shape, &indices).map_err(|e| e.at(node_span))?
+            };
+            let wanted = array.elem;
+            match elem_type_of(&value) {
+                Some(elem) if elem == wanted => {
+                    array.items[pos] = value;
+                    Ok(())
+                }
+                _ => Err(RuntimeError::new(format!(
+                    "array element must be {}, not {}",
+                    wanted.name(),
+                    value.type_name()
+                ))),
+            }
+        }
+        Value::Tuple(_) => Err(RuntimeError::with_span(
+            "cannot assign to tuple (tuples are immutable)",
+            node_span,
+        )),
+        Value::Set(_) => Err(RuntimeError::with_span(
+            "cannot assign to set (sets have no indexes)",
+            node_span,
+        )),
+        other => Err(RuntimeError::with_span(
+            format!("cannot index {}", other.type_name()),
+            node_span,
+        )),
+    }
+}
+
+/// A binary operator on two already-evaluated values (everything
+/// except `and` / `or`, which short-circuit before this): the
+/// arithmetic, comparison and equality rules, with errors
+/// pointing at the operator's span. Shared by the tree-walker
+/// (`eval_binary`) and the VM (`Binary` instruction).
+pub(crate) fn binary_values(
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    // Comparisons with an array are element-wise (Phase 12):
+    // they return a Bool array, never a single Bool. `==`/`!=`
+    // against a List or a Dict still falls back to whole-value
+    // equality.
+    if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
+        let op = match op {
+            BinaryOp::Eq => Some(CompareOp::Eq),
+            BinaryOp::NotEq => Some(CompareOp::NotEq),
+            BinaryOp::Lt => Some(CompareOp::Lt),
+            BinaryOp::LtEq => Some(CompareOp::LtEq),
+            BinaryOp::Gt => Some(CompareOp::Gt),
+            BinaryOp::GtEq => Some(CompareOp::GtEq),
+            _ => None,
+        };
+        if let Some(op) = op {
+            return array::compare_arrays(op, left, right).map_err(|e| e.at(span));
+        }
+    }
+    let result = match op {
+        BinaryOp::Eq => Ok(Value::Bool(values_equal(left, right))),
+        BinaryOp::NotEq => Ok(Value::Bool(!values_equal(left, right))),
+        BinaryOp::Add => add_values(left, right),
+        BinaryOp::Sub => numeric_op(left, right, "subtract", i64::checked_sub, |a, b| a - b),
+        BinaryOp::Mul => numeric_op(left, right, "multiply", i64::checked_mul, |a, b| a * b),
+        BinaryOp::Div => divide_values(left, right),
+        BinaryOp::Mod => modulo_values(left, right),
+        BinaryOp::Lt => compare_values(left, right, Ordering::Less, false),
+        BinaryOp::LtEq => compare_values(left, right, Ordering::Less, true),
+        BinaryOp::Gt => compare_values(left, right, Ordering::Greater, false),
+        BinaryOp::GtEq => compare_values(left, right, Ordering::Greater, true),
+        BinaryOp::And | BinaryOp::Or => unreachable!("and/or short-circuit before binary_values"),
+    };
+    result.map_err(|e| e.at(span))
+}
+
 /// Resolve a (possibly negative) index into a position: `-1` is the
 /// last element, `-len` the first. Out of range is an error.
 /// `kind` names the collection in the message ("list", "tuple",
@@ -2224,7 +2445,7 @@ fn resolve_index(len: usize, index: Value, kind: &str) -> Result<usize, RuntimeE
 /// index this type) point at it; errors about one index (out of
 /// range, wrong key, step zero) point at that index expression,
 /// which each `IndexArg` carries.
-fn index_value(
+pub(crate) fn index_value(
     target: &Value,
     args: Vec<IndexArg>,
     node_span: Span,
@@ -2373,7 +2594,7 @@ fn single_arg(args: Vec<IndexArg>, kind: &str) -> Result<IndexArg, RuntimeError>
 /// `+`: integer/float arithmetic, string concatenation, or
 /// element-wise array arithmetic (array + array, array + scalar,
 /// scalar + array).
-fn add_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+pub(crate) fn add_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
     if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
         return array::elementwise(ArrayOp::Add, left, right);
     }
@@ -2398,7 +2619,7 @@ fn add_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
 /// float). Integer overflow is an error, not a panic. Arrays work
 /// element by element (array op array, array op scalar, scalar op
 /// array).
-fn numeric_op(
+pub(crate) fn numeric_op(
     left: &Value,
     right: &Value,
     verb: &str,
@@ -2431,7 +2652,7 @@ fn numeric_op(
 /// `/`: always float division, even between integers. Arrays work
 /// element by element (array / array, array / scalar, scalar /
 /// array).
-fn divide_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+pub(crate) fn divide_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
     if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
         return array::elementwise(ArrayOp::Div, left, right);
     }
@@ -2455,7 +2676,7 @@ fn divide_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
 }
 
 /// `%`: integers only; the remainder keeps the dividend's sign (Rust).
-fn modulo_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
+pub(crate) fn modulo_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
     match (left, right) {
         (Value::Int(_), Value::Int(0)) => Err(RuntimeError::new("modulo by zero")),
         (Value::Int(a), Value::Int(b)) => a
@@ -2472,7 +2693,7 @@ fn modulo_values(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
 
 /// `<`, `<=`, `>`, `>=`: numbers (mixed int/float) or strings
 /// (lexicographic order).
-fn compare_values(
+pub(crate) fn compare_values(
     left: &Value,
     right: &Value,
     wanted: Ordering,

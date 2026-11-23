@@ -17,6 +17,7 @@ use gg_parser::ast::Stmt;
 
 use crate::builtin::Builtin;
 use crate::env::Environment;
+use crate::vm::CodeObject;
 
 /// A value at runtime.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,7 +148,22 @@ const MAX_COMPARE_DEPTH: usize = 64;
 /// it resolves against that class — lexical, like Python's
 /// `__class__` cell. A plain top-level function has none, so
 /// `super` inside it is an error even when called from a method.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `code` is the compiled form of `body`, when the function was
+/// defined while the bytecode backend was active (`None` for
+/// functions defined by the tree-walker, which the VM compiles
+/// on first call instead). It is derived from `body`, so equality
+/// ignores it — like a span, it is not meaning.
+///
+/// `upvalues` holds the cells the function captured from
+/// enclosing functions, in the order its code object's upvalue
+/// list names them (one per captured variable, shared with the
+/// defining frame: a later assignment through either side is
+/// visible to the other). `None`-valued entries are impossible:
+/// every upvalue is a cell. Functions defined by the tree-walker
+/// have none — the tree-walker captures through environments
+/// instead. Equality ignores them, like `code`.
+#[derive(Debug, Clone)]
 pub struct Function {
     pub params: Vec<String>,
     pub defaults: Vec<Option<Value>>,
@@ -155,6 +171,22 @@ pub struct Function {
     pub body: Vec<Stmt>,
     pub env: Rc<Environment>,
     pub super_class: Option<Rc<ClassDef>>,
+    pub code: Option<Rc<CodeObject>>,
+    pub upvalues: Vec<Rc<RefCell<Value>>>,
+}
+
+// Equality ignores `code`: it is compiled from `body`, so two
+// functions with the same body are equal whether or not one of
+// them was compiled yet.
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        self.params == other.params
+            && self.defaults == other.defaults
+            && self.rest == other.rest
+            && self.body == other.body
+            && self.env == other.env
+            && self.super_class == other.super_class
+    }
 }
 
 /// A dict/set key: only the scalar values are hashable. Note that

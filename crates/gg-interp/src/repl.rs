@@ -190,7 +190,7 @@ fn run_chunk(
         }
         Ok(())
     } else {
-        interp.run(program, input, out)
+        interp.run_repl_chunk(program, input, out)
     }
 }
 

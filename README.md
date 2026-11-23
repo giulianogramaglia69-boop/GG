@@ -149,6 +149,18 @@ multi-line block is a single history entry. Ctrl-C drops the
 line (and the block in progress); Ctrl-D on an empty line
 leaves. When stdin is piped, the REPL uses the plain stream
 loop instead, so piped sessions behave exactly as before.
+**Bytecode VM: done.** A bytecode compiler (`AST → Op`) and a
+stack virtual machine now run GG programs, side by side with the
+tree-walker, behind the same `Interpreter` API; the VM is the
+default, the tree-walker stays as a fallback selectable with
+`GG_BACKEND=tree` (see the Bytecode virtual machine section
+below). Same programs, same values, same error texts and spans
+— verified by a dual-backend test corpus that runs every program
+on both engines and requires identical output. Honest benchmark
+(release build, this VM): the VM is now faster on tight loops
+(1M-iteration sum: ~240 ms vs ~440 ms) and still slower on
+call-heavy recursion (`fib(26)`: ~410 ms vs ~340 ms) — see the
+numbers and why in that section.
 
 ## The REPL
 
@@ -1214,6 +1226,144 @@ test runs under Xvfb with the lavapipe software Vulkan driver,
 and the first real interactive test is on a laptop. One window
 only, no canvas/images, no themes, no multiple windows, and no frame-rate control yet. (Phase 17 demo: `examples/gui_widgets_demo.gg` — radio, combo, progress and vertical; it closes by itself after about 60 frames.)
 
+## Bytecode virtual machine
+
+GG runs on a bytecode VM, like CPython: the compiler
+(`crates/gg-interp/src/vm/compiler.rs`) turns the AST into a
+`CodeObject` — a list of instructions, a constant table, a
+name table and a slot count — and the machine (`vm/machine.rs`)
+executes it on an operand stack, with one locals array per
+frame. Every function, method and lambda compiles to its own
+code object, eagerly, at definition time; a script or module
+compiles as one code object. Compilation happens on the first
+execution; there is no bytecode cache on disk.
+
+The tree-walking interpreter is still in the code, behind the
+same `Interpreter` API, and stays the fallback. Select the
+engine with the `GG_BACKEND` environment variable: `vm` (the
+default) or `tree`. Every public entry point (`run`, `eval`,
+`call_value`, `call_method`, imports, the REPL, `gui.run`'s
+frame function) dispatches on it, so switching backends changes
+nothing but the engine.
+
+### How it works
+
+- **Values and scopes are shared with the tree-walker.** The VM
+  reuses `Value`, the chained `Environment`s (for globals and
+  module attributes), the builtins and the semantics helpers
+  (`bind_arguments`, `index_value`, `binary_values`,
+  `match_pattern`, ...), so closures, shadowing and mutable
+  captured bindings behave exactly as before. Locals, though,
+  are slot-based: the compiler assigns each local a numeric
+  slot per code object (`LoadSlot` / `StoreSlot` /
+  `DefineSlot`), and the frame reads it by index — no scope
+  chain walk. A name bound in an enclosing function becomes
+  an upvalue: a cell (`Rc<RefCell<Value>>`) shared between the
+  defining frame and the nested one, so a closure sees later
+  rebindings, two closures share one binding, and a grandchild
+  reads the same cell as its grandparent (captured
+  transitively, one upvalue per intermediate function). Only
+  names bound nowhere in any enclosing function stay
+  name-based (`LoadName` / `StoreName` / `DefineName`): globals,
+  module attributes, and a REPL chunk's top level, which must
+  persist across chunks.
+- **Spans.** Every instruction carries the span of the token
+  that generated it, and the VM loop uses it as the fallback
+  position for errors — exactly like the statement span in the
+  tree-walker. Error messages and positions are identical on
+  both engines (a dual-backend test corpus in
+  `crates/gg-interp/src/vm/tests.rs` runs every program on both
+  and requires the same stdout or the same error text).
+- **Calls.** Arguments are evaluated in source order into a
+  positional list plus keyword values; `Call`/`CallMethod`/
+  `CallSuper`/`Construct` bind them with the same
+  `bind_arguments` the tree-walker uses (defaults evaluated
+  once at definition time, `*args`, spread, kwargs).
+- **Loops and comprehensions.** Loop state lives in slots of
+  the loop's own scope (`$for_to`, `$for_iter`, `$comp_acc`,
+  ... — `$`-prefixed names, which user code cannot spell, so
+  they can never collide with a real variable). The numeric
+  `for` keeps the last value the body ran with when it ends,
+  like the tree-walker — a closure that captured the loop
+  variable sees that value, not one past the end — and the
+  loop variable is one shared binding across iterations, while
+  a comprehension variable is fresh per item.
+- **Try/except/finally.** A handler stack with Try/Except/
+  Finally phases; `finally` runs on normal, error, `return`
+  and `yield` exits, and a `return`/error inside `finally`
+  replaces the pending outcome (the Python rule). The `except`
+  variable and names defined in `finally` are scoped to the
+  handler and do not leak out.
+- **Generators.** The replay model is unchanged: `next()`
+  re-runs the code object from the start with a yield counter,
+  and `Yield` suspends at the target count. `for x in gen`
+  pulls lazily.
+- **Match.** Compiled to jumps: duplicate the value, try each
+  pattern (`MatchPattern` binds into slots, with fresh cells
+  per match), evaluate the guard, and jump to the next case on
+  failure.
+- **F-strings.** Compiled to concatenation (`BuildStr`).
+- **Indexing/slicing.** Slices travel on a frame-local side
+  stack (`PushIndexValue`/`PushIndexSlice`), not the operand
+  stack, so no new `Value` variant was needed.
+
+### Opcodes
+
+`LoadConst`, `LoadName`, `StoreName`, `DefineName`,
+`LoadSlot`, `StoreSlot`, `DefineSlot`, `LoadUpvalue`,
+`StoreUpvalue`, `Pop`, `Dup`, `Jump`, `JumpIfFalse`,
+`JumpIfTrue`, `Print`, `Return`, `Yield`, `Neg`, `Not`,
+`Binary`, `BuildList`, `ListAppend`, `ListExtend`,
+`BuildTuple`, `BuildDict`, `DictInsert`, `BuildSet`,
+`SetInsert`, `BuildStr`, `MakeFunction`, `MakeClass`, `Call`,
+`CallMethod`, `CallSuper`, `Construct`, `GetField`,
+`SetField`, `GetIndex`, `SetIndex`, `PushIndexValue`,
+`PushIndexSlice`, `EnterScope`, `ForPrep`, `ForCheck`,
+`ForNext`, `ForInPrep`, `ForInNext`, `CompPrep`, `CompNext`,
+`BindComp`, `CompAppend`, `CompDictInsert`, `CompSetInsert`,
+`MatchPattern`, `PushHandler`, `FinishTry`, `EndFinally`,
+`Raise`, `Import`.
+
+### Benchmark (honest numbers)
+
+Release build, this VM, `time` on `gg run` (median of 3 runs
+each; outputs identical on both engines):
+
+| program | tree-walker | VM | |
+|---|---|---|---|
+| `examples/bench_loop.gg` — sum 1..1,000,000 | ~440 ms | ~240 ms | VM ~1.8× **faster** |
+| `examples/bench_fib.gg` — `fib(26)` | ~340 ms | ~410 ms | VM ~1.2× **slower** |
+
+The loop is faster now, and the reason is concrete: slot-based
+locals turned the loop body's variable accesses from `HashMap`
+lookups on the scope chain into array indexes (before slots
+the same loop took ~925 ms on the VM vs ~465 ms on the
+tree-walker). `fib` is still slower because it is call-bound,
+not variable-bound: every call allocates a frame (locals and
+cells arrays), binds arguments through `bind_arguments`, and
+clones the function's upvalues — per-call allocation the
+tree-walker mostly avoids. The next optimization step there is
+cheaper calls (e.g. not allocating the cells array when a code
+object's nested functions capture nothing), not faster
+variables.
+
+### Limits and known deviations
+
+- No bytecode cache on disk (compile on every run), no JIT.
+- Garbage collection is unchanged: values are `Rc`, and cycles
+  still leak.
+- One known limitation of the single-pass compiler: a closure
+  that references a variable declared *later* in its enclosing
+  scope resolves it as a global (runtime "undefined variable"),
+  while the tree-walker sees the later declaration. CPython
+  avoids this with a symtable pass; GG has none yet.
+- One known deviation from the tree-walker: in
+  `super.foo(...)` the VM evaluates the arguments *before*
+  the `super` checks, while the tree-walker checks `super`
+  first. Both engines error on an invalid `super`; the only
+  observable difference is side effects in the arguments
+  combined with an invalid `super`.
+
 ## Grammar
 
 ```text
@@ -1472,10 +1622,23 @@ exit with code 1.
     piped stdin keeps the plain stream loop (no history file
     touched). This closes the "migliora tutto" series (Fasi
     19–24)
+25. **Bytecode VM** ✅ — bytecode compiler (AST → `Op`) +
+    stack machine in `gg-interp` (`crates/gg-interp/src/vm/`),
+    side by side with the tree-walker behind the same API;
+    VM is the default, `GG_BACKEND=tree` selects the fallback;
+    per-function code objects, spans on every instruction,
+    try/except/finally with handler stack, generators by
+    replay, match compiled to jumps; a dual-backend corpus
+    (20 tests) runs every program on both engines and requires
+    identical output; all 14 non-GUI examples + both GUI demos
+    (Xvfb) verified identical; honest benchmark: VM ~1.8×
+    faster on a 1M-iteration loop and ~1.2× slower on
+    `fib(26)`; slot-based locals with transitive upvalues, see
+    the Bytecode virtual machine section
 
-Next: not decided yet — the "migliora tutto" series is done
-(Fasi 19–24); the GUI's first real interactive test on the
-laptop is still open.
+Next: cheaper calls for the VM (the remaining `fib` gap is
+per-call allocation, not variable access) — and, separately, the
+GUI's first real interactive test on the laptop, still open.
 
 Long term: more data libraries in the spirit of Pandas, and a
 web framework in the spirit of Django — each is a large project
