@@ -36,6 +36,7 @@ pub fn build(name: &str) -> Option<Value> {
         }
         "random" => define_functions(&env, RANDOM_FUNCTIONS),
         "linalg" => define_functions(&env, LINALG_FUNCTIONS),
+        "json" => define_functions(&env, JSON_FUNCTIONS),
         // The GUI module lives in `gui.rs`: it needs the
         // interpreter to call frame functions back, so its
         // functions are `WithInterp` builtins, not plain ones.
@@ -93,6 +94,11 @@ const LINALG_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
     ("det", Arity::Exact(1), crate::linalg::det),
     ("inv", Arity::Exact(1), crate::linalg::inv),
     ("rank", Arity::Exact(1), crate::linalg::rank),
+];
+
+const JSON_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("parse", Arity::Exact(1), crate::json::parse),
+    ("stringify", Arity::Range(1, 2), crate::json::stringify),
 ];
 
 /// A number as an f64, or a clear error naming the function.

@@ -160,7 +160,13 @@ on both engines and requires identical output. Honest benchmark
 (release build, this VM): the VM is now faster on tight loops
 (1M-iteration sum: ~240 ms vs ~440 ms) and still slower on
 call-heavy recursion (`fib(26)`: ~410 ms vs ~340 ms) — see the
-numbers and why in that section.
+numbers and why in that section. **JSON module: done.** A native
+`json` module (`import json`): `json.parse(text)` turns JSON into
+GG values (objects → Dicts, arrays → Lists, `null` → Nil) and
+`json.stringify(value)` / `json.stringify(value, indent)` renders
+them back, compact or pretty-printed; a hand-written recursive
+parser in pure Rust, no external crate — see the Standard library
+section below and `examples/json_demo.gg`.
 
 ## The REPL
 
@@ -887,6 +893,34 @@ Full example: `examples/linalg_demo.gg` — the systems from the
 maths ripasso, plus the classic 3x3 with its f64 rounding.
 `examples/rank_demo.gg` shows `rank` telling an indeterminate
 system from an impossible one.
+
+**`json`** — native, in Rust. A hand-written recursive-descent
+parser, pure Rust with no external crate. Objects become Dicts
+(insertion order kept, a duplicate key keeps the last value),
+arrays become Lists, integers that fit in i64 become Int (anything
+else numeric becomes Float), `true`/`false` become Bool and
+`null` becomes Nil. Parse errors are runtime errors with the
+position inside the JSON text (`json.parse(): ... at line L,
+column C`), catchable with `try`/`except`. `stringify` goes the
+other way: Dict keys that are not strings are written as their
+string form, Lists, Tuples, Sets and Arrays become JSON arrays,
+floats print in the shortest form that round-trips (`1.0` stays
+`1.0`, so `parse(stringify(x)) == x` for every finite float);
+functions, classes, instances, modules, queues, stacks and
+generators are runtime errors, never silent `nil`. Nesting
+deeper than 128 levels is an error on both sides — that is also
+what makes `stringify` terminate on a cyclic value (a list
+containing itself) instead of recursing forever.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `json.parse(text)` | Parse a JSON document into a GG value | `json.parse("{\"a\": [1, 2]}")` → `{"a": [1, 2]}` |
+| `json.stringify(value)` | Render a GG value as compact JSON | `json.stringify({"a": 1})` → `"{\"a\":1}"` |
+| `json.stringify(value, indent)` | Pretty-print with `indent` spaces per level (0 = compact); empty collections stay on one line | `json.stringify({"a": [1, 2]}, 2)` → `"{\n  \"a\": [\n    1,\n    2\n  ]\n}"` |
+
+Full example: `examples/json_demo.gg` — write a document to a
+file, read it back, parse it, change a field, and check the
+round-trip, on both backends.
 
 **`stats`** — written in pure GG (`stdlib/stats.gg` in the
 repo), embedded in the binary with `include_str!`, so it works
@@ -1635,6 +1669,15 @@ exit with code 1.
     faster on a 1M-iteration loop and ~1.2× slower on
     `fib(26)`; slot-based locals with transitive upvalues, see
     the Bytecode virtual machine section
+26. **JSON module** ✅ — native `json` module (`import json`):
+    `json.parse(text)` / `json.stringify(value)` /
+    `json.stringify(value, indent)`; hand-written recursive
+    parser in pure Rust, no external crate; objects → Dicts
+    (insertion order, last duplicate wins), integers that fit
+    in i64 → Int, floats round-trip (`1.0` stays `1.0`); parse
+    errors carry the position inside the JSON text; nesting
+    past 128 levels is an error (also stops `stringify` on
+    cyclic values); see `examples/json_demo.gg`
 
 Next: cheaper calls for the VM (the remaining `fib` gap is
 per-call allocation, not variable access) — and, separately, the

@@ -12,6 +12,7 @@ pub mod error;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod interp;
+pub mod json;
 pub mod linalg;
 pub mod native;
 pub mod repl;
@@ -3261,5 +3262,546 @@ mod tests {
             };
             assert!((x - want).abs() < 1e-9, "{x} vs {want}");
         }
+    }
+
+    // ---- JSON module ----
+    //
+    // The GG sources below are Rust raw strings: the JSON text
+    // inside them needs GG `\"` escapes, which a raw string
+    // keeps literally (GG string literals only know `\"`, `\\`,
+    // `\n` and `\t` — a JSON `\uXXXX` or `\/` has to be built
+    // by concatenation, see the escapes test).
+
+    #[test]
+    fn json_parse_scalars() {
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("42")
+"#
+            ),
+            "42\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("-7")
+"#
+            ),
+            "-7\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("3.5")
+"#
+            ),
+            "3.5\n"
+        );
+        // 1e3 parses as a Float; GG prints a Float 1000.0 as
+        // "1000" (Rust float Display, no exponent).
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("1e3")
+"#
+            ),
+            "1000\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("2.5e-2")
+"#
+            ),
+            "0.025\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("\"ciao\"")
+"#
+            ),
+            "ciao\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("true")
+"#
+            ),
+            "true\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("null")
+"#
+            ),
+            "nil\n"
+        );
+        // An integer too big for i64 becomes a Float, rounded.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("9999999999999999999999")
+"#
+            ),
+            "10000000000000000000000\n"
+        );
+        // Whitespace around the value is ignored (the `\n` and
+        // `\t` here are GG escapes inside the string literal).
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("  \n 42 \t ")
+"#
+            ),
+            "42\n"
+        );
+        // The type is preserved: 42 parses as Int, 42.0 as Float.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print type(json.parse("42"))
+"#
+            ),
+            "int\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print type(json.parse("42.0"))
+"#
+            ),
+            "float\n"
+        );
+    }
+
+    #[test]
+    fn json_parse_containers_and_escapes() {
+        // Objects keep insertion order; a duplicate key keeps
+        // the last value.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("{\"b\": 1, \"a\": [1, 2, {\"c\": null}]}")
+"#
+            ),
+            "{\"b\": 1, \"a\": [1, 2, {\"c\": nil}]}\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("{\"a\": 1, \"a\": 2}")
+"#
+            ),
+            "{\"a\": 2}\n"
+        );
+        // All the escapes, one at a time. GG strings only
+        // know `\"`, `\\`, `\n` and `\t`, so a JSON escape
+        // like `\u0041` is built by concatenation: `"\\u0041"`
+        // is the six characters `\u0041` in the JSON text.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("\"" + "a\\nb\\tc" + "\"")
+"#
+            ),
+            "a\nb\tc\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("\"" + "\\\"" + "\"")
+"#
+            ),
+            "\"\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("\"" + "\\\\" + "\"")
+"#
+            ),
+            "\\\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("\"" + "\\/" + "\"")
+"#
+            ),
+            "/\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("\"" + "\\u0041" + "\\uD83D\\uDE00" + "\"")
+"#
+            ),
+            "A😀\n"
+        );
+        // Fields are reachable as a Dict.
+        assert_eq!(
+            run_ok(
+                r#"import json
+let d = json.parse("{\"nome\": \"Giuliano\", \"eta\": 14}")
+print d["nome"]
+print d["eta"] + 1
+"#
+            ),
+            "Giuliano\n15\n"
+        );
+        // Empty containers.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("[]")
+"#
+            ),
+            "[]\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.parse("{}")
+"#
+            ),
+            "{}\n"
+        );
+        // Deep nesting round-trips through parse + stringify.
+        let deep = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        let src = format!("import json\nprint json.stringify(json.parse(\"{deep}\"))\n");
+        assert_eq!(run_ok(&src), format!("{deep}\n"));
+    }
+
+    #[test]
+    fn json_parse_errors() {
+        // A trailing comma: the parser meets ']' where a value
+        // was expected. A missing comma is a different error.
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("[1, 2,]")
+"#
+            )
+            .contains("unexpected character ']'")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("[1 2]")
+"#
+            )
+            .contains("expected ',' or ']' in array")
+        );
+        // An unquoted key, single quotes.
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("{a: 1}")
+"#
+            )
+            .contains("expected a string key in object")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("'ciao'")
+"#
+            )
+            .contains("unexpected character")
+        );
+        // Unterminated string, with its position inside the JSON.
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("\"abc")
+"#
+            )
+            .contains("unterminated string at line 1, column 5")
+        );
+        // Text after the value, and an empty document.
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("1 2")
+"#
+            )
+            .contains("trailing characters after JSON value")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("")
+"#
+            )
+            .contains("unexpected end of JSON input")
+        );
+        // NaN and Infinity are not JSON.
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("NaN")
+"#
+            )
+            .contains("unexpected character 'N'")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("Infinity")
+"#
+            )
+            .contains("unexpected character 'I'")
+        );
+        // Bad numbers: a leading zero, a bare dot, a bad escape,
+        // a lone surrogate (built by concatenation, as above).
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("01")
+"#
+            )
+            .contains("trailing characters after JSON value")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("1.")
+"#
+            )
+            .contains("expected a digit after '.' in number")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("\"" + "\\q" + "\"")
+"#
+            )
+            .contains("invalid escape")
+        );
+        assert!(
+            run_err(
+                r#"import json
+print json.parse("\"" + "\\uD83D" + "\"")
+"#
+            )
+            .contains("lone high surrogate")
+        );
+        // Nesting past the depth limit is an error, not a crash.
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        assert!(
+            run_err(&format!("import json\nprint json.parse(\"{deep}\")\n"))
+                .contains("JSON nested too deep")
+        );
+        // Not a string at all.
+        assert!(
+            run_err(
+                r#"import json
+print json.parse(42)
+"#
+            )
+            .contains("json.parse() expects a Str, not Int")
+        );
+        // Parse errors are catchable with try/except: "[1," ends
+        // where a value was expected.
+        assert_eq!(
+            run_ok(
+                r#"import json
+try then
+    print json.parse("[1,")
+except e then
+    print e
+end
+"#
+            ),
+            "json.parse(): unexpected end of JSON input at line 1, column 4\n"
+        );
+    }
+
+    #[test]
+    fn json_stringify_scalars_and_collections() {
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify(42)
+"#
+            ),
+            "42\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify(3.5)
+"#
+            ),
+            "3.5\n"
+        );
+        // A whole float keeps its `.0`, so it re-parses as a
+        // Float, not an Int.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify(1.0)
+"#
+            ),
+            "1.0\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify("a\nb")
+"#
+            ),
+            "\"a\\nb\"\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify(true)
+"#
+            ),
+            "true\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify(json.parse("null"))
+"#
+            ),
+            "null\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+let n = json.parse("null")
+print json.stringify([1, "a", n])
+"#
+            ),
+            "[1,\"a\",null]\n"
+        );
+        // Tuples and sets become arrays; non-string dict keys
+        // become their string form.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify((1, 2))
+"#
+            ),
+            "[1,2]\n"
+        );
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify({1: "a", true: "b"})
+"#
+            ),
+            "{\"1\":\"a\",\"true\":\"b\"}\n"
+        );
+        // A 2D array nests.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify(reshape(array([1, 2, 3, 4]), [2, 2]))
+"#
+            ),
+            "[[1,2],[3,4]]\n"
+        );
+        // Floats round-trip: parse(stringify(x)) == x.
+        assert_eq!(
+            run_ok(
+                r#"import json
+let xs = [0.1, 3.5, -2.25, 10000000000.0, 0.000001]
+print json.parse(json.stringify(xs)) == xs
+"#
+            ),
+            "true\n"
+        );
+    }
+
+    #[test]
+    fn json_stringify_pretty_and_errors() {
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify({"a": [1, 2], "b": {}}, 2)
+"#
+            ),
+            "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {}\n}\n"
+        );
+        // indent 0 is compact, like no indent at all.
+        assert_eq!(
+            run_ok(
+                r#"import json
+print json.stringify([1, 2], 0)
+"#
+            ),
+            "[1,2]\n"
+        );
+        // A bad indent is an error, not a default.
+        assert!(
+            run_err(
+                r#"import json
+print json.stringify([1], -1)
+"#
+            )
+            .contains("indent must be a non-negative Int")
+        );
+        // Values with no JSON form are errors naming the type.
+        assert!(
+            run_err(
+                r#"import json
+print json.stringify(fn(x) x end)
+"#
+            )
+            .contains("cannot stringify Function")
+        );
+        assert!(
+            run_err(
+                r#"import json
+import math
+print json.stringify(math)
+"#
+            )
+            .contains("cannot stringify Module")
+        );
+        // A cyclic value cannot be stringified (the depth limit
+        // stops the recursion with a clear error).
+        assert!(
+            run_err(
+                r#"import json
+let d = {"a": 1}
+d["self"] = d
+print json.stringify(d)
+"#
+            )
+            .contains("value nested too deep (cyclic values")
+        );
+    }
+
+    #[test]
+    fn json_roundtrip_complex() {
+        // A realistic document: parse, change a field, write it
+        // back, parse again — the structure survives.
+        assert_eq!(
+            run_ok(
+                r#"import json
+let text = "{\"nome\": \"Giuliano\", \"eta\": 14, \"voti\": [9, 8, 10], \"citta\": {\"nome\": \"Agrigento\", \"cap\": 92100}, \"attivo\": true, \"note\": null}"
+let d = json.parse(text)
+d["eta"] = 15
+let back = json.stringify(d)
+let d2 = json.parse(back)
+print d2["nome"]
+print d2["eta"]
+print d2["voti"][2]
+print d2["citta"]["cap"]
+print d2["attivo"]
+print d2["note"]
+"#
+            ),
+            "Giuliano\n15\n10\n92100\ntrue\nnil\n"
+        );
     }
 }

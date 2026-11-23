@@ -1,0 +1,23 @@
+# Demo del modulo json: scrivi un documento JSON su file,
+# rileggilo, parsalo, cambia un campo e riscrivilo —
+# compatto e pretty — verificando il round-trip.
+# Il file va in /tmp così la demo non sporca il repo.
+import json
+
+let persona = json.parse("{\"nome\": \"Giuliano\", \"eta\": 14, \"citta\": \"Agrigento\", \"voti\": [9, 8, 10], \"attivo\": true, \"note\": null}")
+
+write_file("/tmp/persona.json", json.stringify(persona, 2))
+print "scritto /tmp/persona.json:"
+print read_file("/tmp/persona.json")
+
+let d = json.parse(read_file("/tmp/persona.json"))
+print "nome: " + d["nome"]
+print "eta: " + str(d["eta"])
+print "miglior voto: " + str(d["voti"][2])
+print "note:"
+print d["note"]
+
+d["eta"] = 15
+let compatta = json.stringify(d)
+print "compatta: " + compatta
+print "round-trip: " + str(json.parse(compatta) == d)
