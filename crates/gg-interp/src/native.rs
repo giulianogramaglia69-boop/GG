@@ -37,6 +37,9 @@ pub fn build(name: &str) -> Option<Value> {
         "random" => define_functions(&env, RANDOM_FUNCTIONS),
         "linalg" => define_functions(&env, LINALG_FUNCTIONS),
         "json" => define_functions(&env, JSON_FUNCTIONS),
+        "os" => define_functions(&env, OS_FUNCTIONS),
+        "datetime" => define_functions(&env, DATETIME_FUNCTIONS),
+        "regex" => define_functions(&env, REGEX_FUNCTIONS),
         // The GUI module lives in `gui.rs`: it needs the
         // interpreter to call frame functions back, so its
         // functions are `WithInterp` builtins, not plain ones.
@@ -99,6 +102,39 @@ const LINALG_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
 const JSON_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
     ("parse", Arity::Exact(1), crate::json::parse),
     ("stringify", Arity::Range(1, 2), crate::json::stringify),
+];
+
+const OS_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("args", Arity::Exact(0), crate::os::args),
+    ("getenv", Arity::Range(1, 2), crate::os::getenv),
+    ("cwd", Arity::Exact(0), crate::os::cwd),
+    ("listdir", Arity::Exact(1), crate::os::listdir),
+    ("mkdir", Arity::Exact(1), crate::os::mkdir),
+    ("remove", Arity::Exact(1), crate::os::remove),
+];
+
+const DATETIME_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("now", Arity::Exact(0), crate::datetime::now),
+    (
+        "from_timestamp",
+        Arity::Exact(1),
+        crate::datetime::from_timestamp,
+    ),
+    (
+        "to_timestamp",
+        Arity::Exact(1),
+        crate::datetime::to_timestamp,
+    ),
+    ("format", Arity::Exact(2), crate::datetime::format),
+    ("date", Arity::Exact(3), crate::datetime::date),
+];
+
+const REGEX_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("test", Arity::Exact(2), crate::regex::test),
+    ("find", Arity::Exact(2), crate::regex::find),
+    ("groups", Arity::Exact(2), crate::regex::groups),
+    ("replace", Arity::Exact(3), crate::regex::replace),
+    ("split", Arity::Exact(2), crate::regex::split),
 ];
 
 /// A number as an f64, or a clear error naming the function.

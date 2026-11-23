@@ -1,0 +1,15 @@
+# Demo del modulo datetime: ora corrente, data di oggi in UTC
+# e conversioni note — verificata identica su entrambi i
+# backend (le righe con timestamp fissi; `now` e la data di
+# oggi cambiano a ogni run per natura).
+import datetime
+
+print "adesso (unix): " + str(datetime.now())
+print "oggi (UTC): " + datetime.format(datetime.now(), "%Y-%m-%d %H:%M:%S")
+print "giorno della settimana (0 = lunedi): " + datetime.format(datetime.now(), "%w")
+
+let epoca = datetime.from_timestamp(0)
+print "epoca: " + datetime.format(epoca, "%Y-%m-%d %H:%M:%S") + " (weekday " + str(epoca["weekday"]) + ")"
+print "14 novembre 2023: " + datetime.format(1700000000, "%Y-%m-%d %H:%M:%S") + " (weekday " + str(datetime.from_timestamp(1700000000)["weekday"]) + ")"
+print "mezzanotte del 29 febbraio 2024: " + str(datetime.date(2024, 2, 29))
+print "round-trip: " + str(datetime.to_timestamp(datetime.from_timestamp(1234567890)))

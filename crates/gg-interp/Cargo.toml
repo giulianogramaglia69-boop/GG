@@ -22,3 +22,4 @@ gui = ["dep:eframe"]
 gg-lexer = { path = "../gg-lexer" }
 gg-parser = { path = "../gg-parser" }
 eframe = { version = "0.37", optional = true }
+regex = "1"

@@ -1,0 +1,13 @@
+# Demo del modulo os: directory corrente, argomenti da riga
+# di comando, una variabile d'ambiente e il contenuto di
+# examples/ — verificata identica su entrambi i backend.
+import os
+
+print "cwd: " + os.cwd()
+print "args:"
+print os.args()
+print "HOME: " + str(os.getenv("HOME"))
+print "assente: " + str(os.getenv("GG_NON_ESISTE"))
+print "con default: " + os.getenv("GG_NON_ESISTE", "nessuna")
+print "examples/:"
+print os.listdir("examples")

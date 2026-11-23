@@ -7,6 +7,7 @@
 
 pub mod array;
 pub mod builtin;
+pub mod datetime;
 pub mod env;
 pub mod error;
 #[cfg(feature = "gui")]
@@ -15,6 +16,8 @@ pub mod interp;
 pub mod json;
 pub mod linalg;
 pub mod native;
+pub mod os;
+pub mod regex;
 pub mod repl;
 pub mod slice;
 pub mod stdlib;
@@ -3802,6 +3805,517 @@ print d2["note"]
 "#
             ),
             "Giuliano\n15\n10\n92100\ntrue\nnil\n"
+        );
+    }
+
+    // ---- Native `os` module ----
+
+    #[test]
+    fn os_getenv_present_absent_and_default() {
+        // `set_var` is process-wide; no other test reads this name.
+        unsafe {
+            std::env::set_var("GG_OS_TEST_VAR", "ciao");
+        }
+        assert_eq!(
+            run_ok("import os\nprint os.getenv(\"GG_OS_TEST_VAR\")\n"),
+            "ciao\n"
+        );
+        // A present variable wins over the default.
+        assert_eq!(
+            run_ok("import os\nprint os.getenv(\"GG_OS_TEST_VAR\", \"fallback\")\n"),
+            "ciao\n"
+        );
+        // Absent: Nil without a default, the default with one.
+        assert_eq!(
+            run_ok("import os\nprint os.getenv(\"GG_OS_TEST_VAR_MISSING\")\n"),
+            "nil\n"
+        );
+        assert_eq!(
+            run_ok("import os\nprint os.getenv(\"GG_OS_TEST_VAR_MISSING\", \"fallback\")\n"),
+            "fallback\n"
+        );
+        unsafe {
+            std::env::remove_var("GG_OS_TEST_VAR");
+        }
+        // A non-Str name or default is a clear error.
+        assert!(
+            run_err("import os\nprint os.getenv(42)\n")
+                .contains("os.getenv() expects a Str, not Int")
+        );
+        assert!(
+            run_err("import os\nprint os.getenv(\"GG_OS_TEST_VAR_MISSING\", 42)\n")
+                .contains("os.getenv() expects a Str, not Int")
+        );
+    }
+
+    #[test]
+    fn os_cwd_is_a_nonempty_string() {
+        assert_eq!(
+            run_ok("import os\nprint type(os.cwd())\nprint os.cwd() != \"\"\n"),
+            "str\ntrue\n"
+        );
+    }
+
+    #[test]
+    fn os_args_is_a_nonempty_list_of_str() {
+        assert_eq!(
+            run_ok(
+                "import os\nlet a = os.args()\nprint type(a)\nprint len(a) >= 1\nprint type(a[0])\n",
+            ),
+            "list\ntrue\nstr\n"
+        );
+    }
+
+    #[test]
+    fn os_listdir_lists_sorted_names() {
+        let dir = std::env::temp_dir().join(format!("gg-test-os-listdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::create_dir(dir.join("sotto")).unwrap();
+        let path = dir.to_str().unwrap();
+        // Names only, sorted — files and directories alike.
+        assert_eq!(
+            run_ok(&format!("import os\nprint os.listdir(\"{path}\")\n")),
+            "[\"a.txt\", \"b.txt\", \"sotto\"]\n"
+        );
+        // A file is not a directory, and a missing path is an error.
+        assert!(
+            run_err(&format!("import os\nprint os.listdir(\"{path}/a.txt\")\n"))
+                .contains("os.listdir")
+        );
+        assert!(
+            run_err(&format!("import os\nprint os.listdir(\"{path}/manca\")\n"))
+                .contains("os.listdir")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn os_mkdir_and_remove_roundtrip() {
+        let base = std::env::temp_dir().join(format!("gg-test-os-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.to_str().unwrap();
+        let new_dir = format!("{path}/nuova");
+        assert_eq!(
+            run_ok(&format!(
+                "import os\nos.mkdir(\"{new_dir}\")\nprint contains(os.listdir(\"{path}\"), \"nuova\")\n"
+            )),
+            "true\n"
+        );
+        // mkdir on an existing directory is an error, and so is
+        // mkdir with a missing parent (no recursive creation).
+        assert!(run_err(&format!("import os\nos.mkdir(\"{new_dir}\")\n")).contains("os.mkdir"));
+        assert!(
+            run_err(&format!("import os\nos.mkdir(\"{path}/manca/figlia\")\n"))
+                .contains("os.mkdir")
+        );
+        // remove on a directory is an error; remove on a file works.
+        assert!(
+            run_err(&format!("import os\nos.remove(\"{new_dir}\")\n")).contains("is a directory")
+        );
+        assert_eq!(
+            run_ok(&format!(
+                "import os\nwrite_file(\"{path}/f.txt\", \"x\")\nprint file_exists(\"{path}/f.txt\")\nos.remove(\"{path}/f.txt\")\nprint file_exists(\"{path}/f.txt\")\n"
+            )),
+            "true\nfalse\n"
+        );
+        // remove on a missing file is an error.
+        assert!(
+            run_err(&format!("import os\nos.remove(\"{path}/manca.txt\")\n"))
+                .contains("no such file or directory")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- Native `datetime` module ----
+
+    #[test]
+    fn datetime_from_timestamp_epoch() {
+        // Timestamp 0 is 1970-01-01 00:00:00, a Thursday
+        // (weekday 3 with Monday = 0).
+        assert_eq!(
+            run_ok(
+                "import datetime\nlet d = datetime.from_timestamp(0)\nprint d[\"year\"]\nprint d[\"month\"]\nprint d[\"day\"]\nprint d[\"hour\"]\nprint d[\"minute\"]\nprint d[\"second\"]\nprint d[\"weekday\"]\n",
+            ),
+            "1970\n1\n1\n0\n0\n0\n3\n"
+        );
+    }
+
+    #[test]
+    fn datetime_from_timestamp_known_dates() {
+        // 1700000000 is 2023-11-14 22:13:20 UTC, a Tuesday.
+        assert_eq!(
+            run_ok(
+                "import datetime\nlet d = datetime.from_timestamp(1700000000)\nprint d[\"year\"]\nprint d[\"month\"]\nprint d[\"day\"]\nprint d[\"hour\"]\nprint d[\"minute\"]\nprint d[\"second\"]\nprint d[\"weekday\"]\n",
+            ),
+            "2023\n11\n14\n22\n13\n20\n1\n"
+        );
+        // Negative timestamps work: -1 is 1969-12-31 23:59:59,
+        // a Wednesday.
+        assert_eq!(
+            run_ok(
+                "import datetime\nlet d = datetime.from_timestamp(-1)\nprint d[\"year\"]\nprint d[\"month\"]\nprint d[\"day\"]\nprint d[\"hour\"]\nprint d[\"minute\"]\nprint d[\"second\"]\nprint d[\"weekday\"]\n",
+            ),
+            "1969\n12\n31\n23\n59\n59\n2\n"
+        );
+    }
+
+    #[test]
+    fn datetime_to_from_roundtrip() {
+        for ts in [
+            0,
+            1,
+            -1,
+            -86_400,
+            1_700_000_000,
+            1_234_567_890,
+            -1_234_567_890,
+        ] {
+            assert_eq!(
+                run_ok(&format!(
+                    "import datetime\nprint datetime.to_timestamp(datetime.from_timestamp({ts}))\n"
+                )),
+                format!("{ts}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn datetime_date_and_leap_years() {
+        assert_eq!(
+            run_ok("import datetime\nprint datetime.date(1970, 1, 1)\n"),
+            "0\n"
+        );
+        assert_eq!(
+            run_ok("import datetime\nprint datetime.date(2023, 11, 14)\n"),
+            "1699920000\n"
+        );
+        // 2024 is a leap year: 29 February exists.
+        assert_eq!(
+            run_ok("import datetime\nprint datetime.date(2024, 2, 29)\n"),
+            "1709164800\n"
+        );
+        // 2023 is not: 29 February is an error, as is the
+        // 29th of February 1900 (a century, not divisible
+        // by 400) — while 2000-02-29 exists.
+        assert!(
+            run_err("import datetime\nprint datetime.date(2023, 2, 29)\n")
+                .contains("day 29 out of range")
+        );
+        assert!(
+            run_err("import datetime\nprint datetime.date(1900, 2, 29)\n")
+                .contains("day 29 out of range")
+        );
+        assert_eq!(
+            run_ok("import datetime\nprint datetime.date(2000, 2, 29)\n"),
+            "951782400\n"
+        );
+    }
+
+    #[test]
+    fn datetime_validation_errors() {
+        // Month 13, day 32, hour 25, minute 60, second 60.
+        assert!(
+            run_err("import datetime\nprint datetime.date(2024, 13, 1)\n")
+                .contains("month 13 out of range 1-12")
+        );
+        assert!(
+            run_err("import datetime\nprint datetime.date(2024, 1, 32)\n")
+                .contains("day 32 out of range")
+        );
+        assert!(
+            run_err(
+                "import datetime\nlet d = {\"year\": 2024, \"month\": 1, \"day\": 1, \"hour\": 25, \"minute\": 0, \"second\": 0}\nprint datetime.to_timestamp(d)\n",
+            )
+            .contains("hour 25 out of range 0-23")
+        );
+        assert!(
+            run_err(
+                "import datetime\nlet d = {\"year\": 2024, \"month\": 1, \"day\": 1, \"hour\": 0, \"minute\": 60, \"second\": 0}\nprint datetime.to_timestamp(d)\n",
+            )
+            .contains("minute 60 out of range 0-59")
+        );
+        assert!(
+            run_err(
+                "import datetime\nlet d = {\"year\": 2024, \"month\": 1, \"day\": 1, \"hour\": 0, \"minute\": 0, \"second\": 60}\nprint datetime.to_timestamp(d)\n",
+            )
+            .contains("second 60 out of range 0-59")
+        );
+        // A missing field and a non-Int field are errors too.
+        assert!(
+            run_err(
+                "import datetime\nlet d = {\"year\": 2024, \"month\": 1, \"day\": 1, \"hour\": 0, \"minute\": 0}\nprint datetime.to_timestamp(d)\n",
+            )
+            .contains("missing field \"second\"")
+        );
+        assert!(
+            run_err(
+                "import datetime\nlet d = {\"year\": \"2024\", \"month\": 1, \"day\": 1, \"hour\": 0, \"minute\": 0, \"second\": 0}\nprint datetime.to_timestamp(d)\n",
+            )
+            .contains("field \"year\" must be an Int")
+        );
+    }
+
+    #[test]
+    fn datetime_format() {
+        assert_eq!(
+            run_ok(
+                "import datetime\nprint datetime.format(0, \"%Y-%m-%d %H:%M:%S\")\nprint datetime.format(1700000000, \"%Y-%m-%d %H:%M:%S\")\nprint datetime.format(1700000000, \"%d/%m/%Y\")\nprint datetime.format(0, \"%w\")\nprint datetime.format(1700000000, \"%w\")\nprint datetime.format(0, \"100%%\")\n",
+            ),
+            "1970-01-01 00:00:00\n2023-11-14 22:13:20\n14/11/2023\n3\n1\n100%\n"
+        );
+        // A Dict works too, and its `weekday` key is ignored
+        // (it is recomputed from the date).
+        assert_eq!(
+            run_ok(
+                "import datetime\nlet d = datetime.from_timestamp(1234567890)\nprint datetime.format(d, \"%Y-%m-%d %H:%M:%S %w\")\n",
+            ),
+            "2009-02-13 23:31:30 4\n"
+        );
+        // Unknown directives and a trailing % are errors.
+        assert!(
+            run_err("import datetime\nprint datetime.format(0, \"%Q\")\n")
+                .contains("unknown directive %Q")
+        );
+        assert!(
+            run_err("import datetime\nprint datetime.format(0, \"anno %\")\n")
+                .contains("trailing %")
+        );
+        // The first argument must be an Int or a Dict.
+        assert!(
+            run_err("import datetime\nprint datetime.format(\"oggi\", \"%Y\")\n")
+                .contains("expects an Int or a Dict")
+        );
+    }
+
+    #[test]
+    fn datetime_now_is_a_positive_int() {
+        assert_eq!(
+            run_ok("import datetime\nprint type(datetime.now())\nprint datetime.now() > 0\n"),
+            "int\ntrue\n"
+        );
+    }
+
+    // ---- Native `regex` module ----
+
+    #[test]
+    fn regex_test_classes_anchors_and_shorthands() {
+        // Character classes: a match anywhere in the text.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.test("[0-9]+", "abc123")
+print regex.test("[0-9]+", "abc")
+print regex.test("[a-z]+", "ABC")
+"#
+            ),
+            "true\nfalse\nfalse\n"
+        );
+        // Anchors: ^ and $ pin the match to the edges.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.test("^ciao", "ciao mondo")
+print regex.test("^mondo", "ciao mondo")
+print regex.test("mondo$", "ciao mondo")
+print regex.test("mondo$", "mondo ciao")
+print regex.test("^\\d+$", "42")
+print regex.test("^\\d+$", "4a2")
+"#
+            ),
+            "true\nfalse\ntrue\nfalse\ntrue\nfalse\n"
+        );
+        // Shorthands: \d digits, \w word characters, \s space.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.test("\\d", "a1")
+print regex.test("\\w+", "ciao")
+print regex.test("\\s", "a b")
+print regex.test("\\s", "ab")
+"#
+            ),
+            "true\ntrue\ntrue\nfalse\n"
+        );
+        // Unicode: an accented letter matches literally, and .
+        // matches one Unicode character (not one byte).
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.test("è", "caffè")
+print regex.test("^.$", "è")
+print regex.test("^.$", "😀")
+"#
+            ),
+            "true\ntrue\ntrue\n"
+        );
+    }
+
+    #[test]
+    fn regex_find_all_matches_and_empty_when_none() {
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.find("[0-9]+", "a12 b3 c456")
+print regex.find("[a-z]+", "ciao mondo")
+print regex.find("[0-9]+", "niente numeri")
+"#
+            ),
+            "[\"12\", \"3\", \"456\"]\n[\"ciao\", \"mondo\"]\n[]\n"
+        );
+        // Unicode text: \w is Unicode-aware, so "caffè" is one
+        // word; an emoji matches literally.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.find("\\w+", "caffè 😀")
+print regex.find("😀", "ciao 😀 mondo 😀")
+"#
+            ),
+            "[\"caffè\"]\n[\"😀\", \"😀\"]\n"
+        );
+    }
+
+    #[test]
+    fn regex_groups_whole_match_captures_and_nil() {
+        // Index 0 is the whole match, then the capture groups.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.groups("(\\d+)-(\\d+)", "tel 555-1234")
+"#
+            ),
+            "[\"555-1234\", \"555\", \"1234\"]\n"
+        );
+        // An optional group that does not participate is Nil.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.groups("(a)(b)?", "a")
+print regex.groups("(a)(b)?", "ab")
+"#
+            ),
+            "[\"a\", \"a\", nil]\n[\"ab\", \"a\", \"b\"]\n"
+        );
+        // Named groups behave like numbered ones, in order.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.groups("(?P<nome>[a-z]+)@(?P<dominio>[a-z]+)", "scrivi a giuliano@esempio")
+"#
+            ),
+            "[\"giuliano@esempio\", \"giuliano\", \"esempio\"]\n"
+        );
+        // No match at all: an empty List, not Nil.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.groups("(\\d+)", "niente")
+"#
+            ),
+            "[]\n"
+        );
+    }
+
+    #[test]
+    fn regex_replace_with_backreferences() {
+        // Every occurrence is replaced.
+        assert_eq!(
+            run_ok(
+                r##"import regex
+print regex.replace("[0-9]+", "a1 b22", "#")
+print regex.replace("a", "banana", "o")
+"##
+            ),
+            "a# b#\nbonono\n"
+        );
+        // $1 swaps the groups around.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.replace("(\\w+)@(\\w+)", "giuliano@esempio", "$2@$1")
+"#
+            ),
+            "esempio@giuliano\n"
+        );
+        // $nome for a named group, and $$ for a literal $.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.replace("(?P<nome>\\w+)@(?P<dominio>\\w+)", "a@b", "$dominio di $nome")
+print regex.replace("a", "banana", "$$")
+"#
+            ),
+            "b di a\nb$n$n$\n"
+        );
+    }
+
+    #[test]
+    fn regex_split_on_a_pattern() {
+        assert_eq!(
+            run_ok(
+                r#"import regex
+print regex.split(",\\s*", "a, b,c")
+print regex.split("\\s+", "uno due   tre")
+print regex.split(";", "abc")
+print regex.split("😀", "a😀b😀c")
+"#
+            ),
+            "[\"a\", \"b\", \"c\"]\n[\"uno\", \"due\", \"tre\"]\n[\"abc\"]\n[\"a\", \"b\", \"c\"]\n"
+        );
+    }
+
+    #[test]
+    fn regex_invalid_pattern_is_a_catchable_error() {
+        // The crate's message names the problem.
+        assert!(
+            run_err(
+                r#"import regex
+print regex.test("[a-", "x")
+"#
+            )
+            .contains("unclosed character class")
+        );
+        assert!(
+            run_err(
+                r#"import regex
+print regex.find("(", "x")
+"#
+            )
+            .contains("unclosed group")
+        );
+        // ... and it can be caught with try/except.
+        assert_eq!(
+            run_ok(
+                r#"import regex
+try then
+    print regex.test("[a-", "x")
+except e then
+    print "preso"
+end
+"#
+            ),
+            "preso\n"
+        );
+        // A non-Str argument is a clear type error.
+        assert!(
+            run_err(
+                r#"import regex
+print regex.test(42, "x")
+"#
+            )
+            .contains("regex.test() expects a Str, not Int")
+        );
+        assert!(
+            run_err(
+                r#"import regex
+print regex.replace("a", "b", 1)
+"#
+            )
+            .contains("regex.replace() expects a Str, not Int")
         );
     }
 }

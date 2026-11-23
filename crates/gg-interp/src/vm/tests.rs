@@ -614,3 +614,28 @@ fn string_and_builtin_helpers() {
         "42\n1.5\n[0, 1, 2]\n[1, 2, 3]\n",
     );
 }
+
+#[test]
+fn os_module() {
+    // A known directory, so listdir is deterministic on both
+    // backends; getenv uses a variable set here, so it is too.
+    let dir = temp_dir("vm-os");
+    std::fs::write(dir.join("b.txt"), "b").unwrap();
+    std::fs::write(dir.join("a.txt"), "a").unwrap();
+    let path = dir.to_str().unwrap().to_string();
+    unsafe {
+        std::env::set_var("GG_OS_DUAL_TEST_VAR", "ciao");
+    }
+    assert_same_out(
+        &format!(
+            "import os\nprint os.listdir(\"{path}\")\nprint os.getenv(\"GG_OS_DUAL_TEST_VAR\")\nprint os.getenv(\"GG_OS_DUAL_TEST_VAR_MISSING\", \"fallback\")\nprint type(os.cwd())\nprint os.cwd() != \"\"\nprint len(os.args()) >= 1\n"
+        ),
+        "[\"a.txt\", \"b.txt\"]\nciao\nfallback\nstr\ntrue\ntrue\n",
+    );
+    unsafe {
+        std::env::remove_var("GG_OS_DUAL_TEST_VAR");
+    }
+    // Errors agree on both backends too.
+    assert_same("import os\nprint os.listdir(\"/tmp/gg-os-non-esiste-xyz\")\n");
+    assert_same("import os\nos.mkdir(\"/tmp/gg-os-non-esiste-xyz/figlia\")\n");
+}

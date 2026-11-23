@@ -1,0 +1,28 @@
+# Demo del modulo regex: cerca, estrai, sostituisci e dividi
+# con le espressioni regolari — verificata identica su
+# entrambi i backend (VM e tree-walker).
+import regex
+
+let testo = "Giuliano, 14 anni, vive ad Agrigento. Email: giuliano@esempio.it — telefono 555-1234. Caffè ☕ e 😀!"
+
+print "test ^\\d+$ su \"42\": " + str(regex.test("^\\d+$", "42"))
+print "test cifre in testo: " + str(regex.test("[0-9]+", testo))
+print "numeri trovati:"
+print regex.find("[0-9]+", testo)
+print "parole con accenti:"
+print regex.find("\\p{L}+", testo)
+print "email (gruppi: intero, utente, dominio):"
+print regex.groups("([a-z]+)@([a-z]+)\\.([a-z]+)", testo)
+print "telefono (gruppo opzionale assente -> nil):"
+print regex.groups("(\\d+)-(\\d+)(x(\\d+))?", "telefono 555-1234")
+print "maschera le cifre con #:"
+print regex.replace("[0-9]", testo, "#")
+print "scambia utente e dominio con $1/$2:"
+print regex.replace("([a-z]+)@([a-z]+)", testo, "$2@$1")
+print "dividi in frasi:"
+print regex.split("\\.\\s*", testo)
+print "nessun match:"
+print regex.find("[0-9]+", "niente numeri")
+print regex.groups("(\\d+)", "niente numeri")
+print "unicode:"
+print regex.find("😀|☕", testo)

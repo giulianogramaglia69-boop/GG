@@ -166,7 +166,34 @@ GG values (objects → Dicts, arrays → Lists, `null` → Nil) and
 `json.stringify(value)` / `json.stringify(value, indent)` renders
 them back, compact or pretty-printed; a hand-written recursive
 parser in pure Rust, no external crate — see the Standard library
-section below and `examples/json_demo.gg`.
+section below and `examples/json_demo.gg`. **OS module: done.** A native
+`os` module (`import os`): `os.args()` (the command line),
+`os.getenv(name)` / `os.getenv(name, default)`, `os.cwd()`,
+`os.listdir(path)` (names only, sorted), `os.mkdir(path)` and
+`os.remove(path)` (a file, never a directory); pure Rust, no
+external crate, and no command execution or environment writes,
+by design — see the Standard library section below and
+`examples/os_demo.gg`. **Datetime module: done.** A native
+`datetime` module (`import datetime`): `datetime.now()` (the
+Unix timestamp in seconds), `datetime.from_timestamp(ts)` /
+`datetime.to_timestamp(dict)` (a Dict with `year`, `month`,
+`day`, `hour`, `minute`, `second` and `weekday`, 0 = Monday ..
+6 = Sunday), `datetime.format(ts_or_dict, fmt)` (a `strftime`
+subset: `%Y %m %d %H %M %S %w`) and `datetime.date(year,
+month, day)` (midnight UTC); everything is UTC, hand-written
+calendar math in pure Rust, no external crate — see the
+Standard library section below and `examples/datetime_demo.gg`.
+**Regex module: done.** A native `regex` module (`import
+regex`): `regex.test(pattern, text)` / `regex.find(pattern,
+text)` / `regex.groups(pattern, text)` / `regex.replace(pattern,
+text, replacement)` (with `$1` / `$nome` backreferences in the
+replacement) / `regex.split(pattern, text)`; via the `regex`
+crate (1.13.2) from crates.io — the first stdlib module with an
+external dependency. Patterns match on Unicode text (`.` is one
+Unicode character, `\d` is Unicode-aware), and an invalid
+pattern is a runtime error carrying the crate's message,
+catchable with `try`/`except` — see the Standard library
+section below and `examples/regex_demo.gg`.
 
 ## The REPL
 
@@ -921,6 +948,108 @@ containing itself) instead of recursing forever.
 Full example: `examples/json_demo.gg` — write a document to a
 file, read it back, parse it, change a field, and check the
 round-trip, on both backends.
+
+**`os`** — native, in Rust. The process and the filesystem, pure
+Rust with no external crate. `os.args()` is the command line as
+a List of Str, program name first (`gg run file.gg` gives
+`["gg", "run", "file.gg"]` — `gg run` takes no script arguments
+of its own). `os.getenv(name)` returns the variable as a Str, or
+Nil when it is not set; `os.getenv(name, default)` returns the
+default instead. `os.listdir(path)` returns the entry names
+only, sorted, not recursive. `mkdir` creates one directory and
+errors when it already exists or the parent is missing (no
+recursive creation); `remove` deletes a file and errors on a
+directory or a missing path. All errors are runtime errors with
+a clear message, catchable with `try`/`except`. Out of scope, by
+design: running commands (`os.system`) and writing environment
+variables — GG programs observe the environment, they do not
+change it or spawn processes.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `os.args()` | The command line as a List of Str, program name first | `os.args()` → `["gg", "run", "file.gg"]` |
+| `os.getenv(name)` | The value of an environment variable, or Nil when it is not set | `os.getenv("HOME")` → `"/home/giuliano"` |
+| `os.getenv(name, default)` | The value, or the default when the variable is not set | `os.getenv("NOPE", "nessuna")` → `"nessuna"` |
+| `os.cwd()` | The current working directory as a Str | `os.cwd()` → `"/home/giuliano/GG"` |
+| `os.listdir(path)` | The names in a directory, sorted, not recursive | `os.listdir("examples")` → `["args_demo.gg", ...]` |
+| `os.mkdir(path)` | Create one directory, return `nil`; an error when it exists or the parent is missing | `os.mkdir("/tmp/nuova")` |
+| `os.remove(path)` | Delete a file, return `nil`; an error on a directory or a missing path | `os.remove("/tmp/vecchio.txt")` |
+
+Full example: `examples/os_demo.gg` — cwd, args, an
+environment variable and the `examples/` listing, on both
+backends.
+
+**`datetime`** — native, in Rust. Unix timestamps and UTC
+calendar dates, pure Rust with no external crate: the
+calendar math (days-from-civil / civil-from-days) is written
+out by hand, and it works for negative timestamps too
+(before 1970). **Everything is UTC** — there is no local
+time here; that is a later step. A timestamp is an Int,
+seconds since 1970-01-01 00:00:00 UTC. `from_timestamp`
+returns a Dict with `year`, `month`, `day`, `hour`, `minute`,
+`second` and `weekday`, where `weekday` is 0 for Monday
+through 6 for Sunday (1970-01-01 was a Thursday, so
+`from_timestamp(0)["weekday"]` is 3). `to_timestamp` is the
+inverse: it reads the same fields — any `weekday` key is
+ignored, it is recomputed — and validates them (month 1-12, a
+day that exists in that month of that year, leap years
+included, hour 0-23, minute and second 0-59); anything else
+is a runtime error, catchable with `try`/`except`. `format`
+takes an Int timestamp or a Dict like the one
+`from_timestamp` returns, and a format string with a
+`strftime` subset (`%Y` year, `%m` month, `%d` day, `%H`
+hour, `%M` minute, `%S` second, `%w` weekday 0-6 as above);
+`%%` is a literal `%`, any other directive — or a trailing
+`%` — is an error.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `datetime.now()` | The current Unix timestamp in seconds, as an Int | `datetime.now()` → `1700000000` |
+| `datetime.from_timestamp(ts)` | The UTC date and time of a timestamp, as a Dict with `year`, `month`, `day`, `hour`, `minute`, `second` and `weekday` (0 = Monday .. 6 = Sunday) | `datetime.from_timestamp(0)` → `{"year": 1970, "month": 1, "day": 1, "hour": 0, "minute": 0, "second": 0, "weekday": 3}` |
+| `datetime.to_timestamp(dict)` | The Unix timestamp of a Dict like the one `from_timestamp` returns, validating every field | `datetime.to_timestamp(datetime.from_timestamp(1700000000))` → `1700000000` |
+| `datetime.format(ts_or_dict, fmt)` | The date and time as a Str, with a `strftime` subset (`%Y %m %d %H %M %S %w`); the first argument is an Int timestamp or a Dict | `datetime.format(1700000000, "%Y-%m-%d %H:%M:%S")` → `"2023-11-14 22:13:20"` |
+| `datetime.date(year, month, day)` | The Unix timestamp of midnight UTC on that day, validating the date | `datetime.date(2024, 2, 29)` → `1709164800` |
+
+Full example: `examples/datetime_demo.gg` — the current
+time, today in UTC and a few known conversions, on both
+backends.
+
+**`regex`** — native, in Rust, via the `regex` crate (1.13.2)
+from crates.io — the first stdlib module with an external
+dependency. The pattern syntax is the crate's: character
+classes (`[a-z]`, `\d`, `\w`, `\s`, `\p{L}` for Unicode
+letters), anchors (`^`, `$`), quantifiers (`*`, `+`, `?`,
+`{n,m}`), numbered `(...)` and named `(?P<nome>...)` groups,
+and alternation (`|`). There are no backreferences in
+patterns — the crate does not support them; backreferences
+live in the replacement string of `replace` instead (see
+below). Patterns match on Unicode text: `.` matches one
+Unicode character (not one byte), `\d` matches any Unicode
+decimal digit, and accented letters and emoji match literally.
+`test` is true when the pattern matches anywhere in the text.
+`find` returns every non-overlapping match, in order. `groups`
+returns the first match as a List — index 0 is the whole match,
+then one element per capture group, Nil for an optional group
+that did not participate — and an empty List when there is no
+match. `replace` replaces every occurrence; the replacement
+supports `$1` (numbered group), `$nome` (named group),
+`${nome}` (unambiguous form) and `$$` (a literal `$`) — the
+`regex` crate's syntax, not GG's. `split` cuts the text at
+every match. An invalid pattern is a runtime error carrying
+the crate's message (`regex.test(): invalid regex: ...`),
+catchable with `try`/`except`.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `regex.test(pattern, text)` | True when the pattern matches anywhere in the text | `regex.test("^\\d+$", "42")` → `true` |
+| `regex.find(pattern, text)` | Every non-overlapping match, in order, as a List of Str; `[]` when nothing matches | `regex.find("[0-9]+", "a12 b3")` → `["12", "3"]` |
+| `regex.groups(pattern, text)` | The first match as a List: index 0 is the whole match, then the capture groups (Nil for a non-participating optional group); `[]` when no match | `regex.groups("(\\d+)-(\\d+)", "tel 555-1234")` → `["555-1234", "555", "1234"]` |
+| `regex.replace(pattern, text, replacement)` | Replace every occurrence; the replacement supports `$1`, `$nome`, `${nome}` and `$$` | `regex.replace("(\\w+)@(\\w+)", "a@b", "$2@$1")` → `"b@a"` |
+| `regex.split(pattern, text)` | Cut the text at every match, as a List of Str | `regex.split(",\\s*", "a, b,c")` → `["a", "b", "c"]` |
+
+Full example: `examples/regex_demo.gg` — find, groups,
+replace with `$1`/`$2` and split on a concrete text, on both
+backends.
 
 **`stats`** — written in pure GG (`stdlib/stats.gg` in the
 repo), embedded in the binary with `include_str!`, so it works
@@ -1678,6 +1807,37 @@ exit with code 1.
     errors carry the position inside the JSON text; nesting
     past 128 levels is an error (also stops `stringify` on
     cyclic values); see `examples/json_demo.gg`
+27. **OS module** ✅ — native `os` module (`import os`):
+    `os.args()` / `os.getenv(name)` / `os.getenv(name, default)`
+    / `os.cwd()` / `os.listdir(path)` (names only, sorted) /
+    `os.mkdir(path)` / `os.remove(path)` (a file, never a
+    directory); pure Rust, no external crate; no command
+    execution and no environment writes, by design; see
+    `examples/os_demo.gg`
+28. **Datetime module** ✅ — native `datetime` module
+    (`import datetime`): `datetime.now()` /
+    `datetime.from_timestamp(ts)` /
+    `datetime.to_timestamp(dict)` /
+    `datetime.format(ts_or_dict, fmt)` (a `strftime` subset:
+    `%Y %m %d %H %M %S %w`) / `datetime.date(year, month,
+    day)`; everything is UTC, hand-written calendar math in
+    pure Rust, no external crate; the Dict carries `year`,
+    `month`, `day`, `hour`, `minute`, `second` and `weekday`
+    (0 = Monday .. 6 = Sunday); invalid dates (month 13, 29
+    February in a non-leap year, hour 25) are runtime errors;
+    see `examples/datetime_demo.gg`
+29. **Regex module** ✅ — native `regex` module
+    (`import regex`): `regex.test(pattern, text)` /
+    `regex.find(pattern, text)` / `regex.groups(pattern, text)`
+    (whole match at index 0, then the capture groups, Nil for
+    a non-participating optional group, `[]` when no match) /
+    `regex.replace(pattern, text, replacement)` (replacement
+    supports `$1`, `$nome`, `${nome}` and `$$`) /
+    `regex.split(pattern, text)`; via the `regex` crate
+    (1.13.2) from crates.io — the first stdlib module with an
+    external dependency; patterns match on Unicode text, and
+    an invalid pattern is a runtime error with the crate's
+    message; see `examples/regex_demo.gg`
 
 Next: cheaper calls for the VM (the remaining `fib` gap is
 per-call allocation, not variable access) — and, separately, the
