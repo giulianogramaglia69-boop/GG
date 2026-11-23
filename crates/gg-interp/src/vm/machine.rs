@@ -150,7 +150,11 @@ impl Frame {
             index_args: Vec::new(),
             base_env: env,
             locals,
-            cells: vec![None; slot_count],
+            // Lazily created: a frame whose locals are never
+            // captured pays no cell array at all (one fewer
+            // allocation per call), and every access already
+            // treats a missing entry as "no cell".
+            cells: Vec::new(),
             upvalues,
             handlers: Vec::new(),
             super_class,
@@ -461,30 +465,64 @@ impl Interpreter {
         input: &mut dyn BufRead,
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
-        let bindings = bind_arguments(
-            &function.params,
-            &function.defaults,
-            function.rest.as_deref(),
-            &args,
-            &[],
-            None,
-        )?;
+        // `ensure_compiled` is pure (it only compiles the body
+        // when the function has no code yet), so it may run
+        // before the argument check, like the generator check
+        // below already did.
         let code = ensure_compiled(function);
         if code.is_generator {
+            let bindings = bind_arguments(
+                &function.params,
+                &function.defaults,
+                function.rest.as_deref(),
+                &args,
+                &[],
+                None,
+            )?;
             return Ok(Value::Generator(Rc::new(RefCell::new(GeneratorData::new(
                 Rc::clone(function),
                 bindings,
                 function.super_class.clone(),
             )))));
         }
-        // Bind by position: parameter i is slot i, the rest
-        // parameter (when present) is the slot right after.
-        let mut locals = vec![Value::Nil; code.slot_count];
-        for (i, (_, value)) in bindings.iter().enumerate() {
-            if i < locals.len() {
-                locals[i] = value.clone();
+        // Fast path: a positional-only call to a function with
+        // no defaults and no rest parameter. The argument list
+        // becomes the locals directly — parameter i is slot i —
+        // reusing its allocation, with no binding table and no
+        // parameter-name clones. The arity error is the same one
+        // `bind_arguments` reports for this shape of call.
+        let mut locals = if args.kwargs.is_empty()
+            && function.rest.is_none()
+            && function.defaults.iter().all(|d| d.is_none())
+        {
+            if args.positional.len() != function.params.len() {
+                return Err(RuntimeError::new(format!(
+                    "expected {} argument(s) but got {}",
+                    function.params.len(),
+                    args.positional.len()
+                )));
             }
-        }
+            args.positional
+        } else {
+            let bindings = bind_arguments(
+                &function.params,
+                &function.defaults,
+                function.rest.as_deref(),
+                &args,
+                &[],
+                None,
+            )?;
+            // Bind by position: parameter i is slot i, the rest
+            // parameter (when present) is the slot right after.
+            let mut locals = vec![Value::Nil; code.slot_count];
+            for (i, (_, value)) in bindings.iter().enumerate() {
+                if i < locals.len() {
+                    locals[i] = value.clone();
+                }
+            }
+            locals
+        };
+        locals.resize(code.slot_count, Value::Nil);
         match self.run_frame(
             &code,
             Rc::clone(&function.env),
@@ -512,28 +550,64 @@ impl Interpreter {
         out: &mut dyn Write,
     ) -> Result<Value, RuntimeError> {
         let function = &bound.function;
-        let bindings = bind_arguments(
-            &function.params,
-            &function.defaults,
-            function.rest.as_deref(),
-            &args,
-            &[("self", Value::Instance(Rc::clone(&bound.instance)))],
-            Some(&bound.name),
-        )?;
+        // `ensure_compiled` is pure (see `call_vm`).
         let code = ensure_compiled(function);
         if code.is_generator {
+            let bindings = bind_arguments(
+                &function.params,
+                &function.defaults,
+                function.rest.as_deref(),
+                &args,
+                &[("self", Value::Instance(Rc::clone(&bound.instance)))],
+                Some(&bound.name),
+            )?;
             return Ok(Value::Generator(Rc::new(RefCell::new(GeneratorData::new(
                 Rc::clone(function),
                 bindings,
                 Some(Rc::clone(&bound.class)),
             )))));
         }
-        let mut locals = vec![Value::Nil; code.slot_count];
-        for (i, (_, value)) in bindings.iter().enumerate() {
-            if i < locals.len() {
-                locals[i] = value.clone();
+        // Fast path, as in `call_vm`: a positional-only call to
+        // a method with no defaults and no rest parameter. The
+        // parser puts `self` first in a method's parameters, so
+        // the instance goes into slot 0 and the argument list
+        // becomes the remaining locals, reusing its allocation.
+        // The arity error is the same one `bind_arguments`
+        // reports for this shape of call.
+        let mut locals = if args.kwargs.is_empty()
+            && function.rest.is_none()
+            && function.defaults.iter().all(|d| d.is_none())
+            && function.params.first().is_some_and(|p| p == "self")
+        {
+            if args.positional.len() != function.params.len() - 1 {
+                return Err(RuntimeError::new(format!(
+                    "method '{}' expects {} argument(s) but got {}",
+                    bound.name,
+                    function.params.len() - 1,
+                    args.positional.len()
+                )));
             }
-        }
+            let mut locals = args.positional;
+            locals.insert(0, Value::Instance(Rc::clone(&bound.instance)));
+            locals
+        } else {
+            let bindings = bind_arguments(
+                &function.params,
+                &function.defaults,
+                function.rest.as_deref(),
+                &args,
+                &[("self", Value::Instance(Rc::clone(&bound.instance)))],
+                Some(&bound.name),
+            )?;
+            let mut locals = vec![Value::Nil; code.slot_count];
+            for (i, (_, value)) in bindings.iter().enumerate() {
+                if i < locals.len() {
+                    locals[i] = value.clone();
+                }
+            }
+            locals
+        };
+        locals.resize(code.slot_count, Value::Nil);
         match self.run_frame(
             &code,
             Rc::clone(&function.env),
@@ -839,7 +913,15 @@ impl Interpreter {
         }
         kw_values.reverse();
         let positional = match frame.pop()? {
-            Value::List(list) => list.borrow().clone(),
+            // Take the list's buffer when this call owns it (the
+            // compiler builds a fresh list per call, so it
+            // normally is): cloning it was a heap allocation
+            // plus a value clone per argument, per call. An
+            // aliased list falls back to the clone.
+            Value::List(list) => match Rc::try_unwrap(list) {
+                Ok(cell) => cell.into_inner(),
+                Err(list) => list.borrow().clone(),
+            },
             _ => return Err(RuntimeError::new("VM stack underflow (compiler bug)")),
         };
         Ok(CallArgs {
@@ -1061,9 +1143,17 @@ impl Interpreter {
             Op::Call { kwargs } => {
                 let args = self.pop_call_args(frame, kwargs)?;
                 let callee = frame.pop()?;
-                let value = self
-                    .call_value(&callee, args, input, out)
-                    .map_err(|e| e.at(span))?;
+                // Inside the VM the backend is always `Vm`, so a
+                // plain function goes straight to `call_vm`
+                // instead of through the backend dispatch in
+                // `call_value` and the value match in
+                // `call_value_vm`; anything else keeps the
+                // shared path (builtins, methods, classes).
+                let value = match callee {
+                    Value::Function(function) => self.call_vm(&function, args, input, out),
+                    other => self.call_value(&other, args, input, out),
+                }
+                .map_err(|e| e.at(span))?;
                 frame.stack.push(value);
             }
             Op::CallMethod { name, kwargs } => {

@@ -40,6 +40,7 @@ pub fn build(name: &str) -> Option<Value> {
         "os" => define_functions(&env, OS_FUNCTIONS),
         "datetime" => define_functions(&env, DATETIME_FUNCTIONS),
         "regex" => define_functions(&env, REGEX_FUNCTIONS),
+        "http" => define_functions(&env, HTTP_FUNCTIONS),
         // The GUI module lives in `gui.rs`: it needs the
         // interpreter to call frame functions back, so its
         // functions are `WithInterp` builtins, not plain ones.
@@ -135,6 +136,12 @@ const REGEX_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
     ("groups", Arity::Exact(2), crate::regex::groups),
     ("replace", Arity::Exact(3), crate::regex::replace),
     ("split", Arity::Exact(2), crate::regex::split),
+];
+
+const HTTP_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("get", Arity::Range(1, 2), crate::http::get),
+    ("post", Arity::Range(2, 3), crate::http::post),
+    ("request", Arity::Exact(4), crate::http::request),
 ];
 
 /// A number as an f64, or a clear error naming the function.

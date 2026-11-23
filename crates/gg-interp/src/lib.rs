@@ -12,6 +12,7 @@ pub mod env;
 pub mod error;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod http;
 pub mod interp;
 pub mod json;
 pub mod linalg;

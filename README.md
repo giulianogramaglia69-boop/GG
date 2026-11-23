@@ -158,8 +158,8 @@ below). Same programs, same values, same error texts and spans
 — verified by a dual-backend test corpus that runs every program
 on both engines and requires identical output. Honest benchmark
 (release build, this VM): the VM is now faster on tight loops
-(1M-iteration sum: ~240 ms vs ~440 ms) and still slower on
-call-heavy recursion (`fib(26)`: ~410 ms vs ~340 ms) — see the
+(1M-iteration sum: ~240 ms vs ~440 ms) and on call-heavy
+recursion too (`fib(26)`: ~295 ms vs ~355 ms) — see the
 numbers and why in that section. **JSON module: done.** A native
 `json` module (`import json`): `json.parse(text)` turns JSON into
 GG values (objects → Dicts, arrays → Lists, `null` → Nil) and
@@ -193,7 +193,18 @@ external dependency. Patterns match on Unicode text (`.` is one
 Unicode character, `\d` is Unicode-aware), and an invalid
 pattern is a runtime error carrying the crate's message,
 catchable with `try`/`except` — see the Standard library
-section below and `examples/regex_demo.gg`.
+section below and `examples/regex_demo.gg`. **HTTP module:
+done.** A native `http` module (`import http`): a blocking
+HTTP client — `http.get(url)` / `http.get(url, headers)`,
+`http.post(url, body)` / `http.post(url, body, content_type)`
+and `http.request(method, url, body, headers)`; every call
+returns a Dict with `status`, `headers` (keys lowercased) and
+`body`, and an HTTP error status (404, 500) comes back in the
+Dict instead of raising; only network failures are runtime
+errors, with a 30-second timeout for the whole exchange; via
+the `ureq` crate (3.5.2) from crates.io, TLS verified against
+the platform trust store — see the Standard library section
+below and `examples/http_demo.gg`.
 
 ## The REPL
 
@@ -1051,6 +1062,43 @@ Full example: `examples/regex_demo.gg` — find, groups,
 replace with `$1`/`$2` and split on a concrete text, on both
 backends.
 
+**`http`** — native, in Rust, via the `ureq` crate (3.5.2)
+from crates.io — a blocking HTTP client (no async in GG).
+Every call returns a Dict with `status` (the HTTP status
+code as an Int), `headers` (a Dict of the response headers,
+keys lowercased, values Str; a repeated header keeps the last
+value) and `body` (the response body as a Str). An HTTP error
+status (404, 500, ...) is NOT an error: it comes back in the
+Dict with its status and body, like any serious HTTP library.
+Only failures to perform the request are runtime errors — an
+invalid URL, an unreachable host, a refused connection, a
+timeout (30 seconds for the whole exchange, connect and read
+included) — catchable with `try`/`except`. The body is bytes
+on the wire and a Str in GG, so it is decoded with
+`from_utf8_lossy`: bytes that are not valid UTF-8 are replaced
+with U+FFFD instead of failing the request. TLS is verified
+against the platform trust store, not just the bundled Mozilla
+roots, so it also works behind a proxy whose CA is installed
+in the system store. `request` takes Nil for "no body" and
+"no headers" — GG has no `nil` literal, so Nil comes from a
+call that returns it, e.g. `json.parse("null")`. Only POST,
+PUT and PATCH take a body; a body with any other method is an
+error, never silently dropped. The method name is
+case-insensitive (`"get"` works like `"GET"`).
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `http.get(url)` | GET, as a Dict with `status`, `headers` and `body` | `http.get("https://example.com")["status"]` → `200` |
+| `http.get(url, headers)` | GET with request headers, a Dict of Str to Str | `http.get(url, {"Accept": "application/json"})` |
+| `http.post(url, body)` | POST the body as UTF-8 bytes, `Content-Type: text/plain` | `http.post(url, "{\"a\": 1}")["status"]` → `200` |
+| `http.post(url, body, content_type)` | POST with an explicit Content-Type | `http.post(url, body, "application/json")` |
+| `http.request(method, url, body, headers)` | Any method (`"GET"`, `"PUT"`, `"DELETE"`, ...); body is a Str or Nil, headers a Dict or Nil | `http.request("DELETE", url, json.parse("null"), json.parse("null"))["status"]` → `200` |
+
+Full example: `examples/http_demo.gg` — GET from
+example.com, POST of a JSON body to httpbin.org with the
+echoed field parsed back with `json`, and a fallback GET when
+httpbin does not answer, on both backends.
+
 **`stats`** — written in pure GG (`stdlib/stats.gg` in the
 repo), embedded in the binary with `include_str!`, so it works
 with no file on disk. The files in `stdlib/` are the source of
@@ -1495,20 +1543,24 @@ each; outputs identical on both engines):
 | program | tree-walker | VM | |
 |---|---|---|---|
 | `examples/bench_loop.gg` — sum 1..1,000,000 | ~440 ms | ~240 ms | VM ~1.8× **faster** |
-| `examples/bench_fib.gg` — `fib(26)` | ~340 ms | ~410 ms | VM ~1.2× **slower** |
+| `examples/bench_fib.gg` — `fib(26)` | ~355 ms | ~295 ms | VM ~1.2× **faster** |
 
 The loop is faster now, and the reason is concrete: slot-based
 locals turned the loop body's variable accesses from `HashMap`
 lookups on the scope chain into array indexes (before slots
 the same loop took ~925 ms on the VM vs ~465 ms on the
-tree-walker). `fib` is still slower because it is call-bound,
-not variable-bound: every call allocates a frame (locals and
-cells arrays), binds arguments through `bind_arguments`, and
-clones the function's upvalues — per-call allocation the
-tree-walker mostly avoids. The next optimization step there is
-cheaper calls (e.g. not allocating the cells array when a code
-object's nested functions capture nothing), not faster
-variables.
+tree-walker). `fib` was call-bound, not variable-bound, and
+closed the same way — with cheaper calls, not faster
+variables: a positional-only call to a function with no
+defaults and no rest parameter skips the binding table
+entirely and reuses the argument list's allocation as the
+frame's locals, the cell array is only created when a local
+is actually captured, the caller's argument list is taken
+instead of cloned, and a plain function call goes straight
+to the VM's call path instead of through the backend
+dispatch. That took `fib(26)` from ~410 ms to ~295 ms on
+the VM, with the loop untouched (~240 ms) and all 383 tests
+still green on both engines.
 
 ### Limits and known deviations
 
@@ -1795,9 +1847,11 @@ exit with code 1.
     (20 tests) runs every program on both engines and requires
     identical output; all 14 non-GUI examples + both GUI demos
     (Xvfb) verified identical; honest benchmark: VM ~1.8×
-    faster on a 1M-iteration loop and ~1.2× slower on
-    `fib(26)`; slot-based locals with transitive upvalues, see
-    the Bytecode virtual machine section
+    faster on a 1M-iteration loop and ~1.2× faster on
+    `fib(26)` (cheaper calls: no binding table for
+    positional-only calls, argument list reused as locals,
+    lazy cell array); slot-based locals with transitive
+    upvalues, see the Bytecode virtual machine section
 26. **JSON module** ✅ — native `json` module (`import json`):
     `json.parse(text)` / `json.stringify(value)` /
     `json.stringify(value, indent)`; hand-written recursive
@@ -1838,10 +1892,20 @@ exit with code 1.
     external dependency; patterns match on Unicode text, and
     an invalid pattern is a runtime error with the crate's
     message; see `examples/regex_demo.gg`
+30. **HTTP module** ✅ — native `http` module
+    (`import http`): a blocking HTTP client
+    (`http.get(url)` / `http.get(url, headers)`,
+    `http.post(url, body)` / `http.post(url, body,
+    content_type)`, `http.request(method, url, body, headers)`);
+    every call returns a Dict with `status`, `headers`
+    (lowercased keys, a repeated header keeps the last value)
+    and `body` (lossy UTF-8); HTTP error statuses come back in
+    the Dict, only network failures are runtime errors (30s
+    timeout); via the `ureq` crate (3.5.2) from crates.io, TLS
+    verified against the platform trust store; see
+    `examples/http_demo.gg`
 
-Next: cheaper calls for the VM (the remaining `fib` gap is
-per-call allocation, not variable access) — and, separately, the
-GUI's first real interactive test on the laptop, still open.
+Next: the GUI's first real interactive test on the laptop, still open.
 
 Long term: more data libraries in the spirit of Pandas, and a
 web framework in the spirit of Django — each is a large project

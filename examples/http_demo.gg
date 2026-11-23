@@ -1,0 +1,24 @@
+# Demo del modulo http: un client HTTP bloccante — GET, POST
+# con corpo JSON e fallback quando il servizio non risponde.
+# Verificata identica su entrambi i backend (VM e tree-walker).
+import http
+import json
+
+let r = http.get("https://example.com")
+print "GET https://example.com -> status " + str(r["status"])
+print "primi 200 caratteri del body:"
+print r["body"][0:200]
+
+let payload = json.stringify({"nome": "Giuliano", "lingua": "GG", "eta": 14})
+try then
+    let p = http.post("https://httpbin.org/post", payload, "application/json")
+    print "POST https://httpbin.org/post -> status " + str(p["status"])
+    let data = json.parse(p["body"])
+    print "campo json eco-ato da httpbin:"
+    print data["json"]
+except e then
+    print "httpbin non risponde (" + e + "), ripiego su un secondo GET"
+    let r2 = http.get("https://example.org")
+    print "GET https://example.org -> status " + str(r2["status"])
+    print r2["body"][0:200]
+end
