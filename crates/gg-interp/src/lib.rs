@@ -21,6 +21,7 @@ pub mod os;
 pub mod regex;
 pub mod repl;
 pub mod slice;
+pub mod sqlite;
 pub mod stdlib;
 pub mod value;
 pub mod venv;

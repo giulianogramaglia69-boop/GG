@@ -204,7 +204,18 @@ Dict instead of raising; only network failures are runtime
 errors, with a 30-second timeout for the whole exchange; via
 the `ureq` crate (3.5.2) from crates.io, TLS verified against
 the platform trust store — see the Standard library section
-below and `examples/http_demo.gg`.
+below and `examples/http_demo.gg`. **SQLite module: done.** A
+native `sqlite` module (`import sqlite`): an embedded database
+— `sqlite.open(path)` / `sqlite.exec(db, sql)` /
+`sqlite.execute(db, sql, params)` (returns rows changed) /
+`sqlite.query(db, sql)` / `sqlite.query(db, sql, params)`
+(returns a List of Dicts, keys are column names) /
+`sqlite.close(db)`; via the `rusqlite` crate (0.32) from
+crates.io with the `bundled` feature, so no system SQLite
+library is needed; every SQLite failure is a runtime error
+carrying SQLite's message, catchable with `try`/`except` —
+see the Standard library section below and
+`examples/sqlite_demo.gg`.
 
 ## The REPL
 
@@ -1099,6 +1110,47 @@ example.com, POST of a JSON body to httpbin.org with the
 echoed field parsed back with `json`, and a fallback GET when
 httpbin does not answer, on both backends.
 
+**`sqlite`** — native, in Rust, via the `rusqlite` crate
+(0.32) from crates.io with the `bundled` feature, so SQLite
+is compiled from its C sources and no system SQLite library
+is needed: an embedded database, no server, no setup. The
+API is functional, not method calls — GG only calls methods
+on instances, classes and modules, and a native handle is
+none of those, so the connection is passed explicitly as the
+first argument. `open` returns a connection handle
+(`type(db)` is `"sqlite"`, `print db` is `<sqlite>`,
+`<closed sqlite>` after `close`); the handle is shared, so
+`let db2 = db` aliases the same connection and closing one
+closes the other too. Every SQLite failure — a syntax error,
+a missing table, a violated constraint, a wrong number of
+parameters — is a runtime error carrying SQLite's message,
+catchable with `try`/`except`, with the position of the call.
+
+| Function | Description | Example |
+| --- | --- | --- |
+| `sqlite.open(path)` | Open (or create) the database file; `":memory:"` is a temporary in-memory database | `sqlite.open("app.db")` |
+| `sqlite.exec(db, sql)` | Statements with no result (`CREATE TABLE`, `BEGIN`, `COMMIT`, ...); several statements separated by `;` run in one call; returns Nil | `sqlite.exec(db, "CREATE TABLE utenti (id INTEGER PRIMARY KEY, nome TEXT)")` |
+| `sqlite.execute(db, sql, params)` | A statement with `?` placeholders, `params` a List; returns the number of rows changed as an Int | `sqlite.execute(db, "INSERT INTO utenti (nome) VALUES (?)", ["Giuliano"])` → `1` |
+| `sqlite.query(db, sql)` | A SELECT: a List of Dicts, one per row, keys are the column names in order | `sqlite.query(db, "SELECT * FROM utenti")` → `[{"id": 1, "nome": "Giuliano"}]` |
+| `sqlite.query(db, sql, params)` | A SELECT with `?` placeholders | `sqlite.query(db, "SELECT * FROM utenti WHERE eta >= ?", [18])` |
+| `sqlite.close(db)` | Close the connection; any later use of it, including a second `close`, is a runtime error | `sqlite.close(db)` |
+
+Parameters map as Int → INTEGER, Float → REAL, Str → TEXT,
+Bool → INTEGER 0/1 (SQLite has no boolean type), Nil →
+NULL; anything else is an error naming the parameter
+position. Query results map back as INTEGER → Int, REAL →
+Float, TEXT → Str, NULL → Nil and BLOB → a List of Int, one
+per byte — GG has no byte-string type, so a BLOB cannot come
+in as a parameter either (insert one with the SQL literal
+`x'6869'`). Transactions work through plain SQL
+(`exec(db, "BEGIN")` ... `exec(db, "COMMIT")`); that is SQL,
+not API. Out of scope: prepared statements exposed to GG,
+backup, pragmas and threading.
+
+Full example: `examples/sqlite_demo.gg` — create a table,
+insert rows with parameters, select them back, update one,
+on both backends.
+
 **`stats`** — written in pure GG (`stdlib/stats.gg` in the
 repo), embedded in the binary with `include_str!`, so it works
 with no file on disk. The files in `stdlib/` are the source of
@@ -1904,6 +1956,19 @@ exit with code 1.
     timeout); via the `ureq` crate (3.5.2) from crates.io, TLS
     verified against the platform trust store; see
     `examples/http_demo.gg`
+31. **SQLite module** ✅ — native `sqlite` module
+    (`import sqlite`): an embedded database
+    (`sqlite.open(path)` / `sqlite.exec(db, sql)` /
+    `sqlite.execute(db, sql, params)` returning rows changed /
+    `sqlite.query(db, sql)` / `sqlite.query(db, sql, params)`
+    returning a List of Dicts keyed by column name /
+    `sqlite.close(db)`); results map INTEGER → Int, REAL →
+    Float, TEXT → Str, NULL → Nil, BLOB → List of Int (bytes);
+    every SQLite failure is a runtime error with SQLite's
+    message, catchable with `try`/`except`; via the `rusqlite`
+    crate (0.32) from crates.io with the `bundled` feature, so
+    no system SQLite library is needed; see
+    `examples/sqlite_demo.gg`
 
 Next: the GUI's first real interactive test on the laptop, still open.
 

@@ -23,4 +23,5 @@ gg-lexer = { path = "../gg-lexer" }
 gg-parser = { path = "../gg-parser" }
 eframe = { version = "0.37", optional = true }
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "3", features = ["platform-verifier"] }

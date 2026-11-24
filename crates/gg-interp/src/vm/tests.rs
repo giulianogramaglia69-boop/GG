@@ -639,3 +639,23 @@ fn os_module() {
     assert_same("import os\nprint os.listdir(\"/tmp/gg-os-non-esiste-xyz\")\n");
     assert_same("import os\nos.mkdir(\"/tmp/gg-os-non-esiste-xyz/figlia\")\n");
 }
+
+#[test]
+fn sqlite_module() {
+    // Both backends run the same program on the same file, one
+    // after the other: DROP TABLE IF EXISTS first keeps the
+    // second run identical to the first.
+    let dir = temp_dir("vm-sqlite");
+    let path = dir.join("test.db").to_str().unwrap().to_string();
+    assert_same_out(
+        &format!(
+            "import sqlite\nlet db = sqlite.open(\"{path}\")\nsqlite.exec(db, \"DROP TABLE IF EXISTS utenti\")\nsqlite.exec(db, \"CREATE TABLE utenti (id INTEGER PRIMARY KEY, nome TEXT, eta INTEGER)\")\nprint sqlite.execute(db, \"INSERT INTO utenti (nome, eta) VALUES (?, ?)\", [\"Giuliano\", 14])\nprint sqlite.execute(db, \"INSERT INTO utenti (nome, eta) VALUES (?, ?)\", [\"Altro\", 20])\nprint sqlite.query(db, \"SELECT id, nome, eta FROM utenti WHERE eta > ?\", [15])\nprint sqlite.query(db, \"SELECT count(*) AS n FROM utenti\")[0][\"n\"]\nsqlite.close(db)\nprint type(db)\n"
+        ),
+        "1\n1\n[{\"id\": 2, \"nome\": \"Altro\", \"eta\": 20}]\n2\nsqlite\n",
+    );
+    // Errors agree on both backends too, position included.
+    assert_same_err(
+        "import sqlite\nlet db = sqlite.open(\":memory:\")\nsqlite.exec(db, \"CREAT TABLE t (x)\")\n",
+        "runtime error: 3:8: sqlite.exec(): near \"CREAT\": syntax error in CREAT TABLE t (x) at offset 0",
+    );
+}

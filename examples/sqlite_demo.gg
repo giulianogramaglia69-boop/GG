@@ -1,0 +1,32 @@
+# Demo del modulo sqlite: crea un database, una tabella,
+# inserisce righe con parametri, le rilegge con una SELECT e
+# mostra i tipi — verificata identica su entrambi i backend.
+# Il database va in /tmp così la demo non sporca il repo, e
+# viene cancellato alla fine.
+import sqlite
+import os
+
+let percorso = "/tmp/demo-sqlite.db"
+if file_exists(percorso) then
+    os.remove(percorso)
+end
+
+let db = sqlite.open(percorso)
+sqlite.exec(db, "CREATE TABLE utenti (id INTEGER PRIMARY KEY, nome TEXT, eta INTEGER, punteggio REAL)")
+print "inserite: " + str(sqlite.execute(db, "INSERT INTO utenti (nome, eta, punteggio) VALUES (?, ?, ?)", ["Giuliano", 14, 9.5]))
+print "inserite: " + str(sqlite.execute(db, "INSERT INTO utenti (nome, eta, punteggio) VALUES (?, ?, ?)", ["Fabiana", 14, 8.0]))
+print "inserite: " + str(sqlite.execute(db, "INSERT INTO utenti (nome, eta, punteggio) VALUES (?, ?, ?)", ["Altro", 20, 7.25]))
+
+print "tutti:"
+print sqlite.query(db, "SELECT id, nome, eta, punteggio FROM utenti")
+
+print "maggiorenni:"
+print sqlite.query(db, "SELECT nome, punteggio FROM utenti WHERE eta >= ?", [18])
+
+print "modificate: " + str(sqlite.execute(db, "UPDATE utenti SET punteggio = ? WHERE nome = ?", [10.0, "Giuliano"]))
+print "dopo l'update:"
+print sqlite.query(db, "SELECT nome, punteggio FROM utenti WHERE nome = ?", ["Giuliano"])
+
+sqlite.close(db)
+os.remove(percorso)
+print "fatto"

@@ -41,6 +41,7 @@ pub fn build(name: &str) -> Option<Value> {
         "datetime" => define_functions(&env, DATETIME_FUNCTIONS),
         "regex" => define_functions(&env, REGEX_FUNCTIONS),
         "http" => define_functions(&env, HTTP_FUNCTIONS),
+        "sqlite" => define_functions(&env, SQLITE_FUNCTIONS),
         // The GUI module lives in `gui.rs`: it needs the
         // interpreter to call frame functions back, so its
         // functions are `WithInterp` builtins, not plain ones.
@@ -142,6 +143,14 @@ const HTTP_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
     ("get", Arity::Range(1, 2), crate::http::get),
     ("post", Arity::Range(2, 3), crate::http::post),
     ("request", Arity::Exact(4), crate::http::request),
+];
+
+const SQLITE_FUNCTIONS: &[(&str, Arity, BuiltinFn)] = &[
+    ("open", Arity::Exact(1), crate::sqlite::open),
+    ("exec", Arity::Exact(2), crate::sqlite::exec),
+    ("execute", Arity::Exact(3), crate::sqlite::execute),
+    ("query", Arity::Range(2, 3), crate::sqlite::query),
+    ("close", Arity::Exact(1), crate::sqlite::close),
 ];
 
 /// A number as an f64, or a clear error naming the function.

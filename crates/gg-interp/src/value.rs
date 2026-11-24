@@ -67,6 +67,12 @@ pub enum Value {
     /// generators from the same function are independent: each
     /// keeps its own bindings and count of yielded values.
     Generator(Rc<RefCell<GeneratorData>>),
+    /// A SQLite connection opened by `sqlite.open`: the live
+    /// connection, or `None` once `sqlite.close` was called. The
+    /// connection is shared through `Rc<RefCell<...>>` like the
+    /// other mutable handles, so `let db2 = db` aliases the same
+    /// connection — closing one closes the other too.
+    Sqlite(Rc<RefCell<SqliteData>>),
 }
 
 /// A loaded module: its name (as imported) and the environment its
@@ -120,6 +126,58 @@ impl GeneratorData {
 
 // Two generators are equal only when they are the same one.
 impl PartialEq for GeneratorData {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+/// The state of a SQLite connection opened by `sqlite.open`:
+/// the live connection, or `None` once `sqlite.close` was
+/// called.
+///
+/// `id` is unique per connection (a process-wide counter): two
+/// connections are equal only when they are the same one, even
+/// when they point at the same file.
+///
+/// `rusqlite::Connection` is neither `Debug` nor `Clone`, so
+/// `Debug` is hand-written (the live/closed state only) and
+/// there is no `Clone` — the `Rc` around the data is what gets
+/// cloned when a GG variable is copied.
+pub struct SqliteData {
+    pub connection: Option<rusqlite::Connection>,
+    pub id: u64,
+}
+
+/// The next connection id: one counter for the whole process, so
+/// every connection is unique.
+static NEXT_SQLITE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl SqliteData {
+    pub fn new(connection: rusqlite::Connection) -> Self {
+        Self {
+            connection: Some(connection),
+            id: NEXT_SQLITE_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// True once `sqlite.close` was called on this connection.
+    pub fn is_closed(&self) -> bool {
+        self.connection.is_none()
+    }
+}
+
+impl fmt::Debug for SqliteData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_closed() {
+            write!(f, "SqliteData {{ closed }}")
+        } else {
+            write!(f, "SqliteData {{ open }}")
+        }
+    }
+}
+
+// Two connections are equal only when they are the same one.
+impl PartialEq for SqliteData {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
@@ -418,6 +476,7 @@ impl Value {
             Value::BoundMethod(_) => "Function",
             Value::Module(_) => "Module",
             Value::Generator(_) => "Generator",
+            Value::Sqlite(_) => "Sqlite",
         }
     }
 
@@ -573,6 +632,13 @@ impl Value {
             }
             Value::Module(module) => write!(f, "<module {}>", module.name),
             Value::Generator(_) => write!(f, "<generator>"),
+            Value::Sqlite(data) => {
+                if data.borrow().is_closed() {
+                    write!(f, "<closed sqlite>")
+                } else {
+                    write!(f, "<sqlite>")
+                }
+            }
         }
     }
 
@@ -763,6 +829,9 @@ fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
         // Generators compare by identity: two generators from the
         // same function are different generators.
         (Value::Generator(x), Value::Generator(y)) => Rc::ptr_eq(x, y),
+        // Connections compare by identity: two opens of the same
+        // file are different connections.
+        (Value::Sqlite(x), Value::Sqlite(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }

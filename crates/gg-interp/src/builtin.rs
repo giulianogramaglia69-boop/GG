@@ -390,6 +390,7 @@ fn type_of(
         Value::Class(_) => "class".to_string(),
         Value::Module(_) => "module".to_string(),
         Value::Generator(_) => "generator".to_string(),
+        Value::Sqlite(_) => "sqlite".to_string(),
         Value::Instance(inst) => inst.borrow().class.name.clone(),
     };
     Ok(Value::Str(name))
