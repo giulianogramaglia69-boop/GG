@@ -454,11 +454,21 @@ fn unpack_pair(item: Value, span: Span) -> Result<Vec<Value>, RuntimeError> {
 /// (default) or the tree-walker. The tree-walker stays as a
 /// fallback, and every public entry point dispatches on it, so
 /// both engines run the same programs with the same results.
+///
+/// `pkg_roots` are the package roots `import` searches (after
+/// the native modules): the project `gg_packages/` first, then
+/// the global `~/.gg/packages/`. `lockfile` is the `gg.lock`
+/// of the working directory, loaded lazily on the first
+/// package lookup (a missing or unreadable lockfile means "no
+/// pins"); `lockfile_loaded` remembers that it was tried.
 pub struct Interpreter {
     globals: Rc<Environment>,
     backend: Backend,
     super_stack: Vec<Rc<ClassDef>>,
     venv_dirs: Vec<PathBuf>,
+    pkg_roots: Vec<PathBuf>,
+    lockfile_loaded: bool,
+    lockfile: Option<crate::pkg::Lockfile>,
     loading: Vec<PathBuf>,
     cache: HashMap<PathBuf, Value>,
     embedded_cache: HashMap<String, Value>,
@@ -484,6 +494,9 @@ impl Interpreter {
             backend: Backend::from_env(),
             super_stack: Vec::new(),
             venv_dirs: Vec::new(),
+            pkg_roots: Vec::new(),
+            lockfile_loaded: false,
+            lockfile: None,
             loading: Vec::new(),
             cache: HashMap::new(),
             embedded_cache: HashMap::new(),
@@ -519,6 +532,15 @@ impl Interpreter {
     /// given.
     pub fn set_venv_dirs(&mut self, dirs: Vec<PathBuf>) {
         self.venv_dirs = dirs;
+    }
+
+    /// The package roots `import` searches (after the native
+    /// modules), in order: the project `gg_packages/` first,
+    /// then the global `~/.gg/packages/`. Set by the `gg`
+    /// binary (`pkg::default_pkg_roots()`); empty by default,
+    /// so library use stays hermetic.
+    pub fn set_pkg_roots(&mut self, dirs: Vec<PathBuf>) {
+        self.pkg_roots = dirs;
     }
 
     /// The directory the main script lives in: `import` in the
@@ -1716,9 +1738,12 @@ impl Interpreter {
     /// main script's), then the `lib/` directories of the active
     /// venvs, in order, then the working directory; (2) an
     /// embedded stdlib module written in GG (`stats`); (3) a native
-    /// module written in Rust (`math`, `random`). The first match
-    /// wins, so a user file with the same name overrides a stdlib
-    /// or native module.
+    /// module written in Rust (`math`, `random`); (4) an installed
+    /// package (`import ciao` loads the package's `entry` from
+    /// its `gg.toml`, from the project `gg_packages/` first,
+    /// then the global store). The first match wins, so a user
+    /// file with the same name overrides a stdlib, native or
+    /// package module.
     ///
     /// Each module runs exactly once per process: the second import
     /// returns the cached value. A module that (directly or
@@ -1752,18 +1777,49 @@ impl Interpreter {
         if let Some(path) = candidates.iter().find(|p| p.is_file()) {
             return self.import_file_module(name, path, input, out);
         }
-        // No file: an embedded stdlib module, then a native one.
+        // No file: an embedded stdlib module, then a native one,
+        // then an installed package.
         if crate::stdlib::get(name).is_some() {
             return self.import_embedded_module(name, input, out);
         }
         if let Some(module) = self.native_module(name) {
             return Ok(module);
         }
+        if let Some(entry) = self.package_entry(name) {
+            return self.import_file_module(name, &entry, input, out);
+        }
         let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
-        Err(RuntimeError::new(format!(
-            "module '{name}' not found (searched: {})",
-            tried.join(", ")
-        )))
+        let mut message = format!("module '{name}' not found (searched: {})", tried.join(", "));
+        if !self.pkg_roots.is_empty() {
+            message.push_str(&format!(
+                "; no installed package '{name}' found (try 'gg list')"
+            ));
+        }
+        Err(RuntimeError::new(message))
+    }
+
+    /// The entry file of an installed package (`import ciao`
+    /// loads `ciao`'s `entry` from its `gg.toml`), or `None`.
+    /// The `gg.lock` in the working directory pins the version
+    /// when it lists the package; otherwise the newest
+    /// installed version wins. Roots are searched in order.
+    /// The lockfile is read once, on the first package lookup.
+    fn package_entry(&mut self, name: &str) -> Option<PathBuf> {
+        if self.pkg_roots.is_empty() {
+            return None;
+        }
+        if !self.lockfile_loaded {
+            self.lockfile = crate::pkg::read_lockfile(&crate::pkg::lockfile_path()).ok();
+            self.lockfile_loaded = true;
+        }
+        for root in &self.pkg_roots {
+            if let Some(entry) =
+                crate::pkg::resolve_package_entry(name, root, self.lockfile.as_ref())
+            {
+                return Some(entry);
+            }
+        }
+        None
     }
 
     /// Load a module from a `.gg` file: run it once in its own

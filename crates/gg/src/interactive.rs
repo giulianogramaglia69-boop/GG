@@ -45,6 +45,7 @@ pub fn start_repl_interactive() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut session = gg_interp::ReplSession::new(gg_interp::venv_dirs_from_env());
+    session.set_pkg_roots(gg_interp::pkg::default_pkg_roots());
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     // Note: `input` and rustyline both read stdin. While the REPL

@@ -37,6 +37,20 @@ use crate::value::{ArrayData, DictKey, Value};
 /// Deeper input is an error, not a stack overflow.
 const MAX_DEPTH: usize = 128;
 
+/// Parse a JSON document into a GG value (used by the
+/// lockfile reader): the same parser as `json.parse(text)`.
+pub(crate) fn parse_text(text: &str) -> Result<Value, RuntimeError> {
+    Parser::new(text).parse_document()
+}
+
+/// Render a GG value as JSON (used by the lockfile writer):
+/// the same rendering as `json.stringify(value, indent)`.
+pub(crate) fn stringify_value(value: &Value, indent: usize) -> Result<String, RuntimeError> {
+    let mut out = String::new();
+    write_value(&mut out, value, indent, 0, 0)?;
+    Ok(out)
+}
+
 /// `json.parse(text)` — parse a JSON document into a GG value.
 pub fn parse(
     args: &[Value],

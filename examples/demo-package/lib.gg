@@ -1,0 +1,13 @@
+# Pacchetto di esempio "ciao" (1.0.0).
+# Installalo con: gg install ./examples/demo-package
+# (poi `import ciao` lo trova tra i pacchetti installati).
+
+let VERSION = "1.0.0"
+
+fn saluta(nome)
+    return "Ciao " + nome + "!"
+end
+
+fn doppio(x)
+    return x * 2
+end

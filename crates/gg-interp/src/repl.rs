@@ -53,6 +53,7 @@ pub fn run_repl_with_venv(
 ) -> std::io::Result<()> {
     print_welcome(out)?;
     let mut session = ReplSession::new(venv_dirs);
+    session.set_pkg_roots(crate::pkg::default_pkg_roots());
     loop {
         out.write_all(session.prompt().as_bytes())?;
         out.flush()?;
@@ -95,6 +96,14 @@ impl ReplSession {
             buffer: String::new(),
             prompt: PROMPT,
         }
+    }
+
+    /// The package roots `import` searches (after the native
+    /// modules): the project `gg_packages/` first, then the
+    /// global store. Set by the `gg` binary for the interactive
+    /// driver; `run_repl_with_venv` sets the defaults itself.
+    pub fn set_pkg_roots(&mut self, dirs: Vec<std::path::PathBuf>) {
+        self.interp.set_pkg_roots(dirs);
     }
 
     /// The prompt to show before the next line.

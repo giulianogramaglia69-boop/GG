@@ -1,0 +1,9 @@
+# Demo del gestore pacchetti: prima installa il pacchetto con
+#   gg install ./examples/demo-package
+# poi lancia questa demo: `import ciao` lo trova tra i pacchetti
+# installati (prima in gg_packages/ del progetto, poi in
+# ~/.gg/packages/).
+import ciao
+print ciao.saluta("Giuliano")
+print ciao.doppio(21)
+print ciao.VERSION

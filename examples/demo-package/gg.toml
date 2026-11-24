@@ -1,0 +1,4 @@
+name = "ciao"
+version = "1.0.0"
+description = "Pacchetto di esempio per il gestore pacchetti di GG"
+entry = "lib.gg"

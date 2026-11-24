@@ -18,6 +18,7 @@ pub mod json;
 pub mod linalg;
 pub mod native;
 pub mod os;
+pub mod pkg;
 pub mod regex;
 pub mod repl;
 pub mod slice;
@@ -105,11 +106,27 @@ pub fn run_source_with(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), GgError> {
+    run_source_with_pkgs(source, base_dir, venv_dirs, Vec::new(), input, out)
+}
+
+/// Like `run_source_with`, but `import` also searches the given
+/// package roots (the project `gg_packages/` first, then the
+/// global store) — after files, the embedded stdlib and native
+/// modules. Used by the `gg` binary for `gg run`.
+pub fn run_source_with_pkgs(
+    source: &str,
+    base_dir: Option<std::path::PathBuf>,
+    venv_dirs: Vec<std::path::PathBuf>,
+    pkg_roots: Vec<std::path::PathBuf>,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<(), GgError> {
     let tokens = gg_lexer::lex(source)?;
     let program = gg_parser::parse(&tokens)?;
     let mut interp = Interpreter::new();
     interp.set_base_dir(base_dir);
     interp.set_venv_dirs(venv_dirs);
+    interp.set_pkg_roots(pkg_roots);
     interp.run(&program, input, out)?;
     Ok(())
 }

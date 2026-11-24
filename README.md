@@ -215,7 +215,17 @@ crates.io with the `bundled` feature, so no system SQLite
 library is needed; every SQLite failure is a runtime error
 carrying SQLite's message, catchable with `try`/`except` —
 see the Standard library section below and
-`examples/sqlite_demo.gg`.
+`examples/sqlite_demo.gg`. **Package manager: done.** `gg
+install` / `gg list` / `gg remove` and a `gg.lock` lockfile:
+packages are `gg.toml` manifests (`name`, `version`,
+`description`, `entry`, `dependencies`) installed from a
+local directory or from GitHub (`owner/repo[@tag|@commit]`,
+cloned with `git`) into `~/.gg/packages/<name>/<version>/`
+(or `gg_packages/` with `--local`); `import <name>` finds
+them after files, the stdlib and native modules, and the
+lockfile pins the version — see the Package manager section
+below and `examples/package_demo.gg` with
+`examples/demo-package/`.
 
 ## The REPL
 
@@ -812,14 +822,19 @@ builtin such as `len` is *not* an attribute (`module 'm' has no
 attribute 'len'`), and a missing attribute is a runtime error
 (`module 'm' has no attribute 'y'`).
 
-**Search order.** `import nome` looks for the module in three
+**Search order.** `import nome` looks for the module in four
 levels, in this order: (1) a `.gg` file — the directory of the
 file doing the import, then the `lib/` directories of the active
 venvs, in flag order, then the current working directory; (2) an
 embedded stdlib module written in GG (`stats`); (3) a native
-module written in Rust (`math`, `random`). The first match wins:
-a user file with the same name overrides a stdlib or a native
-module (`math.gg` next to your script shadows the native
+module written in Rust (`math`, `random`); (4) an installed
+package — the package's `entry` from its `gg.toml`, from the
+project `gg_packages/` first, then the global store
+`~/.gg/packages/` (the `gg.lock` in the working directory
+pins the version when it lists the package, otherwise the
+newest installed version wins). The first match wins:
+a user file with the same name overrides a stdlib, a native
+module or a package (`math.gg` next to your script shadows the native
 `math`). A module that is not found is a runtime error listing
 every path that was tried (`module 'nope' not found (searched:
 ...)`). Nested imports resolve against the directory of the
@@ -875,11 +890,103 @@ module
 <module greeter>
 ```
 
+## Package manager
+
+Packages share code between projects. A package is a directory
+with a `gg.toml` manifest and `.gg` files; `import <name>`
+loads the package's `entry` file (default `lib.gg`).
+
+**The manifest (`gg.toml`).** TOML, parsed with the `toml`
+crate (0.8) — a syntax error reports its line and column:
+
+```toml
+name = "ciao"                    # required: the importable name (a GG identifier)
+version = "1.0.0"                # required: X.Y.Z (no prerelease/build metadata)
+description = "Saluti in GG"    # optional
+entry = "lib.gg"                 # optional, default lib.gg: the file `import ciao` loads
+dependencies = ["owner/altro@1.0.0", "./locale"]   # optional: package specs
+```
+
+A missing or mistyped field is a clear error (`gg.toml:
+missing required field 'version'`). The `entry` must be a
+relative `.gg` path inside the package (no `..`, no absolute
+path). A dependency spec is the same as an install spec (see
+below); a relative local dependency resolves against the
+depending package's own directory (npm rule), so `./b` in
+`a/gg.toml` is `a/b`.
+
+**Commands.**
+
+```sh
+$ gg install owner/repo            # from GitHub, default branch
+$ gg install owner/repo@v1.2.3     # from GitHub, a tag (must agree with the manifest version)
+$ gg install owner/repo@abcdef0... # from GitHub, a commit (7-40 hex characters)
+$ gg install ./examples/demo-package   # from a local directory
+$ gg install --local owner/repo    # into the project's gg_packages/ instead of the global store
+$ gg install                       # reinstall exactly what gg.lock pins (like `npm ci`)
+$ gg list                          # installed packages: name, version, global/local
+$ gg remove ciao                   # remove every installed version (and prune gg.lock)
+```
+
+**Layout.** Packages live in `<root>/<name>/<version>/`
+(`gg.toml` + `.gg` files; `.git` and `target` are never
+copied). The roots are the project-local `gg_packages/`
+(searched first at import) and the global store
+`~/.gg/packages/`. A GitHub install clones with `git`
+(`--depth 1` for a tag or the default branch, a full clone +
+checkout for a commit) — `git` must be installed; a missing
+`git` or a failing clone is a clear error. The lockfile
+`gg.lock` (JSON, in the project directory) records each
+package's `source` (`github:owner/repo` or `local:<path>`),
+`version`, `resolved` (the commit hash, or the canonical
+path for a local package) and `location` (`global`/`local`).
+
+**Dependencies.** After installing a package, its
+`dependencies` are installed recursively. A dependency cycle
+is an error naming the chain (`dependency cycle: a -> b ->
+a`), and two explicitly demanded versions of the same
+package are an error (`version conflict for package 'bar'`
+— v1 has no version resolver: pick one version). A
+dependency without a version (`owner/bar`) takes whatever
+version its manifest declares.
+
+**Security, honestly.** `gg install` only downloads and
+copies code — it never runs anything (no install hooks, by
+design). Importing a package runs its GG code exactly like
+any other `import`, so a package is trusted the way any
+dependency is trusted: install only code you have read, or
+from authors you trust. A package whose name is also a
+built-in module (`math`, `stats`, ...) still installs, but
+`import <name>` loads the built-in instead — `gg install`
+warns about it.
+
+**Limits (v1).** No central registry, no version resolver
+(a conflict is an error), no `gg publish`, no `gg update`,
+no signatures. Dotted imports (`import a.b`) do not exist
+in GG, so a package exposes only its entry file — a
+package's own internal modules are reached through relative
+imports inside the package.
+
+Full example: `examples/demo-package/` (the `ciao` package)
+and `examples/package_demo.gg`:
+
+```sh
+$ gg install ./examples/demo-package
+Installed ciao 1.0.0 (~/.gg/packages/ciao/1.0.0)
+Updated gg.lock
+$ gg run examples/package_demo.gg
+Ciao Giuliano!
+42
+1.0.0
+```
+
 ## Standard library
 
 Phase 10 adds a minimal standard library in three layers, in
 the import resolution order above: user `.gg` files first, then
-embedded GG modules, then native Rust modules. Specialized
+embedded GG modules, then native Rust modules (installed
+packages are a fourth layer, after the native modules — see
+the Package manager section). Specialized
 domains live in modules, not as top-level builtins: math
 functions are `math.sqrt`, never a bare `sqrt`.
 
@@ -1753,6 +1860,9 @@ cargo build --release
 ./target/release/gg run hello.gg          # run a .gg program
 ./target/release/gg run --venv myproj hello.gg   # run with a venv's lib/ on the module path
 ./target/release/gg venv myproj            # create a virtual environment (myproj/ + lib/ + gg.toml)
+./target/release/gg install owner/repo   # install a package from GitHub (or ./dir for a local one)
+./target/release/gg list                 # list installed packages
+./target/release/gg remove ciao          # remove an installed package
 ./target/release/gg --tokens hello.gg   # print the tokens, one per line
 ./target/release/gg --ast hello.gg      # parse and print the AST (canonical form)
 ./target/release/gg --help
@@ -1775,7 +1885,8 @@ exit with code 1.
 8. **OOP** ✅ — classes, methods, inheritance (see below)
 9. **Modules + virtual environments** ✅ — `import` (with `as`
    alias), module values (`type` is `"module"`), search order
-   (script dir → venv `lib/` → working dir), once-per-process
+   (script dir → venv `lib/` → working dir → installed
+   packages), once-per-process
    cache, circular-import detection, nested imports relative to
    the importing module, `gg venv`, `gg run --venv <dir>`,
    `GG_VENV`, REPL imports
@@ -1969,6 +2080,22 @@ exit with code 1.
     crate (0.32) from crates.io with the `bundled` feature, so
     no system SQLite library is needed; see
     `examples/sqlite_demo.gg`
+32. **Package manager** ✅ — `gg install` / `gg list` /
+    `gg remove` and a `gg.lock` lockfile: packages are
+    `gg.toml` manifests (`name`, `version`, `description`,
+    `entry`, `dependencies`, parsed with the `toml` crate
+    0.8) installed from a local directory or from GitHub
+    (`owner/repo[@tag|@commit]`, cloned with `git`) into
+    `~/.gg/packages/<name>/<version>/` (or `gg_packages/`
+    with `--local`); `import <name>` finds them after files,
+    the embedded stdlib and native modules, with the lockfile
+    pinning the version (else the newest installed version);
+    dependencies install recursively, cycles and version
+    conflicts are clear errors (no resolver in v1), `gg
+    install` with no spec reinstalls from the lockfile, and
+    installing only copies code — it never runs anything; see
+    the Package manager section, `examples/package_demo.gg`
+    and `examples/demo-package/`
 
 Next: the GUI's first real interactive test on the laptop, still open.
 

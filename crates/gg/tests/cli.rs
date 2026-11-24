@@ -165,3 +165,113 @@ fn cli_run_imports_from_the_working_directory() {
     assert_eq!(stdout, "da cwd\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_install_list_remove_and_reinstall_from_lockfile() {
+    let dir = temp_dir("pkg-cli");
+    // A package source next to the project, and a demo that
+    // imports it. HOME is pointed at the scratch directory so
+    // the global store (~/.gg/packages) lands there too.
+    let src = dir.join("ciao-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("gg.toml"),
+        "name = \"ciao\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.gg"),
+        "fn saluta(nome)\n    return \"Ciao \" + nome + \"!\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.gg"),
+        "import ciao\nprint ciao.saluta(\"Giuliano\")\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        ProcCommand::new(gg_bin())
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", dir.to_str().unwrap())
+            .output()
+            .unwrap()
+    };
+    // Before the install the import fails.
+    let output = run(&["run", "main.gg"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("module 'ciao' not found"), "{stderr}");
+    // Install from the local path.
+    let output = run(&["install", "./ciao-src"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Installed ciao 1.0.0"), "{stdout}");
+    assert!(
+        dir.join(".gg")
+            .join("packages")
+            .join("ciao")
+            .join("1.0.0")
+            .join("lib.gg")
+            .is_file()
+    );
+    assert!(dir.join("gg.lock").is_file());
+    // The import now works.
+    let output = run(&["run", "main.gg"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert_eq!(stdout, "Ciao Giuliano!\n");
+    // `gg list` shows it.
+    let output = run(&["list"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("ciao 1.0.0 (global)"), "{stdout}");
+    // Wipe the store: `gg install` with no arguments brings it
+    // back from the lockfile.
+    std::fs::remove_dir_all(dir.join(".gg")).unwrap();
+    let output = run(&["install"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Installed ciao 1.0.0"), "{stdout}");
+    let output = run(&["run", "main.gg"]);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Ciao Giuliano!\n"
+    );
+    // `gg remove` takes it away again (and prunes the lockfile).
+    let output = run(&["remove", "ciao"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(!dir.join(".gg").join("packages").join("ciao").exists());
+    let output = run(&["run", "main.gg"]);
+    assert!(!output.status.success());
+    let output = run(&["remove", "ciao"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("not installed")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_install_rejects_a_directory_without_a_manifest() {
+    let dir = temp_dir("pkg-cli-bad");
+    let src = dir.join("nopkg");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.gg"), "fn v()\n    return 1\nend\n").unwrap();
+    let output = ProcCommand::new(gg_bin())
+        .args(["install", "./nopkg"])
+        .current_dir(&dir)
+        .env("HOME", dir.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("no gg.toml found"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -24,4 +24,5 @@ gg-parser = { path = "../gg-parser" }
 eframe = { version = "0.37", optional = true }
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "0.8"
 ureq = { version = "3", features = ["platform-verifier"] }

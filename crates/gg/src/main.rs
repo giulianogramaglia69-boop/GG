@@ -34,6 +34,11 @@ fn print_help() {
     println!(
         "  venv <name>                       create a virtual environment <name>/ with lib/ and gg.toml"
     );
+    println!(
+        "  install [--local] <spec>...    install packages (or reinstall from gg.lock with no spec)"
+    );
+    println!("  list                            list installed packages");
+    println!("  remove <name>                   remove an installed package");
     println!();
     println!("Options:");
     println!("  --tokens <file.gg>   print the tokens of a .gg file, one per line");
@@ -44,6 +49,13 @@ fn print_help() {
     println!("Modules: `import math` loads math.gg from the script's directory,");
     println!("then the venv lib/ directories (--venv, or GG_VENV), then the working");
     println!("directory. Each module runs once per process.");
+    println!();
+    println!("Packages: `gg install owner/repo[@tag|@commit]` installs from GitHub,");
+    println!("`gg install ./dir` from a local directory; installed packages live in");
+    println!("~/.gg/packages/<name>/<version>/ (or gg_packages/ with --local), and");
+    println!("`import <name>` finds them after files, the stdlib and native modules.");
+    println!("`gg install` with no spec reinstalls from gg.lock. Install only copies");
+    println!("code — it never runs anything.");
     println!();
     println!("Token output format: <line>:<col> TYPE value");
 }
@@ -63,6 +75,14 @@ enum Command {
         file: String,
     },
     Venv {
+        name: String,
+    },
+    Install {
+        specs: Vec<String>,
+        local: bool,
+    },
+    List,
+    Remove {
         name: String,
     },
     Help,
@@ -90,9 +110,43 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         [cmd, ..] if cmd == "venv" => {
             Err("gg venv takes exactly one name: gg venv <name>".to_string())
         }
+        [cmd, rest @ ..] if cmd == "install" => parse_install(rest),
+        [cmd] if cmd == "list" => Ok(Command::List),
+        [cmd, ..] if cmd == "list" => {
+            Err("gg list takes no arguments: gg list".to_string())
+        }
+        [cmd, name] if cmd == "remove" => Ok(Command::Remove {
+            name: name.clone(),
+        }),
+        [cmd] if cmd == "remove" => {
+            Err("gg remove needs a name: gg remove <name>".to_string())
+        }
+        [cmd, ..] if cmd == "remove" => {
+            Err("gg remove takes exactly one name: gg remove <name>".to_string())
+        }
         [cmd, rest @ ..] if cmd == "run" => parse_run(rest),
-        _ => Err("Usage: gg [repl | run [--venv <dir>]... <file.gg> | venv <name> | --tokens <file.gg> | --ast <file.gg>]".to_string()),
+        _ => Err("Usage: gg [repl | run [--venv <dir>]... <file.gg> | venv <name> | install [--local] <spec>... | list | remove <name> | --tokens <file.gg> | --ast <file.gg>]".to_string()),
     }
+}
+
+/// Parse the arguments after `install`: an optional `--local`
+/// flag and zero or more specs. No spec means "reinstall from
+/// gg.lock".
+fn parse_install(rest: &[String]) -> Result<Command, String> {
+    let mut local = false;
+    let mut specs = Vec::new();
+    for arg in rest {
+        match arg.as_str() {
+            "--local" => local = true,
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown option '{other}' (did you mean '--local'?)"
+                ));
+            }
+            other => specs.push(other.to_string()),
+        }
+    }
+    Ok(Command::Install { specs, local })
 }
 
 /// Parse the arguments after `run`: `--venv <dir>` flags
@@ -146,6 +200,9 @@ fn main() -> ExitCode {
         Ok(Command::Ast { file }) => dump_ast(&file),
         Ok(Command::Run { file, venv_dirs }) => run_file(&file, venv_dirs),
         Ok(Command::Venv { name }) => create_venv_cmd(&name),
+        Ok(Command::Install { specs, local }) => install_cmd(&specs, local),
+        Ok(Command::List) => list_cmd(),
+        Ok(Command::Remove { name }) => remove_cmd(&name),
         Err(msg) => {
             eprintln!("error: {msg}");
             eprintln!("Run `gg --help` for the full usage.");
@@ -219,7 +276,14 @@ fn run_file(path: &str, flag_venv_dirs: Vec<PathBuf>) -> ExitCode {
     let mut input = stdin.lock();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    match gg_interp::run_source_with(&source, base_dir, venv_dirs, &mut input, &mut out) {
+    match gg_interp::run_source_with_pkgs(
+        &source,
+        base_dir,
+        venv_dirs,
+        gg_interp::pkg::default_pkg_roots(),
+        &mut input,
+        &mut out,
+    ) {
         Ok(()) => {
             // Flush stdout so piped output is not lost.
             let _ = out.flush();
@@ -247,6 +311,132 @@ fn create_venv_cmd(name: &str) -> ExitCode {
             println!("  {name}/");
             println!("  {name}/lib/");
             println!("  {name}/gg.toml");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The install options for the current directory: the global
+/// store, and the project directory (the lockfile lives
+/// there).
+fn install_opts(local: bool) -> Result<gg_interp::pkg::InstallOpts, String> {
+    let project_dir = std::env::current_dir()
+        .map_err(|e| format!("cannot determine the working directory: {e}"))?;
+    Ok(gg_interp::pkg::InstallOpts {
+        local,
+        project_dir,
+        global_root: gg_interp::pkg::global_packages_dir(),
+    })
+}
+
+fn install_cmd(specs: &[String], local: bool) -> ExitCode {
+    let opts = match install_opts(local) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // No spec: reinstall exactly what gg.lock pins.
+    if specs.is_empty() {
+        match gg_interp::pkg::install_from_lockfile(&opts) {
+            Ok(reports) => {
+                for report in reports {
+                    println!(
+                        "Installed {} {} ({})",
+                        report.name,
+                        report.version,
+                        report.dir.display()
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        let mut parsed = Vec::new();
+        for spec in specs {
+            match gg_interp::pkg::PackageSpec::parse(spec) {
+                Ok(spec) => parsed.push(spec),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        match gg_interp::pkg::install_many(&parsed, &opts) {
+            Ok(reports) => {
+                for report in reports {
+                    if report.already_installed {
+                        println!(
+                            "{} {} is already installed ({})",
+                            report.name,
+                            report.version,
+                            report.dir.display()
+                        );
+                    } else {
+                        println!(
+                            "Installed {} {} ({})",
+                            report.name,
+                            report.version,
+                            report.dir.display()
+                        );
+                    }
+                    if gg_interp::pkg::shadows_builtin(&report.name) {
+                        eprintln!(
+                            "warning: '{}' is also a built-in module: 'import {}' loads the built-in, not this package",
+                            report.name, report.name
+                        );
+                    }
+                }
+                println!("Updated gg.lock");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn list_cmd() -> ExitCode {
+    let local_root = std::env::current_dir()
+        .map(|cwd| cwd.join("gg_packages"))
+        .unwrap_or_else(|_| PathBuf::from("gg_packages"));
+    let installed =
+        gg_interp::pkg::list_installed(&gg_interp::pkg::global_packages_dir(), &local_root);
+    if installed.is_empty() {
+        println!("No packages installed yet. Try: gg install owner/repo");
+        return ExitCode::SUCCESS;
+    }
+    for pkg in installed {
+        let location = match pkg.location {
+            gg_interp::pkg::Location::Global => "global",
+            gg_interp::pkg::Location::Local => "local",
+        };
+        println!("{} {} ({})", pkg.name, pkg.version, location);
+    }
+    ExitCode::SUCCESS
+}
+
+fn remove_cmd(name: &str) -> ExitCode {
+    let local_root = std::env::current_dir()
+        .map(|cwd| cwd.join("gg_packages"))
+        .unwrap_or_else(|_| PathBuf::from("gg_packages"));
+    match gg_interp::pkg::remove_package(name, &gg_interp::pkg::global_packages_dir(), &local_root)
+    {
+        Ok(removed) => {
+            for dir in removed {
+                println!("Removed {}", dir.display());
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -359,6 +549,42 @@ mod tests {
         assert!(parse_args(&args(&["--tokens"])).is_err());
         assert!(parse_args(&args(&["--bogus"])).is_err());
         assert!(parse_args(&args(&["file.gg"])).is_err());
+    }
+
+    #[test]
+    fn parse_install_list_and_remove() {
+        assert_eq!(
+            parse_args(&args(&["install"])),
+            Ok(Command::Install {
+                specs: vec![],
+                local: false,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["install", "owner/repo"])),
+            Ok(Command::Install {
+                specs: vec!["owner/repo".to_string()],
+                local: false,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["install", "--local", "./pkg", "o/r@v1.0.0"])),
+            Ok(Command::Install {
+                specs: vec!["./pkg".to_string(), "o/r@v1.0.0".to_string()],
+                local: true,
+            })
+        );
+        assert_eq!(parse_args(&args(&["list"])), Ok(Command::List));
+        assert!(parse_args(&args(&["list", "x"])).is_err());
+        assert_eq!(
+            parse_args(&args(&["remove", "ciao"])),
+            Ok(Command::Remove {
+                name: "ciao".to_string(),
+            })
+        );
+        assert!(parse_args(&args(&["remove"])).is_err());
+        assert!(parse_args(&args(&["remove", "a", "b"])).is_err());
+        assert!(parse_args(&args(&["install", "--bogus", "o/r"])).is_err());
     }
 
     #[test]
